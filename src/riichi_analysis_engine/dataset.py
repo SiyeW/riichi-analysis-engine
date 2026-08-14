@@ -44,25 +44,61 @@ class ShardDataset(IterableDataset[dict[str, torch.Tensor]]):
         return shards
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        yielded = 0
+        accepted = 0
         rng = np.random.default_rng(self.seed + self.epoch)
+        pending: dict[str, np.ndarray] | None = None
         for path in self._shards():
             arrays = load_shard(path)
             length = len(arrays["policy"])
             indices = rng.permutation(length) if self.shuffle else np.arange(length)
-            for start in range(0, length, self.batch_size):
-                batch_indices = indices[start : start + self.batch_size]
-                if self.max_samples:
-                    remaining = self.max_samples - yielded
-                    if remaining <= 0:
-                        return
-                    batch_indices = batch_indices[:remaining]
-                sample = {
-                    name: torch.from_numpy(np.ascontiguousarray(value[batch_indices]))
-                    for name, value in arrays.items()
-                    if name not in {"perspective", "event_index"}
+            if self.max_samples:
+                remaining = self.max_samples - accepted
+                if remaining <= 0:
+                    break
+                indices = indices[:remaining]
+            accepted += len(indices)
+            selected = {
+                name: value[indices]
+                for name, value in arrays.items()
+                if name not in {"perspective", "event_index"}
+            }
+            cursor = 0
+            if pending is not None:
+                pending_length = len(next(iter(pending.values())))
+                take = min(self.batch_size - pending_length, len(indices))
+                pending = {
+                    name: np.concatenate((value, selected[name][:take]), axis=0)
+                    for name, value in pending.items()
                 }
-                yield sample
-                yielded += len(batch_indices)
-                if self.max_samples and yielded >= self.max_samples:
-                    return
+                cursor = take
+                if len(next(iter(pending.values()))) == self.batch_size:
+                    yield {
+                        name: torch.from_numpy(np.ascontiguousarray(value))
+                        for name, value in pending.items()
+                    }
+                    pending = None
+
+            while cursor + self.batch_size <= len(indices):
+                stop = cursor + self.batch_size
+                yield {
+                    name: torch.from_numpy(np.ascontiguousarray(value[cursor:stop]))
+                    for name, value in selected.items()
+                }
+                cursor = stop
+            if cursor < len(indices):
+                tail = {
+                    name: np.ascontiguousarray(value[cursor:])
+                    for name, value in selected.items()
+                }
+                if pending is None:
+                    pending = tail
+                else:
+                    pending = {
+                        name: np.concatenate((pending[name], value), axis=0)
+                        for name, value in tail.items()
+                    }
+        if pending is not None:
+            yield {
+                name: torch.from_numpy(np.ascontiguousarray(value))
+                for name, value in pending.items()
+            }
