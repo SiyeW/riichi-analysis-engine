@@ -178,8 +178,15 @@ class AnalysisRuntime:
                 for index, seat in enumerate(opponents)
             ]
         }
-        draw = _finite(outputs["draw"].sigmoid())
-        win = outputs["win"].sigmoid().numpy()
+        outcome = outputs["outcome"].softmax(-1).numpy()
+        draw = _finite(outcome[0])
+        win = np.asarray(
+            [
+                sum(outcome[mask] for mask in range(1, 16) if mask & (1 << relative))
+                for relative in range(4)
+            ],
+            dtype=np.float32,
+        )
         deal_player = outputs["deal_in_player"].sigmoid().numpy()
         target = outputs["target"].softmax(-1).numpy()
         results["kyoku-outcome"] = {

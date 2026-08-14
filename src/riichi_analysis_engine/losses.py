@@ -14,8 +14,7 @@ DEFAULT_WEIGHTS = {
     "wall_count": 1.0,
     "dora": 0.2,
     "score": 0.2,
-    "draw": 0.2,
-    "win": 0.5,
+    "outcome": 0.7,
     "deal_in_player": 0.3,
     "target": 0.2,
     "kyoku_delta": 0.2,
@@ -77,12 +76,10 @@ def multitask_loss(
         F.softplus(outputs["score"]), batch["score"].float() / 1000.0, reduction="none"
     )
     losses["score"] = _masked_mean(score_error, winner_mask)
-    losses["draw"] = F.binary_cross_entropy_with_logits(
-        outputs["draw"], batch["draw"].float()
+    outcome_label = sum(
+        batch["win"][:, player].long() << player for player in range(4)
     )
-    losses["win"] = F.binary_cross_entropy_with_logits(
-        outputs["win"], batch["win"].float()
-    )
+    losses["outcome"] = F.cross_entropy(outputs["outcome"], outcome_label)
     losses["deal_in_player"] = F.binary_cross_entropy_with_logits(
         outputs["deal_in_player"], batch["deal_in_player"].float()
     )
