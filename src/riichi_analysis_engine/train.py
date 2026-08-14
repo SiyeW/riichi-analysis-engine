@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import platform
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,30 @@ from .losses import DEFAULT_WEIGHTS, multitask_loss
 from .model import RiichiAnalysisModel, count_parameters
 
 
+def source_metadata() -> dict[str, object]:
+    root = Path(__file__).resolve().parents[2]
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        return {"sourceRevision": revision, "sourceDirty": dirty}
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return {"sourceRevision": None, "sourceDirty": None}
+
+
 def environment_metadata(device: torch.device) -> dict[str, object]:
     metadata: dict[str, object] = {
         "python": sys.version.split()[0],
@@ -26,6 +51,7 @@ def environment_metadata(device: torch.device) -> dict[str, object]:
         "torch": str(torch.__version__),
         "cudaRuntime": torch.version.cuda,
         "cudnn": torch.backends.cudnn.version(),
+        **source_metadata(),
     }
     if device.type == "cuda":
         metadata["deviceName"] = torch.cuda.get_device_name(device)

@@ -45,6 +45,15 @@ def public_dataset_metadata(checkpoint: dict[str, object]) -> object:
     }
 
 
+def training_source_revision(checkpoint: dict[str, object]) -> str | None:
+    environment = checkpoint.get("environment")
+    if isinstance(environment, dict):
+        revision = environment.get("sourceRevision")
+        if isinstance(revision, str):
+            return revision
+    return source_revision()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export inference-only model weights.")
     parser.add_argument("checkpoint", type=Path)
@@ -77,7 +86,7 @@ def main() -> None:
             "datasets": public_dataset_metadata(checkpoint),
             "environment": checkpoint.get("environment"),
             "validation": checkpoint.get("validation"),
-            "sourceRevision": source_revision(),
+            "sourceRevision": training_source_revision(checkpoint),
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
