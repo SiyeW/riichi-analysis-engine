@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -86,16 +87,19 @@ def save_shard(path: str | Path, arrays: dict[str, np.ndarray]) -> None:
     payload = dict(arrays)
     obs = pack_observations(payload.pop("obs"))
     action_mask = pack_action_masks(payload.pop("action_mask"))
-    np.savez_compressed(
-        destination,
-        storage_format=np.asarray(STORAGE_FORMAT),
-        obs_nonzero=obs.nonzero,
-        obs_nonone=obs.nonone,
-        obs_values=obs.values,
-        obs_offsets=obs.offsets,
-        action_mask=action_mask,
-        **payload,
-    )
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(
+            handle,
+            storage_format=np.asarray(STORAGE_FORMAT),
+            obs_nonzero=obs.nonzero,
+            obs_nonone=obs.nonone,
+            obs_values=obs.values,
+            obs_offsets=obs.offsets,
+            action_mask=action_mask,
+            **payload,
+        )
+    os.replace(temporary, destination)
 
 
 def load_shard(path: str | Path, *, unpack_obs: bool = True) -> dict[str, np.ndarray]:

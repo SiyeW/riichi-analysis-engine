@@ -184,8 +184,13 @@ def convert_record_to_shard(
 ) -> tuple[int, str, int, str | None]:
     destination = Path(output) / f"game-{record_index:06d}.npz"
     if destination.exists() and not overwrite:
-        with np.load(destination, allow_pickle=False) as source:
-            return record_index, record["sourceId"], len(source["policy"]), None
+        try:
+            with np.load(destination, allow_pickle=False) as source:
+                if source["storage_format"].item() != "dual-bitpack-sparse-float16-v1":
+                    raise ValueError("unsupported storage format")
+                return record_index, record["sourceId"], len(source["policy"]), None
+        except (OSError, ValueError, KeyError, EOFError):
+            destination.unlink()
     if mortal_python_root not in sys.path:
         sys.path.insert(0, mortal_python_root)
     from libriichi.state import PlayerState

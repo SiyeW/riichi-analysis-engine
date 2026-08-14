@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -50,7 +51,9 @@ def main() -> None:
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, args.output)
+    temporary = args.output.with_suffix(args.output.suffix + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, args.output)
     print(
         json.dumps(
             {

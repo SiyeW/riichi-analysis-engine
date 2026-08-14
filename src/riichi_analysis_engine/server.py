@@ -8,10 +8,10 @@ from typing import Any
 
 import torch
 
-from . import __version__
 from .runtime import AnalysisRuntime
 
 PROTOCOL = {"name": "riichi-engine-protocol", "major": 2, "minor": 1}
+ENGINE_VERSION = "0.1.0-dev.0"
 OUTPUT_IDS = [
     "action-recommendation",
     "opponent-shanten",
@@ -70,14 +70,21 @@ class Engine:
 
     def hello(self, params: dict[str, Any]) -> dict[str, Any]:
         protocol = params.get("protocol")
-        if not isinstance(protocol, dict) or protocol.get("name") != PROTOCOL["name"] or protocol.get("major") != 2:
+        if (
+            not isinstance(protocol, dict)
+            or protocol.get("name") != PROTOCOL["name"]
+            or protocol.get("major") != 2
+            or isinstance(protocol.get("minor"), bool)
+            or not isinstance(protocol.get("minor"), int)
+            or protocol.get("minor") < 1
+        ):
             raise ProtocolError("protocol version is not compatible", "PROTOCOL_MISMATCH")
         devices = [{"type": "cpu", "title": {"default": "CPU"}}]
         if torch.cuda.is_available():
             devices.append({"type": "cuda", "title": {"default": "NVIDIA CUDA"}})
         return {
             "protocol": PROTOCOL,
-            "engine": {"id": "org.riichi.analysis", "name": "Riichi Analysis Engine", "version": __version__},
+            "engine": {"id": "org.riichi.analysis", "name": "Riichi Analysis Engine", "version": ENGINE_VERSION},
             "outputContracts": [output_declaration(value) for value in OUTPUT_IDS],
             "weightSlots": [
                 {
@@ -100,8 +107,15 @@ class Engine:
         if len(ids) != len(enabled) or len(set(ids)) != len(ids) or not set(ids).issubset(OUTPUT_IDS):
             raise ProtocolError("enabledOutputs contains an unavailable output", "UNSUPPORTED_OUTPUT")
         weights = params.get("weights")
-        if not isinstance(weights, list) or len(weights) != 1 or weights[0].get("slotId") != "model":
+        if (
+            not isinstance(weights, list)
+            or len(weights) != 1
+            or weights[0].get("slotId") != "model"
+            or weights[0].get("format") != "riichi-analysis-pytorch-v1"
+        ):
             raise ProtocolError("model weights are required", "INVALID_WEIGHTS")
+        if params.get("options") != {}:
+            raise ProtocolError("options must be empty", "INVALID_OPTIONS")
         path = Path(weights[0].get("path", ""))
         device_type = params.get("device", {}).get("type")
         if device_type not in {"cpu", "cuda"} or device_type == "cuda" and not torch.cuda.is_available():
@@ -189,4 +203,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
