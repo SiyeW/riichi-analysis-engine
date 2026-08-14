@@ -26,7 +26,7 @@ TILE34_TO_INDEX = {tile: index for index, tile in enumerate(TILES_34)}
 
 
 def deaka(tile: str) -> str:
-    return tile[:-1] if tile.endswith("r") else tile
+    return tile.removesuffix("r")
 
 
 def tile34_index(tile: str) -> int:

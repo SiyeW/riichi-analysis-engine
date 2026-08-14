@@ -186,9 +186,7 @@ def main() -> None:
                     result = engine.analyze(params)
                 elif method == "engine.getStatus":
                     result = {"state": engine.state, "activeTasks": 0, "queuedTasks": 0, "lastError": None}
-                elif method in {"session.reset", "session.close"}:
-                    result = {"ok": True}
-                elif method == "engine.shutdown":
+                elif method in {"session.reset", "session.close"} or method == "engine.shutdown":
                     result = {"ok": True}
                 else:
                     raise ProtocolError("method not found", "METHOD_NOT_FOUND", -32601)
@@ -196,7 +194,7 @@ def main() -> None:
                 emit({"jsonrpc": "2.0", "id": request["id"], "result": result})
             if method == "engine.shutdown":
                 break
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 -- JSON-RPC errors belong on the wire
             if not isinstance(request, dict) or "id" in request:
                 emit({"jsonrpc": "2.0", "id": request.get("id") if isinstance(request, dict) else None, "error": error_payload(error)})
 
