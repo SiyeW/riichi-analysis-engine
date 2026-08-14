@@ -12,4 +12,4 @@ The current local development build loads `libriichi` from a downloaded Mortal s
 
 ## tenhou-to-mjai
 
-Training logs were obtained from [NikkeTryHard/tenhou-to-mjai](https://github.com/NikkeTryHard/tenhou-to-mjai). Its code is licensed under Apache License 2.0 and its converted datasets are offered under Creative Commons Attribution 4.0 International. See [DATA_PROVENANCE.md](DATA_PROVENANCE.md) for the reviewed revision, archive hashes, and required attribution checks.
+Training logs were obtained from [NikkeTryHard/tenhou-to-mjai release v2.0.0](https://github.com/NikkeTryHard/tenhou-to-mjai/releases/tag/v2.0.0). Its code is licensed under Apache License 2.0 and its converted datasets are offered under Creative Commons Attribution 4.0 International. See [DATA_PROVENANCE.md](DATA_PROVENANCE.md) for the reviewed revision, archive hashes, and required attribution checks.
