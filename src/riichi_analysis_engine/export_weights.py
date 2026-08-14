@@ -33,6 +33,18 @@ def source_revision() -> str | None:
         return None
 
 
+def public_dataset_metadata(checkpoint: dict[str, object]) -> object:
+    datasets = checkpoint.get("datasets")
+    if not isinstance(datasets, dict):
+        return None
+    return {
+        split: {key: value for key, value in metadata.items() if key != "path"}
+        if isinstance(metadata, dict)
+        else metadata
+        for split, metadata in datasets.items()
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export inference-only model weights.")
     parser.add_argument("checkpoint", type=Path)
@@ -62,7 +74,7 @@ def main() -> None:
             "step": int(checkpoint.get("step", 0)),
             "trainingData": args.training_data,
             "validationData": args.validation_data,
-            "datasets": checkpoint.get("datasets"),
+            "datasets": public_dataset_metadata(checkpoint),
             "environment": checkpoint.get("environment"),
             "validation": checkpoint.get("validation"),
             "sourceRevision": source_revision(),
