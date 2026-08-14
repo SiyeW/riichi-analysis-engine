@@ -182,11 +182,13 @@ def save_checkpoint(
     scaler: torch.amp.GradScaler,
     *,
     epoch: int,
+    batch_in_epoch: int,
     step: int,
+    samples_seen: int,
     parameters: dict[str, int],
     datasets: dict[str, dict[str, object]],
     environment: dict[str, object],
-    validation: dict[str, float],
+    validation: dict[str, float] | None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -194,7 +196,9 @@ def save_checkpoint(
         {
             "format": "riichi-analysis-model-v1",
             "epoch": epoch,
+            "batchInEpoch": batch_in_epoch,
             "step": step,
+            "samplesSeen": samples_seen,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
@@ -221,6 +225,8 @@ def main() -> None:
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-validation-samples", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--checkpoint-every", type=int, default=2000)
+    parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int, default=20252026)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -238,6 +244,21 @@ def main() -> None:
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
+    start_epoch = 0
+    resume_batch = 0
+    step = 0
+    samples_seen = 0
+    if args.resume is not None:
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
+        if checkpoint.get("format") != "riichi-analysis-model-v1":
+            raise RuntimeError("resume checkpoint has an unsupported format")
+        model.load_state_dict(checkpoint["model"], strict=True)
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scaler.load_state_dict(checkpoint["scaler"])
+        start_epoch = int(checkpoint.get("epoch", 0))
+        resume_batch = int(checkpoint.get("batchInEpoch", 0))
+        step = int(checkpoint.get("step", 0))
+        samples_seen = int(checkpoint.get("samplesSeen", 0))
     train_data = ShardDataset(
         args.train,
         shuffle=True,
@@ -285,17 +306,17 @@ def main() -> None:
         encoding="utf-8",
     )
     log_path = args.run / "metrics.jsonl"
-    step = 0
-    samples_seen = 0
     started = time.perf_counter()
     print(json.dumps({"device": str(device), "parameters": parameters}, indent=2))
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         train_data.set_epoch(epoch)
         model.train()
-        for batch in train_loader:
+        for batch_in_epoch, batch in enumerate(train_loader, start=1):
+            if epoch == start_epoch and batch_in_epoch <= resume_batch:
+                continue
             batch = move_batch(batch, device)
             samples_seen += len(batch["policy"])
             optimizer.zero_grad(set_to_none=True)
@@ -326,6 +347,21 @@ def main() -> None:
                 with log_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                 print(json.dumps(record, ensure_ascii=False))
+            if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
+                save_checkpoint(
+                    args.run / "checkpoint-latest.pt",
+                    model,
+                    optimizer,
+                    scaler,
+                    epoch=epoch,
+                    batch_in_epoch=batch_in_epoch,
+                    step=step,
+                    samples_seen=samples_seen,
+                    parameters=parameters,
+                    datasets=datasets,
+                    environment=environment,
+                    validation=None,
+                )
 
         metrics = validate(model, validation_loader, device, amp_dtype)
         record = {"phase": "validation", "epoch": epoch, "step": step, **metrics}
@@ -338,7 +374,9 @@ def main() -> None:
             optimizer,
             scaler,
             epoch=epoch + 1,
+            batch_in_epoch=0,
             step=step,
+            samples_seen=samples_seen,
             parameters=parameters,
             datasets=datasets,
             environment=environment,
