@@ -22,6 +22,7 @@
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[train,test]"
 .\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
 模型结构和训练方法见[模型文档](docs/model.zh-CN.md)，数据来源见[数据说明](DATA_PROVENANCE.md)。
@@ -54,6 +55,7 @@ py -3.11 -m venv .venv
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[train,test]"
 .\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
 モデル構成と学習方法は[モデル資料](docs/model.ja-JP.md)、データの出典は[データ資料](DATA_PROVENANCE.md)を参照してください。
@@ -86,6 +88,7 @@ The model, data converter, and training pipeline are under development. Training
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[train,test]"
 .\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
 See the [model documentation](docs/model.en-US.md) for the architecture and training workflow, and [data provenance](DATA_PROVENANCE.md) for dataset sources.
@@ -95,4 +98,3 @@ See the [model documentation](docs/model.en-US.md) for the architecture and trai
 Source code is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE). Training data, model weights, and third-party components retain their respective terms.
 
 </div>
-
