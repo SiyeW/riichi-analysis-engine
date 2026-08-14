@@ -11,6 +11,7 @@ def test_output_shapes() -> None:
     assert outputs["concealed_count"].shape == (2, 3, 34, 5)
     assert outputs["wall_count"].shape == (2, 34, 5)
     assert outputs["target"].shape == (2, 4, 4)
+    assert outputs["outcome"].shape == (2, 16)
     assert outputs["placement"].shape == (2, 24)
     assert outputs["policy"].shape == (2, 46)
 
@@ -20,8 +21,7 @@ def test_default_parameter_budget() -> None:
     assert count_parameters(model) == {
         "encoder": 23_663_488,
         "state": 1_875_750,
-        "future": 835_647,
+        "future": 844_106,
         "policy": 47_150,
-        "total": 26_422_035,
+        "total": 26_430_494,
     }
-

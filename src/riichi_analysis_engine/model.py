@@ -82,8 +82,7 @@ class HeadDimensions:
     wall_count: int = 34 * 5
     dora: int = 3
     score: int = 3
-    draw: int = 1
-    win: int = 4
+    outcome: int = 16
     deal_in_player: int = 4
     target: int = 4 * 4
     kyoku_delta: int = 4
@@ -105,8 +104,7 @@ class HeadDimensions:
         return (
             self.dora
             + self.score
-            + self.draw
-            + self.win
+            + self.outcome
             + self.deal_in_player
             + self.target
             + self.kyoku_delta
@@ -159,13 +157,12 @@ class RiichiAnalysisModel(nn.Module):
             state,
             (d.shanten, d.furiten_no_yaku, d.deal_in_tile, d.concealed_count, d.wall_count),
         )
-        dora, score, draw, win, deal_player, target, delta, placement, match_score = self._split(
+        dora, score, outcome, deal_player, target, delta, placement, match_score = self._split(
             future,
             (
                 d.dora,
                 d.score,
-                d.draw,
-                d.win,
+                d.outcome,
                 d.deal_in_player,
                 d.target,
                 d.kyoku_delta,
@@ -182,8 +179,7 @@ class RiichiAnalysisModel(nn.Module):
             "wall_count": wall.view(batch, 34, 5),
             "dora": dora.view(batch, 3),
             "score": score.view(batch, 3),
-            "draw": draw.view(batch),
-            "win": win.view(batch, 4),
+            "outcome": outcome.view(batch, 16),
             "deal_in_player": deal_player.view(batch, 4),
             "target": target.view(batch, 4, 4),
             "kyoku_delta": delta.view(batch, 4),
@@ -206,4 +202,3 @@ def count_parameters(model: nn.Module) -> dict[str, int]:
     }
     counts["total"] = sum(parameter.numel() for parameter in model.parameters())
     return counts
-
