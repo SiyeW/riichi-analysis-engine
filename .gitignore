@@ -1,0 +1,12 @@
+/.venv/
+/.pytest_cache/
+/build/
+/dist/
+/data/manifests/
+/data/processed/
+/runs/
+/weights/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
