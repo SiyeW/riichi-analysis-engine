@@ -10,6 +10,8 @@ The local `model.py`, gameplay loader, observation encoder, and constants were v
 
 The current local development build loads `libriichi` from a downloaded Mortal source tree. A public source release must include a reproducible way to build the exact `libriichi` binary it distributes.
 
+Windows runtime packages include the collected license texts for bundled Python packages. CUDA libraries distributed with a PyTorch runtime remain subject to NVIDIA's applicable terms and must be reviewed before publication.
+
 ## tenhou-to-mjai
 
 Training logs were obtained from [NikkeTryHard/tenhou-to-mjai release v2.0.0](https://github.com/NikkeTryHard/tenhou-to-mjai/releases/tag/v2.0.0). Its code is licensed under Apache License 2.0 and its converted datasets are offered under Creative Commons Attribution 4.0 International. See [DATA_PROVENANCE.md](DATA_PROVENANCE.md) for the reviewed revision, archive hashes, and required attribution checks.

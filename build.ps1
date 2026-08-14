@@ -52,6 +52,18 @@ Copy-Item -Path (Join-Path $WorkRoot 'pyinstaller\riichi-analysis-engine\*') -De
 Copy-Item -LiteralPath (Join-Path $ProjectRoot 'engine.json') -Destination $PackageRoot
 Copy-Item -LiteralPath (Join-Path $ProjectRoot 'LICENSE') -Destination $PackageRoot
 Copy-Item -LiteralPath (Join-Path $ProjectRoot 'THIRD_PARTY_NOTICES.md') -Destination $PackageRoot
+& $Python -m piplicenses `
+    --format plain-vertical `
+    --with-license-file `
+    --no-license-path `
+    --output-file (Join-Path $PackageRoot 'THIRD_PARTY_LICENSES.txt')
+if ($LASTEXITCODE -ne 0) {
+    throw 'Third-party license collection failed.'
+}
+$PythonLicense = & $Python -c "import pathlib, sys; print(pathlib.Path(sys.base_prefix) / 'LICENSE.txt')"
+if (Test-Path -LiteralPath $PythonLicense) {
+    Copy-Item -LiteralPath $PythonLicense -Destination (Join-Path $PackageRoot 'PYTHON_LICENSE.txt')
+}
 
 Write-Host "Built runtime package: $PackageRoot"
 Write-Host 'Model weights are not included.'
