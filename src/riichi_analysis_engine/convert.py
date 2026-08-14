@@ -13,8 +13,8 @@ import numpy as np
 from .constants import OBS_VERSION, relative_players
 from .replay import (
     FRAME_EVENTS,
+    ExactTargetTracker,
     FullState,
-    LegacyTargetTracker,
     action_label,
     annotate_game,
     passive_perspective,
@@ -34,12 +34,12 @@ def read_manifest(path: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
 
 def _sample_targets(
     perspective: int,
-    legacy_targets: np.ndarray,
+    exact_targets: np.ndarray,
     full_state: FullState,
     future: dict[str, np.ndarray | int],
     annotation: Any,
 ) -> dict[str, np.ndarray | int]:
-    row = legacy_targets[perspective]
+    row = exact_targets[perspective]
     shanten = np.empty(3, dtype=np.uint8)
     furiten = np.empty(3, dtype=np.uint8)
     deal_in = np.empty((3, 34), dtype=np.uint8)
@@ -81,14 +81,14 @@ def convert_game(
 ) -> dict[str, np.ndarray]:
     annotations = annotate_game(events)
     full_state = FullState()
-    legacy = LegacyTargetTracker(label_source_root)
+    exact_tracker = ExactTargetTracker(label_source_root)
     states = [player_state_type(player) for player in range(4)]
     samples: dict[str, list[Any]] = {}
 
     def append_sample(
         event_index: int,
         perspective: int,
-        legacy_targets: np.ndarray,
+        exact_targets: np.ndarray,
         *,
         policy: int,
         kan_select: bool,
@@ -102,7 +102,7 @@ def convert_game(
         annotation = annotations[event_index]
         future = rotated_future(annotation, full_state.scores, perspective)
         targets = _sample_targets(
-            perspective, legacy_targets, full_state, future, annotation
+            perspective, exact_targets, full_state, future, annotation
         )
         values: dict[str, Any] = {
             "obs": np.asarray(observation, dtype=np.float32),
@@ -119,11 +119,11 @@ def convert_game(
         event_json = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         candidates = [state.update(event_json) for state in states]
         full_state.process(event)
-        legacy_targets = legacy.process(event)
+        exact_targets = exact_tracker.process(event)
         if event["type"] not in FRAME_EVENTS:
             continue
-        if legacy_targets is None:
-            raise RuntimeError(f"missing legacy targets at {source_id}:{index}")
+        if exact_targets is None:
+            raise RuntimeError(f"missing exact targets at {source_id}:{index}")
 
         sampled: set[int] = set()
         for perspective, cans in enumerate(candidates):
@@ -138,7 +138,7 @@ def convert_game(
             append_sample(
                 index,
                 perspective,
-                legacy_targets,
+                exact_targets,
                 policy=policy,
                 kan_select=False,
             )
@@ -147,7 +147,7 @@ def convert_game(
                 append_sample(
                     index,
                     perspective,
-                    legacy_targets,
+                    exact_targets,
                     policy=kan_tile,
                     kan_select=True,
                 )
@@ -157,7 +157,7 @@ def convert_game(
             append_sample(
                 index,
                 passive,
-                legacy_targets,
+                exact_targets,
                 policy=-1,
                 kan_select=False,
             )
@@ -205,7 +205,7 @@ def convert_record_to_shard(
         )
         save_shard(destination, arrays)
         return record_index, record["sourceId"], len(arrays["policy"]), None
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 -- one malformed game must not stop a batch
         return record_index, record["sourceId"], 0, repr(error)
 
 
@@ -263,7 +263,7 @@ def main() -> None:
             for completed, future in enumerate(
                 concurrent.futures.as_completed(futures), start=1
             ):
-                index, source_id, samples, error = future.result()
+                _index, source_id, samples, error = future.result()
                 if error is None:
                     converted_games += 1
                     converted_samples += samples
@@ -324,7 +324,7 @@ def main() -> None:
             converted_games += 1
             if len(shard_games) >= args.games_per_shard:
                 flush()
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 -- report and continue with later games
             failures.append({"sourceId": record["sourceId"], "error": repr(error)})
             print(f"FAILED {record['sourceId']}: {error!r}", file=sys.stderr)
     flush()

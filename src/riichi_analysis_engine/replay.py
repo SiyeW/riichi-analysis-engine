@@ -16,9 +16,7 @@ import numpy as np
 
 from .constants import (
     PLAYERS,
-    TILE34_TO_INDEX,
     TILE37_TO_ACTION,
-    TILES_34,
     deaka,
     relative_players,
     tile34_index,
@@ -267,8 +265,8 @@ def annotate_game(events: list[dict[str, Any]]) -> dict[int, FutureAnnotation]:
     return annotations
 
 
-class LegacyTargetTracker:
-    """Uses the audited v2.3 hidden-state labels while they are moved into this repo."""
+class ExactTargetTracker:
+    """Uses the audited v2.3 hidden-state implementation for exact labels."""
 
     def __init__(self, source_root: Path) -> None:
         root = str(source_root.resolve())
@@ -386,7 +384,7 @@ def action_label(
 
 def passive_perspective(source_id: str, event_index: int) -> int:
     digest = hashlib.blake2b(
-        f"{source_id}:{event_index}".encode("utf-8"), digest_size=8
+        f"{source_id}:{event_index}".encode(), digest_size=8
     ).digest()
     return int.from_bytes(digest, "little") % PLAYERS
 

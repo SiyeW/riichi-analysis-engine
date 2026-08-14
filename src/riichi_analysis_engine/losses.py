@@ -4,7 +4,6 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
-
 DEFAULT_WEIGHTS = {
     "policy": 1.0,
     "shanten": 1.0,

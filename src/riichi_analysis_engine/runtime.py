@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from .constants import TILES_34, TILE37_TO_ACTION, relative_players, tile34_index
+from .constants import TILE37_TO_ACTION, TILES_34, relative_players, tile34_index
 from .model import RiichiAnalysisModel
 
 PERMUTATIONS = tuple(itertools.permutations(range(4)))
