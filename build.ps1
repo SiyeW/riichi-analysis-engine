@@ -60,8 +60,13 @@ Copy-Item -LiteralPath (Join-Path $ProjectRoot 'THIRD_PARTY_NOTICES.md') -Destin
 if ($LASTEXITCODE -ne 0) {
     throw 'Third-party license collection failed.'
 }
-$PythonLicense = & $Python -c "import pathlib, sys; print(pathlib.Path(sys.base_prefix) / 'LICENSE.txt')"
-if (Test-Path -LiteralPath $PythonLicense) {
+$PythonBase = & $Python -c "import sys; print(sys.base_prefix)"
+$PythonLicenses = @(
+    (Join-Path $PythonBase 'LICENSE_PYTHON.txt'),
+    (Join-Path $PythonBase 'LICENSE.txt')
+)
+$PythonLicense = $PythonLicenses | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if ($PythonLicense) {
     Copy-Item -LiteralPath $PythonLicense -Destination (Join-Path $PackageRoot 'PYTHON_LICENSE.txt')
 }
 
