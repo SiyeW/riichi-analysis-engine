@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
+import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -13,6 +16,34 @@ from torch.utils.data import DataLoader
 from .dataset import ShardDataset
 from .losses import DEFAULT_WEIGHTS, multitask_loss
 from .model import RiichiAnalysisModel, count_parameters
+
+
+def environment_metadata(device: torch.device) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "numpy": np.__version__,
+        "torch": str(torch.__version__),
+        "cudaRuntime": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),
+    }
+    if device.type == "cuda":
+        metadata["deviceName"] = torch.cuda.get_device_name(device)
+        metadata["deviceCapability"] = list(torch.cuda.get_device_capability(device))
+    return metadata
+
+
+def dataset_metadata(root: Path) -> dict[str, object]:
+    summary_path = root / "summary.json"
+    if not summary_path.exists():
+        return {"path": str(root.resolve())}
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    return {
+        "path": str(root.resolve()),
+        "manifest": summary.get("manifest"),
+        "games": summary.get("convertedGames"),
+        "samples": summary.get("convertedSamples"),
+    }
 
 
 def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -127,6 +158,9 @@ def save_checkpoint(
     epoch: int,
     step: int,
     parameters: dict[str, int],
+    datasets: dict[str, dict[str, object]],
+    environment: dict[str, object],
+    validation: dict[str, float],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -140,6 +174,9 @@ def save_checkpoint(
             "scaler": scaler.state_dict(),
             "parameters": parameters,
             "lossWeights": DEFAULT_WEIGHTS,
+            "datasets": datasets,
+            "environment": environment,
+            "validation": validation,
         },
         temporary,
     )
@@ -202,6 +239,11 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
     args.run.mkdir(parents=True, exist_ok=True)
+    datasets = {
+        "train": dataset_metadata(args.train),
+        "validation": dataset_metadata(args.validation),
+    }
+    environment = environment_metadata(device)
     config = {
         **vars(args),
         "train": str(args.train.resolve()),
@@ -209,6 +251,8 @@ def main() -> None:
         "run": str(args.run.resolve()),
         "effectiveDevice": str(device),
         "parameters": parameters,
+        "datasets": datasets,
+        "environment": environment,
     }
     (args.run / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2, default=str) + "\n",
@@ -270,6 +314,9 @@ def main() -> None:
             epoch=epoch + 1,
             step=step,
             parameters=parameters,
+            datasets=datasets,
+            environment=environment,
+            validation=metrics,
         )
 
 

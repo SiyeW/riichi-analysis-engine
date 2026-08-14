@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import torch
@@ -17,6 +18,19 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def source_revision() -> str | None:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
 
 
 def main() -> None:
@@ -48,6 +62,10 @@ def main() -> None:
             "step": int(checkpoint.get("step", 0)),
             "trainingData": args.training_data,
             "validationData": args.validation_data,
+            "datasets": checkpoint.get("datasets"),
+            "environment": checkpoint.get("environment"),
+            "validation": checkpoint.get("validation"),
+            "sourceRevision": source_revision(),
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
