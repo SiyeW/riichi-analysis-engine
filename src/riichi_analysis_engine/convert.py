@@ -217,6 +217,10 @@ def main() -> None:
     parser.add_argument("--label-source-root", type=Path, required=True)
     parser.add_argument("--games-per-shard", type=int, default=16)
     parser.add_argument("--max-games", type=int, default=0)
+    parser.add_argument("--start-game", type=int, default=0)
+    parser.add_argument("--end-game", type=int, default=0)
+    parser.add_argument("--reverse", action="store_true")
+    parser.add_argument("--summary-name", default="summary.json")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -227,8 +231,16 @@ def main() -> None:
     from libriichi.state import PlayerState
 
     metadata, records = read_manifest(args.manifest)
+    start_game = args.start_game
+    end_game = args.end_game or len(records)
+    if not 0 <= start_game <= end_game <= len(records):
+        raise ValueError("game range is outside the manifest")
     if args.max_games > 0:
-        records = records[: args.max_games]
+        end_game = min(end_game, start_game + args.max_games)
+    indexed_records = list(enumerate(records[start_game:end_game], start=start_game))
+    if args.reverse:
+        indexed_records.reverse()
+    records = [record for _index, record in indexed_records]
     args.output.mkdir(parents=True, exist_ok=True)
     if args.workers > 1:
         converted_games = 0
@@ -246,7 +258,7 @@ def main() -> None:
                     str(args.label_source_root.resolve()),
                     args.overwrite,
                 )
-                for index, record in enumerate(records)
+                for index, record in indexed_records
             ]
             for completed, future in enumerate(
                 concurrent.futures.as_completed(futures), start=1
@@ -273,7 +285,7 @@ def main() -> None:
             "failures": failures,
             "elapsedSeconds": time.perf_counter() - start,
         }
-        (args.output / "summary.json").write_text(
+        (args.output / args.summary_name).write_text(
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -326,7 +338,7 @@ def main() -> None:
         "failures": failures,
         "elapsedSeconds": time.perf_counter() - start,
     }
-    (args.output / "summary.json").write_text(
+    (args.output / args.summary_name).write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
