@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import torch
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from .dataset import ShardDataset
@@ -28,6 +29,16 @@ def validate(
     model.eval()
     totals: dict[str, float] = {"total": 0.0, **{name: 0.0 for name in DEFAULT_WEIGHTS}}
     batches = 0
+    metric_sums: dict[str, float] = {}
+    metric_counts: dict[str, int] = {}
+
+    def add_metric(name: str, values: torch.Tensor, mask: torch.Tensor | None = None) -> None:
+        values = values.float()
+        if mask is not None:
+            values = values[mask]
+        metric_sums[name] = metric_sums.get(name, 0.0) + float(values.sum())
+        metric_counts[name] = metric_counts.get(name, 0) + values.numel()
+
     for batch in loader:
         batch = move_batch(batch, device)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
@@ -36,8 +47,75 @@ def validate(
         totals["total"] += float(total)
         for name, value in losses.items():
             totals[name] += float(value)
+        policy_valid = batch["policy"] >= 0
+        policy_logits = outputs["policy"].masked_fill(~batch["action_mask"], -torch.inf)
+        add_metric(
+            "policyAccuracy",
+            policy_logits.argmax(-1) == batch["policy"],
+            policy_valid,
+        )
+        add_metric(
+            "shantenAccuracy",
+            outputs["shanten"].argmax(-1) == batch["shanten"],
+        )
+        add_metric(
+            "furitenBrier",
+            (outputs["furiten_no_yaku"].sigmoid() - batch["furiten_no_yaku"].float()).square(),
+            batch["shanten"] == 0,
+        )
+        add_metric(
+            "dealInTileBrier",
+            (outputs["deal_in_tile"].sigmoid() - batch["deal_in_tile"].float()).square(),
+        )
+        add_metric(
+            "concealedCountAccuracy",
+            outputs["concealed_count"].argmax(-1) == batch["concealed_count"],
+        )
+        add_metric(
+            "wallCountAccuracy",
+            outputs["wall_count"].argmax(-1) == batch["wall_count"],
+        )
+        add_metric(
+            "doraMae",
+            (F.softplus(outputs["dora"]) - batch["dora"].float()).abs(),
+            batch["winner_mask"].bool(),
+        )
+        add_metric(
+            "scoreMaePoints",
+            (F.softplus(outputs["score"]) * 1000.0 - batch["score"].float()).abs(),
+            batch["winner_mask"].bool(),
+        )
+        outcome_label = sum(
+            batch["win"][:, player].long() << player for player in range(4)
+        )
+        add_metric("outcomeAccuracy", outputs["outcome"].argmax(-1) == outcome_label)
+        add_metric(
+            "dealInPlayerBrier",
+            (outputs["deal_in_player"].sigmoid() - batch["deal_in_player"].float()).square(),
+        )
+        add_metric(
+            "targetAccuracy",
+            outputs["target"].argmax(-1) == batch["target"],
+            batch["target"] >= 0,
+        )
+        add_metric(
+            "kyokuDeltaMaePoints",
+            (outputs["kyoku_delta"] * 10_000.0 - batch["kyoku_delta"].float()).abs(),
+        )
+        add_metric("placementJointAccuracy", outputs["placement"].argmax(-1) == batch["placement"])
+        add_metric(
+            "matchScoreMaePoints",
+            (outputs["match_score"] * 10_000.0 - batch["match_score"].float()).abs(),
+        )
         batches += 1
-    return {name: value / max(1, batches) for name, value in totals.items()}
+    result = {name: value / max(1, batches) for name, value in totals.items()}
+    result.update(
+        {
+            f"metric/{name}": metric_sums[name] / max(1, metric_counts[name])
+            for name in metric_sums
+        }
+    )
+    return result
 
 
 def save_checkpoint(
