@@ -2,7 +2,6 @@ param(
     [Parameter(Mandatory = $true)] [string] $Raw2025,
     [Parameter(Mandatory = $true)] [string] $Zip2026,
     [Parameter(Mandatory = $true)] [string] $MortalPythonRoot,
-    [Parameter(Mandatory = $true)] [string] $LabelSourceRoot,
     [int] $Workers = 8,
     [int] $BatchSize = 256
 )
@@ -29,14 +28,12 @@ if (-not (Test-Path -LiteralPath $python)) {
     --manifest (Join-Path $manifests "validation-2026.jsonl") `
     --output $validation `
     --mortal-python-root $MortalPythonRoot `
-    --label-source-root $LabelSourceRoot `
     --workers $Workers
 
 & $python -m riichi_analysis_engine.convert `
     --manifest (Join-Path $manifests "train-2025-1of20.jsonl") `
     --output $train `
     --mortal-python-root $MortalPythonRoot `
-    --label-source-root $LabelSourceRoot `
     --workers $Workers
 
 & $python -m riichi_analysis_engine.train `
@@ -50,4 +47,3 @@ if (-not (Test-Path -LiteralPath $python)) {
 & $python -m riichi_analysis_engine.export_weights `
     (Join-Path $run "checkpoint-epoch-1.pt") `
     $weights
-
