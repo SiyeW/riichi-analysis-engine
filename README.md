@@ -22,6 +22,7 @@
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[train,test]"
 .\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
 模型结构和通用训练接口见[模型文档](docs/model.zh-CN.md)。
@@ -54,6 +55,7 @@ py -3.11 -m venv .venv
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[train,test]"
 .\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
 モデル構成と共通の学習インターフェースは[モデル資料](docs/model.ja-JP.md)を参照してください。
@@ -86,6 +88,7 @@ The model, data converter, and training pipeline are under development. Training
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[train,test]"
 .\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
 See the [model documentation](docs/model.en-US.md) for the architecture and generic training interface.
@@ -95,4 +98,3 @@ See the [model documentation](docs/model.en-US.md) for the architecture and gene
 Source code is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE). Training data, model weights, and third-party components retain their respective terms.
 
 </div>
-
