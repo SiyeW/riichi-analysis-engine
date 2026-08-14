@@ -2,7 +2,7 @@
 
 ## Mortal and libriichi
 
-The observation encoder, action space, and residual model family are based on [Mortal](https://github.com/Equim-chan/Mortal) and its `libriichi` component.
+The observation encoder, action space, rule-label calculations, and residual model family are based on [Mortal](https://github.com/Equim-chan/Mortal) and its `libriichi` component.
 
 Mortal is licensed under the GNU Affero General Public License v3.0 or later. No Mortal or Akagi model weights are included in this repository.
 

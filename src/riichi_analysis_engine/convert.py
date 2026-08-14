@@ -77,11 +77,10 @@ def convert_game(
     source_id: str,
     *,
     player_state_type: Any,
-    label_source_root: Path,
 ) -> dict[str, np.ndarray]:
     annotations = annotate_game(events)
     full_state = FullState()
-    exact_tracker = ExactTargetTracker(label_source_root)
+    exact_tracker = ExactTargetTracker()
     states = [player_state_type(player) for player in range(4)]
     samples: dict[str, list[Any]] = {}
 
@@ -119,7 +118,7 @@ def convert_game(
         event_json = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         candidates = [state.update(event_json) for state in states]
         full_state.process(event)
-        exact_targets = exact_tracker.process(event)
+        exact_targets = exact_tracker.process(event, states)
         if event["type"] not in FRAME_EVENTS:
             continue
         if exact_targets is None:
@@ -179,7 +178,6 @@ def convert_record_to_shard(
     record: dict[str, str],
     output: str,
     mortal_python_root: str,
-    label_source_root: str,
     overwrite: bool,
 ) -> tuple[int, str, int, str | None]:
     destination = Path(output) / f"game-{record_index:06d}.npz"
@@ -201,7 +199,6 @@ def convert_record_to_shard(
             events,
             record["sourceId"],
             player_state_type=PlayerState,
-            label_source_root=Path(label_source_root),
         )
         save_shard(destination, arrays)
         return record_index, record["sourceId"], len(arrays["policy"]), None
@@ -214,7 +211,7 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--mortal-python-root", type=Path, required=True)
-    parser.add_argument("--label-source-root", type=Path, required=True)
+    parser.add_argument("--label-source-root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--games-per-shard", type=int, default=16)
     parser.add_argument("--max-games", type=int, default=0)
     parser.add_argument("--start-game", type=int, default=0)
@@ -255,7 +252,6 @@ def main() -> None:
                     record,
                     str(args.output.resolve()),
                     mortal_root,
-                    str(args.label_source_root.resolve()),
                     args.overwrite,
                 )
                 for index, record in indexed_records
@@ -318,7 +314,6 @@ def main() -> None:
                     events,
                     record["sourceId"],
                     player_state_type=PlayerState,
-                    label_source_root=args.label_source_root,
                 )
             )
             converted_games += 1

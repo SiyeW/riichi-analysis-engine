@@ -29,7 +29,7 @@ State predictions cover opponent shanten, furiten or no yaku, per-tile deal-in r
 
 Training inputs are supplied through a private external manifest.
 
-At least one deterministic perspective is retained for every public event. When an action can be supervised, the acting player or an explicit-pass perspective is retained as well. Observations are stored losslessly using two bitmaps and sparse `float16` values.
+At least one deterministic perspective is retained for every public event. When an action can be supervised, the acting player or an explicit-pass perspective is retained as well. Observations are compressed using two bitmaps and sparse `float16` values.
 
 ## Running the test training job
 

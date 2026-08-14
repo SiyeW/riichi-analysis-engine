@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import importlib
 import itertools
 import json
-import sys
 import zipfile
 from collections import Counter
 from dataclasses import dataclass, field
@@ -21,6 +19,7 @@ from .constants import (
     relative_players,
     tile34_index,
 )
+from .yaku import has_ron_yaku, is_complete_hand
 
 FRAME_EVENTS = {
     "start_kyoku",
@@ -266,58 +265,143 @@ def annotate_game(events: list[dict[str, Any]]) -> dict[int, FutureAnnotation]:
 
 
 class ExactTargetTracker:
-    """Uses the audited v2.3 hidden-state implementation for exact labels."""
+    """Build exact shanten and legal-ron labels from four libriichi states."""
 
-    def __init__(self, source_root: Path) -> None:
-        root = str(source_root.resolve())
-        if root not in sys.path:
-            sys.path.insert(0, root)
-        self.module = importlib.import_module("mj_shanten_predictor_v2_3.data")
-        self.state = self.module.GameState()
+    def __init__(self) -> None:
+        self.bakaze = 27
+        self.oya = 0
+        self.wall_remaining = 70
+        self.last_tsumo_actor: int | None = None
+        self.chankan_tile: int | None = None
+        self.discarded = np.zeros((4, 34), dtype=bool)
+        self.temporary_furiten = np.zeros(4, dtype=bool)
+        self.riichi_pass_furiten = np.zeros(4, dtype=bool)
         self.pending_pass: tuple[dict[str, Any], list[int]] | None = None
 
-    def process(self, event: dict[str, Any]) -> np.ndarray | None:
+    def _player_target(
+        self,
+        player: int,
+        state: Any,
+    ) -> tuple[int, int, np.ndarray]:
+        hand_raw = state.tehai
+        hand = (
+            np.frombuffer(hand_raw, dtype=np.uint8)
+            if isinstance(hand_raw, bytes)
+            else np.asarray(hand_raw, dtype=np.uint8)
+        ).astype(np.int16)
+        drawn = state.last_self_tsumo()
+        can_improve_after_discard = int(hand.sum()) % 3 == 2 and bool(
+            state.has_next_shanten_discard
+        )
+        shanten = int(state.shanten)
+        if can_improve_after_discard:
+            shanten -= 1
+        shanten = max(0, min(6, shanten))
+        ron_waits = np.zeros(34, dtype=np.uint8)
+        if shanten != 0:
+            return shanten, 0, ron_waits
+
+        if drawn is not None and int(hand.sum()) % 3 == 2:
+            hand[tile34_index(drawn)] -= 1
+        if int(hand.sum()) % 3 != 1:
+            return shanten, 0, ron_waits
+
+        open_melds = len(state.chis) + len(state.pons) + len(state.minkans) + len(state.ankans)
+        waits = np.zeros(34, dtype=bool)
+        for tile in range(34):
+            if hand[tile] >= 4:
+                continue
+            hand[tile] += 1
+            waits[tile] = is_complete_hand(hand, open_melds)
+            hand[tile] -= 1
+        if not waits.any():
+            return shanten, 0, ron_waits
+        if (
+            bool((waits & self.discarded[player]).any())
+            or bool(self.temporary_furiten[player])
+            or bool(self.riichi_pass_furiten[player])
+        ):
+            return shanten, 1, ron_waits
+        if bool(state.self_riichi_declared or state.self_riichi_accepted):
+            return shanten, 0, waits.astype(np.uint8)
+        if self.wall_remaining == 0 and player != self.last_tsumo_actor:
+            return shanten, 0, waits.astype(np.uint8)
+
+        any_yaku = False
+        for tile in np.flatnonzero(waits):
+            tile = int(tile)
+            if tile == self.chankan_tile:
+                ron_waits[tile] = 1
+                any_yaku = True
+                continue
+            complete = hand.copy()
+            complete[tile] += 1
+            if has_ron_yaku(
+                complete,
+                chis=state.chis,
+                pons=state.pons,
+                minkans=state.minkans,
+                ankans=state.ankans,
+                bakaze=self.bakaze,
+                jikaze=27 + ((player - self.oya) % 4),
+                winning_tile=tile,
+            ):
+                ron_waits[tile] = 1
+                any_yaku = True
+        return shanten, int(not any_yaku), ron_waits
+
+    def process(self, event: dict[str, Any], states: list[Any]) -> np.ndarray | None:
+        kind = event["type"]
         if self.pending_pass is not None:
             discard, players = self.pending_pass
-            if self.module.is_hora_on_dahai(event, discard):
-                self.pending_pass = None
-            else:
-                self.state.apply_accepted_dahai_passes(players)
-                self.state.mark_accepted_dahai(discard)
-                self.pending_pass = None
-
-        kind = event["type"]
+            if not (kind == "hora" and event.get("target") == discard.get("actor")):
+                for player in players:
+                    if bool(
+                        states[player].self_riichi_declared
+                        or states[player].self_riichi_accepted
+                    ):
+                        self.riichi_pass_furiten[player] = True
+                    else:
+                        self.temporary_furiten[player] = True
+            self.pending_pass = None
+        self.chankan_tile = None
+        if kind == "start_kyoku":
+            self.bakaze = 27 + "ESWN".index(event["bakaze"])
+            self.oya = int(event["oya"])
+            self.wall_remaining = 70
+            self.last_tsumo_actor = None
+            self.discarded.fill(False)
+            self.temporary_furiten.fill(False)
+            self.riichi_pass_furiten.fill(False)
+        elif kind == "tsumo":
+            self.wall_remaining = max(0, self.wall_remaining - 1)
+            self.last_tsumo_actor = int(event["actor"])
+            self.temporary_furiten[int(event["actor"])] = False
+        elif kind == "dahai":
+            self.discarded[int(event["actor"]), tile34_index(event["pai"])] = True
+        elif kind == "kakan":
+            self.chankan_tile = tile34_index(event["pai"])
         if kind not in FRAME_EVENTS:
             return None
-        handlers = {
-            "start_kyoku": self.state.handle_start_kyoku,
-            "tsumo": self.state.handle_tsumo,
-            "dahai": self.state.handle_dahai,
-            "chi": self.state.handle_chi,
-            "pon": self.state.handle_pon,
-            "reach": self.state.handle_reach,
-            "reach_accepted": self.state.handle_reach_accepted,
-            "dora": self.state.handle_dora,
-        }
-        if kind in {"ankan", "kakan", "daiminkan"}:
-            self.state.handle_kan(event)
-        else:
-            handlers[kind](event)
 
-        target0 = self.module.encode_target(self.state)
-        rotated = self.module._rotate_targets_row(target0, self.state)
+        absolute = [self._player_target(player, states[player]) for player in range(4)]
+        rotated = np.zeros((4, 126), dtype=np.float32)
+        for perspective in range(4):
+            for position, player in enumerate(relative_players(perspective)):
+                shanten, stuck, waits = absolute[player]
+                base = position * 8
+                rotated[perspective, base + shanten] = 1
+                rotated[perspective, base + 7] = stuck
+                rotated[perspective, 24 + position * 34 : 24 + (position + 1) * 34] = waits
         if kind == "dahai":
-            tile = self.state._ti34(event["pai"])
-            players = (
-                []
-                if tile is None
-                else self.module._ron_pass_candidates_from_rotated_targets(
-                    rotated, event["actor"], tile
-                )
-            )
+            discarder = int(event["actor"])
+            tile = tile34_index(event["pai"])
+            players = [
+                player
+                for player in range(4)
+                if player != discarder and absolute[player][2][tile]
+            ]
             self.pending_pass = (event, players)
-        self.state.chankan_tile = None
-        self.state.last_accepted_dahai = None
         return rotated
 
 
