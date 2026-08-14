@@ -20,12 +20,14 @@
 
 ```powershell
 py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[train,test]"
+.\.venv\Scripts\python.exe -m pip install -e ".[train,test,build]"
 .\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
 模型结构和训练方法见[模型文档](docs/model.zh-CN.md)，数据来源见[数据说明](DATA_PROVENANCE.md)。
+
+运行 `build.ps1` 可生成不含模型权重的 Windows 引擎包。
 
 ### 许可证
 
@@ -53,12 +55,14 @@ py -3.11 -m venv .venv
 
 ```powershell
 py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[train,test]"
+.\.venv\Scripts\python.exe -m pip install -e ".[train,test,build]"
 .\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
 モデル構成と学習方法は[モデル資料](docs/model.ja-JP.md)、データの出典は[データ資料](DATA_PROVENANCE.md)を参照してください。
+
+`build.ps1` を実行すると、モデルの重みを含まない Windows エンジンパッケージを作成できます。
 
 ### ライセンス
 
@@ -86,12 +90,14 @@ The model, data converter, and training pipeline are under development. Training
 
 ```powershell
 py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[train,test]"
+.\.venv\Scripts\python.exe -m pip install -e ".[train,test,build]"
 .\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
 See the [model documentation](docs/model.en-US.md) for the architecture and training workflow, and [data provenance](DATA_PROVENANCE.md) for dataset sources.
+
+Run `build.ps1` to create a Windows engine package without model weights.
 
 ### License
 
