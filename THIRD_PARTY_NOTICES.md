@@ -10,6 +10,8 @@ The local `model.py`, gameplay loader, observation encoder, and constants were v
 
 The current local development build loads `libriichi` from a downloaded Mortal source tree. A public source release must include a reproducible way to build the exact `libriichi` binary it distributes.
 
+Windows runtime packages include the collected license texts for bundled Python packages. CUDA libraries distributed with a PyTorch runtime remain subject to NVIDIA's applicable terms and must be reviewed before publication.
+
 ## Training data
 
 Training-data details are maintained outside the public repository.
