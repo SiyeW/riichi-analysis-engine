@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -50,6 +51,7 @@ def save_checkpoint(
     parameters: dict[str, int],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
             "format": "riichi-analysis-model-v1",
@@ -61,8 +63,9 @@ def save_checkpoint(
             "parameters": parameters,
             "lossWeights": DEFAULT_WEIGHTS,
         },
-        path,
+        temporary,
     )
+    os.replace(temporary, path)
 
 
 def main() -> None:

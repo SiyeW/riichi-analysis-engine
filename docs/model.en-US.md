@@ -30,3 +30,7 @@ State predictions cover opponent shanten, furiten or no yaku, per-tile deal-in r
 The training split contains 8,944 games, selected as a stable filename-hash `1/20` sample of the 2025 logs. Validation uses the 246 games held out from the 2026 logs by the same MD5 bucket rule as Mortal's dataset preparation script.
 
 At least one deterministic perspective is retained for every public event. When an action can be supervised, the acting player or an explicit-pass perspective is retained as well. Observations are stored losslessly using two bitmaps and sparse `float16` values.
+
+## Running the test training job
+
+Create the Python 3.11 training environment, then run `scripts/run-training-test.ps1`. Supply the 2025 log directory, the 2026 archive, Mortal's Python module directory, and the v2.3 exact-label implementation. The script prepares manifests, converts both splits, trains one epoch, and exports inference weights. Completed per-game shards are reused when the job is resumed.
