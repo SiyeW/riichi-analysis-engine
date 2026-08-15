@@ -23,8 +23,10 @@ DEFAULT_WEIGHTS = {
 
 
 def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
-    mask = mask.to(values.dtype)
-    return (values * mask).sum() / mask.sum().clamp_min(1.0)
+    selected = values[mask]
+    if selected.numel() == 0:
+        return values.new_zeros(())
+    return selected.mean()
 
 
 def multitask_loss(
