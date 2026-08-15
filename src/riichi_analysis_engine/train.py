@@ -81,7 +81,8 @@ def validate(
     model: RiichiAnalysisModel,
     loader: DataLoader,
     device: torch.device,
-    amp_dtype: torch.dtype | None,
+    *,
+    progress_every: int = 100,
 ) -> dict[str, float]:
     model.eval()
     totals: dict[str, float] = {"total": 0.0, **{name: 0.0 for name in DEFAULT_WEIGHTS}}
@@ -98,9 +99,8 @@ def validate(
 
     for batch in loader:
         batch = move_batch(batch, device)
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            outputs = model(batch["obs"].float())
-            total, losses = multitask_loss(outputs, batch)
+        outputs = model(batch["obs"].float())
+        total, losses = multitask_loss(outputs, batch)
         totals["total"] += float(total)
         for name, value in losses.items():
             totals[name] += float(value)
@@ -165,6 +165,8 @@ def validate(
             (outputs["match_score"] * 10_000.0 - batch["match_score"].float()).abs(),
         )
         batches += 1
+        if progress_every > 0 and batches % progress_every == 0:
+            print(json.dumps({"phase": "validation-progress", "batches": batches}))
     result = {name: value / max(1, batches) for name, value in totals.items()}
     result.update(
         {
@@ -363,7 +365,7 @@ def main() -> None:
                     validation=None,
                 )
 
-        metrics = validate(model, validation_loader, device, amp_dtype)
+        metrics = validate(model, validation_loader, device)
         record = {"phase": "validation", "epoch": epoch, "step": step, **metrics}
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
