@@ -11,7 +11,7 @@ import torch
 from .runtime import AnalysisRuntime
 
 PROTOCOL = {"name": "riichi-engine-protocol", "major": 2, "minor": 1}
-ENGINE_VERSION = "0.1.0-dev.0"
+ENGINE_VERSION = "0.1.0-dev.1"
 OUTPUT_IDS = [
     "action-recommendation",
     "opponent-shanten",
@@ -76,14 +76,14 @@ class Engine:
             or protocol.get("major") != 2
             or isinstance(protocol.get("minor"), bool)
             or not isinstance(protocol.get("minor"), int)
-            or protocol.get("minor") < 1
+            or protocol.get("minor") < 0
         ):
             raise ProtocolError("protocol version is not compatible", "PROTOCOL_MISMATCH")
         devices = [{"type": "cpu", "title": {"default": "CPU"}}]
         if torch.cuda.is_available():
             devices.append({"type": "cuda", "title": {"default": "NVIDIA CUDA"}})
         return {
-            "protocol": PROTOCOL,
+            "protocol": {**PROTOCOL, "minor": min(protocol["minor"], PROTOCOL["minor"])},
             "engine": {"id": "org.riichi.analysis", "name": "Riichi Analysis Engine", "version": ENGINE_VERSION},
             "outputContracts": [output_declaration(value) for value in OUTPUT_IDS],
             "weightSlots": [
