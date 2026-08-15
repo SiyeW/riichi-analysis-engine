@@ -23,7 +23,7 @@ class PackedObservations:
 
 
 def pack_observations(observations: np.ndarray) -> PackedObservations:
-    observations = np.asarray(observations, dtype=np.float32)
+    observations = np.asarray(observations)
     if observations.ndim != 3 or observations.shape[1:] != (OBS_CHANNELS, TILE_TYPES):
         raise ValueError(f"wrong observation shape: {observations.shape}")
     if not np.isfinite(observations).all():
