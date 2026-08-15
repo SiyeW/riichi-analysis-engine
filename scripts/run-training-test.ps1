@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)] [string] $Raw2025,
     [Parameter(Mandatory = $true)] [string] $Zip2026,
     [Parameter(Mandatory = $true)] [string] $MortalPythonRoot,
-    [int] $Workers = 8,
+    [int] $Workers = 4,
     [int] $BatchSize = 256
 )
 

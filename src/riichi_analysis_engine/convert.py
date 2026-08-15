@@ -104,7 +104,7 @@ def convert_game(
             perspective, exact_targets, full_state, future, annotation
         )
         values: dict[str, Any] = {
-            "obs": np.asarray(observation, dtype=np.float32),
+            "obs": np.asarray(observation, dtype=np.float16),
             "action_mask": np.asarray(action_mask, dtype=bool),
             "policy": np.int8(policy),
             "perspective": np.uint8(perspective),
