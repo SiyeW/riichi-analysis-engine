@@ -19,6 +19,7 @@ from .constants import (
     relative_players,
     tile34_index,
 )
+from .prediction_values import SCORE_VALUE_SET
 from .yaku import has_ron_yaku, is_complete_hand
 
 FRAME_EVENTS = {
@@ -186,9 +187,23 @@ class FullState:
         tiles = self.winning_tiles(actor, target)
         dora_tiles = [_dora_from_marker(marker) for marker in self.dora_markers]
         dora_tiles.extend(_dora_from_marker(marker) for marker in ura_markers)
-        normal = sum(deaka(tile) in dora_tiles for tile in tiles)
+        normal = sum(dora_tiles.count(deaka(tile)) for tile in tiles)
         reds = sum(tile.endswith("r") for tile in tiles)
         return normal + reds
+
+
+def hand_score(event: dict[str, Any], state: FullState, *, first_winner: bool) -> int:
+    actor, target = int(event["actor"]), int(event["target"])
+    deltas = np.asarray(event["deltas"], dtype=np.int32)
+    if actor == target:
+        value = -int(deltas[np.arange(PLAYERS) != actor].sum())
+    else:
+        value = -int(deltas[target])
+    if first_winner:
+        value -= state.honba * 300
+    if value not in SCORE_VALUE_SET:
+        raise ValueError(f"hora produced an unsupported hand score: {value}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -234,10 +249,9 @@ def annotate_game(events: list[dict[str, Any]]) -> dict[int, FutureAnnotation]:
             if actor != target:
                 active.deal_in[target] = 1
             active.dora[actor] = state.dora_count(actor, target, list(event.get("ura_markers", [])))
-            value = int(event["deltas"][actor]) - state.honba * 300
-            if not active.first_winner_seen:
-                value -= state.kyotaku * 1_000
-            active.score[actor] = max(0, value)
+            active.score[actor] = hand_score(
+                event, state, first_winner=not active.first_winner_seen
+            )
             active.first_winner_seen = True
         elif kind == "ryukyoku" and active is not None:
             active.draw = 1

@@ -21,7 +21,7 @@ from .replay import (
     read_events,
     rotated_future,
 )
-from .storage import save_shard
+from .storage import STORAGE_FORMAT, save_shard
 
 
 def read_manifest(path: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
@@ -184,7 +184,7 @@ def convert_record_to_shard(
     if destination.exists() and not overwrite:
         try:
             with np.load(destination, allow_pickle=False) as source:
-                if source["storage_format"].item() != "dual-bitpack-sparse-float16-v1":
+                if source["storage_format"].item() != STORAGE_FORMAT:
                     raise ValueError("unsupported storage format")
                 return record_index, record["sourceId"], len(source["policy"]), None
         except (OSError, ValueError, KeyError, EOFError):
@@ -272,7 +272,7 @@ def main() -> None:
                         f"samples={converted_samples}; failures={len(failures)}"
                     )
         summary = {
-            "format": "riichi-analysis-multitask-v1",
+            "format": "riichi-analysis-multitask-v2",
             "manifest": metadata,
             "requestedGames": len(records),
             "convertedGames": converted_games,
@@ -325,7 +325,7 @@ def main() -> None:
     flush()
 
     summary = {
-        "format": "riichi-analysis-multitask-v1",
+        "format": "riichi-analysis-multitask-v2",
         "manifest": metadata,
         "requestedGames": len(records),
         "convertedGames": converted_games,

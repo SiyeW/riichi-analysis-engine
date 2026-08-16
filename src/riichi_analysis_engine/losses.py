@@ -4,6 +4,8 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+from .prediction_values import DORA_TAIL_START, SCORE_VALUES
+
 DEFAULT_WEIGHTS = {
     "policy": 1.0,
     "shanten": 1.0,
@@ -27,6 +29,16 @@ def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
     if selected.numel() == 0:
         return values.new_zeros(())
     return selected.mean()
+
+
+def score_class_indices(values: Tensor) -> Tensor:
+    vocabulary = torch.as_tensor(SCORE_VALUES, device=values.device, dtype=values.dtype)
+    indices = torch.searchsorted(vocabulary, values)
+    bounded = indices.clamp_max(len(SCORE_VALUES) - 1)
+    if ((indices >= len(SCORE_VALUES)) | (vocabulary[bounded] != values)).any():
+        invalid = values[(indices >= len(SCORE_VALUES)) | (vocabulary[bounded] != values)]
+        raise ValueError(f"score labels contain unsupported values: {invalid.unique().tolist()}")
+    return bounded
 
 
 def multitask_loss(
@@ -69,18 +81,38 @@ def multitask_loss(
     )
 
     winner_mask = batch["winner_mask"].bool()
-    dora_error = F.smooth_l1_loss(
-        F.softplus(outputs["dora"]), batch["dora"].float(), reduction="none"
+    if winner_mask.any():
+        dora_labels = batch["dora"].long()[winner_mask]
+        dora_classes = dora_labels.clamp_max(DORA_TAIL_START)
+        dora_distribution = F.cross_entropy(
+            outputs["dora_distribution"][winner_mask], dora_classes
+        )
+        dora_point = F.mse_loss(
+            F.softplus(outputs["dora_point"])[winner_mask], dora_labels.float()
+        )
+        score_labels = batch["score"].long()[winner_mask]
+        score_distribution = F.cross_entropy(
+            outputs["score_distribution"][winner_mask], score_class_indices(score_labels)
+        )
+        score_point = F.mse_loss(
+            F.softplus(outputs["score_point"])[winner_mask], score_labels.float() / 1000.0
+        )
+        losses["dora"] = dora_distribution + dora_point
+        losses["score"] = score_distribution + score_point
+    else:
+        losses["dora"] = outputs["dora_distribution"].sum() * 0
+        losses["score"] = outputs["score_distribution"].sum() * 0
+
+    any_win = batch["win"].bool().any(dim=-1)
+    any_win_loss = F.binary_cross_entropy_with_logits(
+        outputs["outcome_any_win"], any_win.float()
     )
-    losses["dora"] = _masked_mean(dora_error, winner_mask)
-    score_error = F.smooth_l1_loss(
-        F.softplus(outputs["score"]), batch["score"].float() / 1000.0, reduction="none"
+    winner_loss = F.binary_cross_entropy_with_logits(
+        outputs["outcome_winner"], batch["win"].float(), reduction="none"
     )
-    losses["score"] = _masked_mean(score_error, winner_mask)
-    outcome_label = sum(
-        batch["win"][:, player].long() << player for player in range(4)
+    losses["outcome"] = any_win_loss + _masked_mean(
+        winner_loss, any_win.unsqueeze(-1).expand_as(winner_loss)
     )
-    losses["outcome"] = F.cross_entropy(outputs["outcome"], outcome_label)
     losses["deal_in_player"] = F.binary_cross_entropy_with_logits(
         outputs["deal_in_player"], batch["deal_in_player"].float()
     )

@@ -1,7 +1,8 @@
 import numpy as np
 
+from riichi_analysis_engine.prediction_values import SCORE_VALUE_SET, SCORE_VALUES
 from riichi_analysis_engine.prepare import mortal_validation_members, stable_fraction
-from riichi_analysis_engine.replay import FullState, placement_label
+from riichi_analysis_engine.replay import FullState, hand_score, placement_label
 
 
 def test_wall_and_red_dora_tracking() -> None:
@@ -27,6 +28,28 @@ def test_wall_and_red_dora_tracking() -> None:
     state.process({"type": "tsumo", "actor": 0, "pai": "5m"})
     assert int(state.wall.sum()) == 82
     assert state.dora_count(0, 0, []) == 3
+    state.process({"type": "dora", "dora_marker": "4m"})
+    assert state.dora_count(0, 0, []) == 5
+
+
+def test_score_values_follow_the_non_kiriage_table() -> None:
+    assert 7_700 in SCORE_VALUE_SET
+    assert 7_900 in SCORE_VALUE_SET
+    assert 11_600 in SCORE_VALUE_SET
+    assert 11_700 in SCORE_VALUE_SET
+    assert 36_000 in SCORE_VALUE_SET
+    assert 64_000 in SCORE_VALUE_SET
+    assert 96_000 in SCORE_VALUE_SET
+    assert SCORE_VALUES[-1] == 288_000
+    assert 700 not in SCORE_VALUE_SET
+
+
+def test_only_first_winner_receives_honba_in_multiple_ron() -> None:
+    state = FullState(honba=1)
+    first = {"actor": 2, "target": 0, "deltas": [-4200, 0, 6200, 0]}
+    second = {"actor": 3, "target": 0, "deltas": [-1000, 0, 0, 1000]}
+    assert hand_score(first, state, first_winner=True) == 3_900
+    assert hand_score(second, state, first_winner=False) == 1_000
 
 
 def test_placement_ties_use_initial_seat_order() -> None:

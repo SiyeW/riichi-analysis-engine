@@ -8,7 +8,7 @@
 
 ### Riichi Analysis Engine
 
-一款兼容 [riichi-engine-protocol 2.1](https://github.com/SiyeW/riichi-engine-protocol) 的立直麻将分析引擎。
+一款兼容 [riichi-engine-protocol 2.2](https://github.com/SiyeW/riichi-engine-protocol) 的立直麻将分析引擎。
 
 同一个模型可以提供动作推荐、对手向听、牌张放铳率、对手暗牌、牌山、对手宝牌与打点、小局结果与收支、终局顺位与分数预测。
 
@@ -43,7 +43,7 @@ py -3.11 -m venv .venv
 
 ### Riichi Analysis Engine
 
-[riichi-engine-protocol 2.1](https://github.com/SiyeW/riichi-engine-protocol) に対応するリーチ麻雀解析エンジンです。
+[riichi-engine-protocol 2.2](https://github.com/SiyeW/riichi-engine-protocol) に対応するリーチ麻雀解析エンジンです。
 
 1 つのモデルで、行動推薦、対戦相手のシャンテン数と放銃率、手牌と牌山、ドラ数と打点、局の結果と収支、最終順位と持ち点を予測します。
 
@@ -78,7 +78,7 @@ py -3.11 -m venv .venv
 
 ### Riichi Analysis Engine
 
-A Riichi Mahjong analysis engine compatible with [riichi-engine-protocol 2.1](https://github.com/SiyeW/riichi-engine-protocol).
+A Riichi Mahjong analysis engine compatible with [riichi-engine-protocol 2.2](https://github.com/SiyeW/riichi-engine-protocol).
 
 One model predicts recommended actions, opponent shanten and deal-in risk, concealed hands and the wall, dora and hand value, kyoku outcomes and score changes, and final placement and scores.
 

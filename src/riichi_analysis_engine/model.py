@@ -7,6 +7,7 @@ import torch
 from torch import Tensor, nn
 
 from .constants import ACTION_SPACE, OBS_CHANNELS, TILE_TYPES
+from .prediction_values import DORA_VALUES, SCORE_VALUES
 
 
 class ChannelAttention(nn.Module):
@@ -80,6 +81,52 @@ class HeadDimensions:
     deal_in_tile: int = 3 * 34
     concealed_count: int = 3 * 34 * 5
     wall_count: int = 34 * 5
+    dora_distribution: int = 3 * len(DORA_VALUES)
+    dora_point: int = 3
+    score_distribution: int = 3 * len(SCORE_VALUES)
+    score_point: int = 3
+    outcome_any_win: int = 1
+    outcome_winner: int = 4
+    deal_in_player: int = 4
+    target: int = 4 * 4
+    kyoku_delta: int = 4
+    placement: int = 24
+    match_score: int = 4
+
+    @property
+    def state_total(self) -> int:
+        return (
+            self.shanten
+            + self.furiten_no_yaku
+            + self.deal_in_tile
+            + self.concealed_count
+            + self.wall_count
+        )
+
+    @property
+    def future_total(self) -> int:
+        return (
+            self.dora_distribution
+            + self.dora_point
+            + self.score_distribution
+            + self.score_point
+            + self.outcome_any_win
+            + self.outcome_winner
+            + self.deal_in_player
+            + self.target
+            + self.kyoku_delta
+            + self.placement
+            + self.match_score
+        )
+
+
+@dataclass(frozen=True)
+class HeadDimensionsV1:
+    shanten: int = 3 * 7
+    furiten_no_yaku: int = 3
+    deal_in_tile: int = 3 * 34
+    concealed_count: int = 3 * 34 * 5
+    wall_count: int = 34 * 5
     dora: int = 3
     score: int = 3
     outcome: int = 16
@@ -123,9 +170,13 @@ class RiichiAnalysisModel(nn.Module):
         blocks: int = 54,
         state_width: int = 1024,
         future_width: int = 768,
+        format_version: int = 2,
     ) -> None:
         super().__init__()
-        self.dimensions = HeadDimensions()
+        if format_version not in {1, 2}:
+            raise ValueError(f"unsupported model format version: {format_version}")
+        self.format_version = format_version
+        self.dimensions = HeadDimensionsV1() if format_version == 1 else HeadDimensions()
         self.encoder = MortalV4Encoder(channels=channels, blocks=blocks)
         self.state_adapter = nn.Sequential(
             nn.Linear(1024, state_width),
@@ -157,12 +208,66 @@ class RiichiAnalysisModel(nn.Module):
             state,
             (d.shanten, d.furiten_no_yaku, d.deal_in_tile, d.concealed_count, d.wall_count),
         )
-        dora, score, outcome, deal_player, target, delta, placement, match_score = self._split(
+        batch = observation.shape[0]
+        outputs = {
+            "shanten": shanten.view(batch, 3, 7),
+            "furiten_no_yaku": furiten.view(batch, 3),
+            "deal_in_tile": deal_in.view(batch, 3, 34),
+            "concealed_count": concealed.view(batch, 3, 34, 5),
+            "wall_count": wall.view(batch, 34, 5),
+            "policy": self.policy_head(latent),
+        }
+        if self.format_version == 1:
+            assert isinstance(d, HeadDimensionsV1)
+            dora, score, outcome, deal_player, target, delta, placement, match_score = self._split(
+                future,
+                (
+                    d.dora,
+                    d.score,
+                    d.outcome,
+                    d.deal_in_player,
+                    d.target,
+                    d.kyoku_delta,
+                    d.placement,
+                    d.match_score,
+                ),
+            )
+            outputs.update(
+                {
+                    "dora": dora.view(batch, 3),
+                    "score": score.view(batch, 3),
+                    "outcome": outcome.view(batch, 16),
+                    "deal_in_player": deal_player.view(batch, 4),
+                    "target": target.view(batch, 4, 4),
+                    "kyoku_delta": delta.view(batch, 4),
+                    "placement": placement.view(batch, 24),
+                    "match_score": match_score.view(batch, 4),
+                }
+            )
+            return outputs
+
+        assert isinstance(d, HeadDimensions)
+        (
+            dora_distribution,
+            dora_point,
+            score_distribution,
+            score_point,
+            outcome_any_win,
+            outcome_winner,
+            deal_player,
+            target,
+            delta,
+            placement,
+            match_score,
+        ) = self._split(
             future,
             (
-                d.dora,
-                d.score,
-                d.outcome,
+                d.dora_distribution,
+                d.dora_point,
+                d.score_distribution,
+                d.score_point,
+                d.outcome_any_win,
+                d.outcome_winner,
                 d.deal_in_player,
                 d.target,
                 d.kyoku_delta,
@@ -170,23 +275,22 @@ class RiichiAnalysisModel(nn.Module):
                 d.match_score,
             ),
         )
-        batch = observation.shape[0]
-        return {
-            "shanten": shanten.view(batch, 3, 7),
-            "furiten_no_yaku": furiten.view(batch, 3),
-            "deal_in_tile": deal_in.view(batch, 3, 34),
-            "concealed_count": concealed.view(batch, 3, 34, 5),
-            "wall_count": wall.view(batch, 34, 5),
-            "dora": dora.view(batch, 3),
-            "score": score.view(batch, 3),
-            "outcome": outcome.view(batch, 16),
-            "deal_in_player": deal_player.view(batch, 4),
-            "target": target.view(batch, 4, 4),
-            "kyoku_delta": delta.view(batch, 4),
-            "placement": placement.view(batch, 24),
-            "match_score": match_score.view(batch, 4),
-            "policy": self.policy_head(latent),
-        }
+        outputs.update(
+            {
+                "dora_distribution": dora_distribution.view(batch, 3, len(DORA_VALUES)),
+                "dora_point": dora_point.view(batch, 3),
+                "score_distribution": score_distribution.view(batch, 3, len(SCORE_VALUES)),
+                "score_point": score_point.view(batch, 3),
+                "outcome_any_win": outcome_any_win.view(batch),
+                "outcome_winner": outcome_winner.view(batch, 4),
+                "deal_in_player": deal_player.view(batch, 4),
+                "target": target.view(batch, 4, 4),
+                "kyoku_delta": delta.view(batch, 4),
+                "placement": placement.view(batch, 24),
+                "match_score": match_score.view(batch, 4),
+            }
+        )
+        return outputs
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:

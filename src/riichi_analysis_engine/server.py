@@ -10,8 +10,8 @@ import torch
 
 from .runtime import AnalysisRuntime
 
-PROTOCOL = {"name": "riichi-engine-protocol", "major": 2, "minor": 1}
-ENGINE_VERSION = "0.1.0-dev.1"
+PROTOCOL = {"name": "riichi-engine-protocol", "major": 2, "minor": 2}
+ENGINE_VERSION = "0.1.0-dev.2"
 OUTPUT_IDS = [
     "action-recommendation",
     "opponent-shanten",
@@ -28,11 +28,15 @@ OUTPUT_IDS = [
 NUMERIC_REPRESENTATIONS = {
     "opponent-concealed-tile-count": ["distribution", "expected-value"],
     "wall-tile-count": ["distribution", "expected-value"],
-    "opponent-dora-count": ["expected-value"],
-    "opponent-score": ["expected-value"],
     "kyoku-score-delta": ["expected-value"],
     "match-placement": ["distribution", "expected-value"],
     "match-score": ["expected-value"],
+}
+OUTPUT_INTRODUCED = {
+    "kyoku-outcome": 1,
+    "kyoku-score-delta": 1,
+    "match-placement": 1,
+    "match-score": 1,
 }
 POLICY_METRIC = {
     "id": "policy",
@@ -50,10 +54,41 @@ class ProtocolError(Exception):
         self.code = code
 
 
-def output_declaration(output_id: str, *, initialized: bool = False) -> dict[str, Any]:
+def available_output_ids(protocol_minor: int) -> list[str]:
+    return [
+        output_id
+        for output_id in OUTPUT_IDS
+        if OUTPUT_INTRODUCED.get(output_id, 0) <= protocol_minor
+    ]
+
+
+def numeric_representations(output_id: str, protocol_minor: int) -> list[str] | None:
+    if output_id == "opponent-dora-count":
+        if protocol_minor >= 2:
+            return ["distribution", "expected-value", "point-estimate"]
+        return ["expected-value"]
+    if output_id == "opponent-score":
+        if protocol_minor >= 2:
+            return ["distribution", "expected-value", "point-estimate"]
+        return ["distribution", "expected-value"]
+    return NUMERIC_REPRESENTATIONS.get(output_id)
+
+
+def output_declaration(
+    output_id: str,
+    protocol_minor: int,
+    *,
+    initialized: bool = False,
+    representations: list[str] | None = None,
+) -> dict[str, Any]:
     result: dict[str, Any] = {"id": output_id, "version": 1}
-    if output_id in NUMERIC_REPRESENTATIONS:
-        result["representations"] = NUMERIC_REPRESENTATIONS[output_id]
+    representations = (
+        numeric_representations(output_id, protocol_minor)
+        if representations is None
+        else representations
+    )
+    if representations is not None:
+        result["representations"] = representations
     if output_id == "action-recommendation":
         result["metrics"] = [POLICY_METRIC]
         if initialized:
@@ -67,6 +102,7 @@ class Engine:
         self.runtime: AnalysisRuntime | None = None
         self.enabled: set[str] = set()
         self.state = "starting"
+        self.protocol_minor: int | None = None
 
     def hello(self, params: dict[str, Any]) -> dict[str, Any]:
         protocol = params.get("protocol")
@@ -79,19 +115,23 @@ class Engine:
             or protocol.get("minor") < 0
         ):
             raise ProtocolError("protocol version is not compatible", "PROTOCOL_MISMATCH")
+        self.protocol_minor = min(protocol["minor"], PROTOCOL["minor"])
+        outputs = available_output_ids(self.protocol_minor)
         devices = [{"type": "cpu", "title": {"default": "CPU"}}]
         if torch.cuda.is_available():
             devices.append({"type": "cuda", "title": {"default": "NVIDIA CUDA"}})
         return {
-            "protocol": {**PROTOCOL, "minor": min(protocol["minor"], PROTOCOL["minor"])},
+            "protocol": {**PROTOCOL, "minor": self.protocol_minor},
             "engine": {"id": "org.riichi.analysis", "name": "Riichi Analysis Engine", "version": ENGINE_VERSION},
-            "outputContracts": [output_declaration(value) for value in OUTPUT_IDS],
+            "outputContracts": [
+                output_declaration(value, self.protocol_minor) for value in outputs
+            ],
             "weightSlots": [
                 {
                     "id": "model",
                     "title": {"default": "Model weights", "zh-CN": "模型权重", "ja-JP": "モデルの重み"},
                     "formats": [{"id": "riichi-analysis-pytorch-v1", "extensions": [".pt"]}],
-                    "requiredForOutputs": [{"id": value, "version": 1} for value in OUTPUT_IDS],
+                    "requiredForOutputs": [{"id": value, "version": 1} for value in outputs],
                 }
             ],
             "devices": devices,
@@ -100,11 +140,14 @@ class Engine:
         }
 
     def initialize(self, params: dict[str, Any]) -> dict[str, Any]:
+        if self.protocol_minor is None:
+            raise ProtocolError("engine.hello is required", "PROTOCOL_MISMATCH")
         enabled = params.get("enabledOutputs")
         if not isinstance(enabled, list) or not enabled:
             raise ProtocolError("enabledOutputs must be non-empty", "UNSUPPORTED_OUTPUT")
         ids = [item.get("id") for item in enabled if isinstance(item, dict) and item.get("version") == 1]
-        if len(ids) != len(enabled) or len(set(ids)) != len(ids) or not set(ids).issubset(OUTPUT_IDS):
+        available = set(available_output_ids(self.protocol_minor))
+        if len(ids) != len(enabled) or len(set(ids)) != len(ids) or not set(ids).issubset(available):
             raise ProtocolError("enabledOutputs contains an unavailable output", "UNSUPPORTED_OUTPUT")
         weights = params.get("weights")
         if (
@@ -125,7 +168,19 @@ class Engine:
         self.enabled = set(ids)
         self.state = "ready"
         return {
-            "outputs": [output_declaration(value, initialized=True) for value in ids],
+            "outputs": [
+                output_declaration(
+                    value,
+                    self.protocol_minor,
+                    initialized=True,
+                    representations=(
+                        self.runtime.representations(value, self.protocol_minor)
+                        if value in {"opponent-dora-count", "opponent-score"}
+                        else None
+                    ),
+                )
+                for value in ids
+            ],
             "device": {"type": device_type},
             "effectiveOptions": {},
         }
@@ -146,7 +201,9 @@ class Engine:
         if len(ids) != len(requested) or len(set(ids)) != len(ids) or not set(ids).issubset(self.enabled):
             raise ProtocolError("outputs contains an unavailable output", "UNSUPPORTED_OUTPUT")
         try:
-            data, elapsed = self.runtime.predict(events, seat, requested)
+            data, elapsed = self.runtime.predict(
+                events, seat, requested, self.protocol_minor or 0
+            )
         except (KeyError, TypeError, ValueError) as error:
             raise ProtocolError(str(error), "INVALID_HISTORY") from error
         return {

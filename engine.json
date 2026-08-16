@@ -2,12 +2,12 @@
   "schemaVersion": 2,
   "id": "org.riichi.analysis",
   "name": "Riichi Analysis Engine",
-  "version": "0.1.0-dev.1",
+  "version": "0.1.0-dev.2",
   "sourceUrl": "https://github.com/SiyeW/riichi-analysis-engine",
   "protocol": {
     "name": "riichi-engine-protocol",
     "major": 2,
-    "minor": 1
+    "minor": 2
   },
   "entrypoints": {
     "windows-x64": {

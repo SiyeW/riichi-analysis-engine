@@ -10,10 +10,10 @@ $ErrorActionPreference = "Stop"
 $project = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $project ".venv\Scripts\python.exe"
 $manifests = Join-Path $project "data\manifests"
-$train = Join-Path $project "data\processed\train-2025-1of20"
-$validation = Join-Path $project "data\processed\validation-2026"
-$run = Join-Path $project "runs\train-2025-1of20-test"
-$weights = Join-Path $project "weights\riichi-analysis-2025-1of20-test.pt"
+$train = Join-Path $project "data\processed-v2\train-2025-1of20"
+$validation = Join-Path $project "data\processed-v2\validation-2026"
+$run = Join-Path $project "runs\train-2025-1of20-v2-test"
+$weights = Join-Path $project "weights\riichi-analysis-2025-1of20-v2-test.pt"
 
 if (-not (Test-Path -LiteralPath $python)) {
     throw "Create .venv and install the training dependencies first."

@@ -33,7 +33,7 @@ def main() -> None:
     require(manifest["name"] == "Riichi Analysis Engine", "unexpected engine name")
     require(
         manifest["protocol"]
-        == {"name": "riichi-engine-protocol", "major": 2, "minor": 1},
+        == {"name": "riichi-engine-protocol", "major": 2, "minor": 2},
         "unexpected protocol version",
     )
     require(
