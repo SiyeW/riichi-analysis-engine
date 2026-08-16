@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from .constants import TILE37_TO_ACTION, TILES_34, relative_players, tile34_index
 from .model import RiichiAnalysisModel
+from .prediction_values import DORA_VALUES, SCORE_VALUES
 
 PERMUTATIONS = tuple(itertools.permutations(range(4)))
 
@@ -59,6 +60,19 @@ def _prediction_from_distribution(probabilities: np.ndarray, *, first_value: int
     }
 
 
+def _valued_distribution(
+    probabilities: np.ndarray, values: tuple[int | str, ...]
+) -> list[dict[str, float | int | str]]:
+    return [
+        {"value": value, "probability": _finite(probability)}
+        for value, probability in zip(values, probabilities, strict=True)
+    ]
+
+
+def _valued_expected_value(probabilities: np.ndarray, values: tuple[int, ...]) -> float:
+    return _finite(np.dot(np.asarray(values, dtype=np.float64), probabilities))
+
+
 def _chi_action(action: dict[str, Any]) -> int:
     called = tile34_index(action["pai"])
     consumed = sorted(tile34_index(tile) for tile in action["consumed"])
@@ -90,14 +104,37 @@ class AnalysisRuntime:
     def __init__(self, checkpoint: str | Path, device: str) -> None:
         self.device = torch.device(device)
         payload = torch.load(Path(checkpoint), map_location="cpu", weights_only=True)
-        if payload.get("format") != "riichi-analysis-model-v1":
+        model_format = payload.get("format")
+        if model_format not in {"riichi-analysis-model-v1", "riichi-analysis-model-v2"}:
             raise RuntimeError("weight file has an unsupported format")
-        self.model = RiichiAnalysisModel()
+        self.format_version = 1 if model_format == "riichi-analysis-model-v1" else 2
+        if self.format_version == 2:
+            expected_values = {
+                "dora": list(DORA_VALUES),
+                "score": list(SCORE_VALUES),
+            }
+            architecture = payload.get("architecture")
+            if not isinstance(architecture, dict) or architecture.get(
+                "predictionValues"
+            ) != expected_values:
+                raise RuntimeError("weight file uses different prediction values")
+        self.model = RiichiAnalysisModel(format_version=self.format_version)
         self.model.load_state_dict(payload["model"], strict=True)
         self.model.to(self.device).eval()
         self.player_state_type = _load_player_state()
         with torch.inference_mode():
             self.model(torch.zeros(1, 1012, 34, device=self.device))
+
+    def representations(self, output_id: str, protocol_minor: int) -> list[str]:
+        if output_id not in {"opponent-dora-count", "opponent-score"}:
+            raise ValueError(f"unsupported representation query: {output_id}")
+        if self.format_version == 1:
+            return ["expected-value"]
+        if protocol_minor >= 2:
+            return ["distribution", "point-estimate"]
+        if output_id == "opponent-score":
+            return ["distribution", "expected-value"]
+        return ["expected-value"]
 
     def _observation(self, events: list[dict[str, Any]], controlled_seat: int) -> np.ndarray:
         state = self.player_state_type(controlled_seat)
@@ -111,6 +148,7 @@ class AnalysisRuntime:
         events: list[dict[str, Any]],
         controlled_seat: int,
         requested: list[dict[str, Any]],
+        protocol_minor: int = 1,
     ) -> tuple[dict[str, dict[str, Any]], float]:
         started = time.perf_counter()
         observation = self._observation(events, controlled_seat)
@@ -164,29 +202,74 @@ class AnalysisRuntime:
                 for tile_index, tile in enumerate(TILES_34)
             }
         }
-        dora = F.softplus(outputs["dora"]).numpy()
+        if self.format_version == 1:
+            dora_predictions = [
+                {"expectedValue": _finite(value)}
+                for value in F.softplus(outputs["dora"]).numpy()
+            ]
+            score_predictions = [
+                {"expectedValue": _finite(value)}
+                for value in (F.softplus(outputs["score"]) * 1000.0).numpy()
+            ]
+        else:
+            dora_distribution = outputs["dora_distribution"].softmax(-1).numpy()
+            dora_point = F.softplus(outputs["dora_point"]).numpy()
+            score_distribution = outputs["score_distribution"].softmax(-1).numpy()
+            score_point = (F.softplus(outputs["score_point"]) * 1000.0).numpy()
+            if protocol_minor >= 2:
+                dora_predictions = [
+                    {
+                        "distribution": _valued_distribution(probabilities, DORA_VALUES),
+                        "pointEstimate": _finite(dora_point[index]),
+                    }
+                    for index, probabilities in enumerate(dora_distribution)
+                ]
+                score_predictions = [
+                    {
+                        "distribution": _valued_distribution(probabilities, SCORE_VALUES),
+                        "pointEstimate": _finite(score_point[index]),
+                    }
+                    for index, probabilities in enumerate(score_distribution)
+                ]
+            else:
+                dora_predictions = [
+                    {"expectedValue": _finite(value)} for value in dora_point
+                ]
+                score_predictions = [
+                    {
+                        "distribution": _valued_distribution(probabilities, SCORE_VALUES),
+                        "expectedValue": _valued_expected_value(
+                            probabilities, SCORE_VALUES
+                        ),
+                    }
+                    for probabilities in score_distribution
+                ]
         results["opponent-dora-count"] = {
             "players": [
-                {"seat": seat, "prediction": {"expectedValue": _finite(dora[index])}}
+                {"seat": seat, "prediction": dora_predictions[index]}
                 for index, seat in enumerate(opponents)
             ]
         }
-        score = (F.softplus(outputs["score"]) * 1000.0).numpy()
         results["opponent-score"] = {
             "players": [
-                {"seat": seat, "prediction": {"expectedValue": _finite(score[index])}}
+                {"seat": seat, "prediction": score_predictions[index]}
                 for index, seat in enumerate(opponents)
             ]
         }
-        outcome = outputs["outcome"].softmax(-1).numpy()
-        draw = _finite(outcome[0])
-        win = np.asarray(
-            [
-                sum(outcome[mask] for mask in range(1, 16) if mask & (1 << relative))
-                for relative in range(4)
-            ],
-            dtype=np.float32,
-        )
+        if self.format_version == 1:
+            outcome = outputs["outcome"].softmax(-1).numpy()
+            draw = _finite(outcome[0])
+            win = np.asarray(
+                [
+                    sum(outcome[mask] for mask in range(1, 16) if mask & (1 << relative))
+                    for relative in range(4)
+                ],
+                dtype=np.float32,
+            )
+        else:
+            any_win = outputs["outcome_any_win"].sigmoid()
+            draw = _finite(1.0 - any_win)
+            win = (any_win * outputs["outcome_winner"].sigmoid()).numpy()
         deal_player = outputs["deal_in_player"].sigmoid().numpy()
         target = outputs["target"].softmax(-1).numpy()
         results["kyoku-outcome"] = {

@@ -11,7 +11,7 @@ from .constants import ACTION_SPACE, OBS_CHANNELS, TILE_TYPES
 OBS_ELEMENTS = OBS_CHANNELS * TILE_TYPES
 OBS_BYTES = (OBS_ELEMENTS + 7) // 8
 ACTION_BYTES = (ACTION_SPACE + 7) // 8
-STORAGE_FORMAT = "dual-bitpack-sparse-float16-v1"
+STORAGE_FORMAT = "dual-bitpack-sparse-float16-v2"
 
 
 @dataclass

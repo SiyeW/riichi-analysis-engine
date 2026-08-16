@@ -15,8 +15,9 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from .dataset import ShardDataset
-from .losses import DEFAULT_WEIGHTS, multitask_loss
+from .losses import DEFAULT_WEIGHTS, multitask_loss, score_class_indices
 from .model import RiichiAnalysisModel, count_parameters
+from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
 
 
 def source_metadata() -> dict[str, object]:
@@ -134,18 +135,39 @@ def validate(
         )
         add_metric(
             "doraMae",
-            (F.softplus(outputs["dora"]) - batch["dora"].float()).abs(),
+            (F.softplus(outputs["dora_point"]) - batch["dora"].float()).abs(),
             batch["winner_mask"].bool(),
         )
+        winner_mask = batch["winner_mask"].bool()
+        if winner_mask.any():
+            add_metric(
+                "doraDistributionAccuracy",
+                outputs["dora_distribution"][winner_mask].argmax(-1)
+                == batch["dora"].long()[winner_mask].clamp_max(DORA_TAIL_START),
+            )
+            add_metric(
+                "scoreDistributionAccuracy",
+                outputs["score_distribution"][winner_mask].argmax(-1)
+                == score_class_indices(batch["score"].long()[winner_mask]),
+            )
         add_metric(
             "scoreMaePoints",
-            (F.softplus(outputs["score"]) * 1000.0 - batch["score"].float()).abs(),
-            batch["winner_mask"].bool(),
+            (F.softplus(outputs["score_point"]) * 1000.0 - batch["score"].float()).abs(),
+            winner_mask,
         )
-        outcome_label = sum(
-            batch["win"][:, player].long() << player for player in range(4)
+        any_win_probability = outputs["outcome_any_win"].sigmoid()
+        add_metric(
+            "outcomeDrawBrier",
+            ((1.0 - any_win_probability) - batch["draw"].float()).square(),
         )
-        add_metric("outcomeAccuracy", outputs["outcome"].argmax(-1) == outcome_label)
+        add_metric(
+            "outcomeWinnerBrier",
+            (
+                any_win_probability.unsqueeze(-1)
+                * outputs["outcome_winner"].sigmoid()
+                - batch["win"].float()
+            ).square(),
+        )
         add_metric(
             "dealInPlayerBrier",
             (outputs["deal_in_player"].sigmoid() - batch["deal_in_player"].float()).square(),
@@ -196,7 +218,7 @@ def save_checkpoint(
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "format": "riichi-analysis-model-v1",
+            "format": "riichi-analysis-model-v2",
             "epoch": epoch,
             "batchInEpoch": batch_in_epoch,
             "step": step,
@@ -206,6 +228,10 @@ def save_checkpoint(
             "scaler": scaler.state_dict(),
             "parameters": parameters,
             "lossWeights": DEFAULT_WEIGHTS,
+            "predictionValues": {
+                "dora": list(DORA_VALUES),
+                "score": list(SCORE_VALUES),
+            },
             "datasets": datasets,
             "environment": environment,
             "validation": validation,
@@ -252,8 +278,13 @@ def main() -> None:
     samples_seen = 0
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
-        if checkpoint.get("format") != "riichi-analysis-model-v1":
+        if checkpoint.get("format") != "riichi-analysis-model-v2":
             raise RuntimeError("resume checkpoint has an unsupported format")
+        if checkpoint.get("predictionValues") != {
+            "dora": list(DORA_VALUES),
+            "score": list(SCORE_VALUES),
+        }:
+            raise RuntimeError("resume checkpoint uses different prediction values")
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         scaler.load_state_dict(checkpoint["scaler"])

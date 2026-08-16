@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 
 from .model import RiichiAnalysisModel, count_parameters
+from .prediction_values import DORA_VALUES, SCORE_VALUES
 
 
 def sha256(path: Path) -> str:
@@ -63,12 +64,14 @@ def main() -> None:
     args = parser.parse_args()
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if checkpoint.get("format") != "riichi-analysis-model-v1":
+    model_format = checkpoint.get("format")
+    if model_format not in {"riichi-analysis-model-v1", "riichi-analysis-model-v2"}:
         raise RuntimeError("checkpoint has an unsupported format")
-    model = RiichiAnalysisModel()
+    format_version = 1 if model_format == "riichi-analysis-model-v1" else 2
+    model = RiichiAnalysisModel(format_version=format_version)
     model.load_state_dict(checkpoint["model"], strict=True)
     payload = {
-        "format": "riichi-analysis-model-v1",
+        "format": model_format,
         "model": model.state_dict(),
         "architecture": {
             "observationVersion": 4,
@@ -89,6 +92,14 @@ def main() -> None:
             "sourceRevision": training_source_revision(checkpoint),
         },
     }
+    if format_version == 2:
+        prediction_values = {
+            "dora": list(DORA_VALUES),
+            "score": list(SCORE_VALUES),
+        }
+        if checkpoint.get("predictionValues") != prediction_values:
+            raise RuntimeError("checkpoint uses different prediction values")
+        payload["architecture"]["predictionValues"] = prediction_values
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
     torch.save(payload, temporary)

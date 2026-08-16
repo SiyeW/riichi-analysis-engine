@@ -7,7 +7,7 @@ from riichi_analysis_engine.server import Engine, ProtocolError
 
 @pytest.mark.parametrize(
     ("host_minor", "negotiated_minor"),
-    [(0, 0), (1, 1), (2, 1)],
+    [(0, 0), (1, 1), (2, 2), (3, 2)],
 )
 def test_hello_negotiates_the_highest_common_minor(
     host_minor: int,
@@ -27,6 +27,35 @@ def test_hello_negotiates_the_highest_common_minor(
         "major": 2,
         "minor": negotiated_minor,
     }
+
+
+def test_hello_only_declares_features_from_the_negotiated_minor() -> None:
+    with mock.patch("riichi_analysis_engine.server.torch.cuda.is_available", return_value=False):
+        old = Engine().hello(
+            {
+                "protocol": {
+                    "name": "riichi-engine-protocol",
+                    "major": 2,
+                    "minor": 0,
+                }
+            }
+        )
+        current = Engine().hello(
+            {
+                "protocol": {
+                    "name": "riichi-engine-protocol",
+                    "major": 2,
+                    "minor": 2,
+                }
+            }
+        )
+
+    old_outputs = {item["id"]: item for item in old["outputContracts"]}
+    current_outputs = {item["id"]: item for item in current["outputContracts"]}
+    assert "kyoku-outcome" not in old_outputs
+    assert "point-estimate" not in old_outputs["opponent-dora-count"]["representations"]
+    assert "kyoku-outcome" in current_outputs
+    assert "point-estimate" in current_outputs["opponent-dora-count"]["representations"]
 
 
 @pytest.mark.parametrize(
