@@ -12,7 +12,9 @@ DEFAULT_WEIGHTS = {
     "furiten_no_yaku": 0.2,
     "deal_in_tile": 0.5,
     "concealed_count": 1.0,
+    "concealed_red_count": 1.0,
     "wall_count": 1.0,
+    "wall_red_count": 1.0,
     "dora": 0.2,
     "score": 0.2,
     "outcome": 0.7,
@@ -76,8 +78,16 @@ def multitask_loss(
         outputs["concealed_count"].reshape(-1, 5),
         batch["concealed_count"].reshape(-1).long(),
     )
+    losses["concealed_red_count"] = F.cross_entropy(
+        outputs["concealed_red_count"].reshape(-1, 2),
+        batch["concealed_red_count"].reshape(-1).long(),
+    )
     losses["wall_count"] = F.cross_entropy(
         outputs["wall_count"].reshape(-1, 5), batch["wall_count"].reshape(-1).long()
+    )
+    losses["wall_red_count"] = F.cross_entropy(
+        outputs["wall_red_count"].reshape(-1, 2),
+        batch["wall_red_count"].reshape(-1).long(),
     )
 
     winner_mask = batch["winner_mask"].bool()

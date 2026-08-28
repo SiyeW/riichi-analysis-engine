@@ -21,6 +21,9 @@ TILES_37 = (
     "E", "S", "W", "N", "P", "F", "C", "5mr", "5pr", "5sr",
 )
 
+RED_TILES = ("5mr", "5pr", "5sr")
+RED_TILE_TO_INDEX = {tile: index for index, tile in enumerate(RED_TILES)}
+
 TILE37_TO_ACTION = {tile: index for index, tile in enumerate(TILES_37)}
 TILE34_TO_INDEX = {tile: index for index, tile in enumerate(TILES_34)}
 

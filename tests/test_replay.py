@@ -25,6 +25,8 @@ def test_wall_and_red_dora_tracking() -> None:
     state = FullState()
     state.process(event)
     assert int(state.wall.sum()) == 83
+    assert state.wall_red.tolist() == [0, 1, 1]
+    assert state.concealed_red_counts(0).tolist() == [1, 0, 0]
     state.process({"type": "tsumo", "actor": 0, "pai": "5m"})
     assert int(state.wall.sum()) == 82
     assert state.dora_count(0, 0, []) == 3

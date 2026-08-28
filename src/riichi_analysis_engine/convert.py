@@ -52,13 +52,18 @@ def _sample_targets(
     concealed = np.stack(
         [full_state.concealed_counts(player) for player in absolute_opponents], axis=0
     )
+    concealed_red = np.stack(
+        [full_state.concealed_red_counts(player) for player in absolute_opponents], axis=0
+    )
     winner_mask = annotation.win[list(absolute_opponents)].astype(np.uint8, copy=False)
     return {
         "shanten": shanten,
         "furiten_no_yaku": furiten,
         "deal_in_tile": deal_in,
         "concealed_count": concealed,
+        "concealed_red_count": concealed_red,
         "wall_count": full_state.wall.copy(),
+        "wall_red_count": full_state.wall_red.copy(),
         "dora": future["dora"],
         "score": future["score"],
         "winner_mask": winner_mask,

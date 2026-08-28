@@ -14,6 +14,8 @@ import numpy as np
 
 from .constants import (
     PLAYERS,
+    RED_TILES,
+    RED_TILE_TO_INDEX,
     TILE37_TO_ACTION,
     deaka,
     relative_players,
@@ -74,6 +76,7 @@ class FullState:
     hands: list[Counter[str]] = field(default_factory=lambda: [Counter() for _ in range(4)])
     melds: list[list[list[str]]] = field(default_factory=lambda: [[] for _ in range(4)])
     wall: np.ndarray = field(default_factory=lambda: np.zeros(34, dtype=np.uint8))
+    wall_red: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.uint8))
     scores: np.ndarray = field(default_factory=lambda: np.full(4, 25_000, dtype=np.int32))
     dora_markers: list[str] = field(default_factory=list)
     riichi: list[bool] = field(default_factory=lambda: [False] * 4)
@@ -99,13 +102,19 @@ class FullState:
             self.last_discard = None
             self.last_kan_tile = None
             self.wall = np.full(34, 4, dtype=np.int16)
+            self.wall_red = np.ones(3, dtype=np.int8)
             for hand in event["tehais"]:
                 for tile in hand:
                     self.wall[tile34_index(tile)] -= 1
+                    if tile in RED_TILE_TO_INDEX:
+                        self.wall_red[RED_TILE_TO_INDEX[tile]] -= 1
             self.wall[tile34_index(event["dora_marker"])] -= 1
-            if (self.wall < 0).any():
+            if event["dora_marker"] in RED_TILE_TO_INDEX:
+                self.wall_red[RED_TILE_TO_INDEX[event["dora_marker"]]] -= 1
+            if (self.wall < 0).any() or (self.wall_red < 0).any():
                 raise ValueError("negative wall count at start_kyoku")
             self.wall = self.wall.astype(np.uint8)
+            self.wall_red = self.wall_red.astype(np.uint8)
         elif kind == "tsumo":
             actor, tile = int(event["actor"]), event["pai"]
             self.hands[actor][tile] += 1
@@ -113,6 +122,11 @@ class FullState:
             if self.wall[index] == 0:
                 raise ValueError(f"negative wall count after drawing {tile}")
             self.wall[index] -= 1
+            if tile in RED_TILE_TO_INDEX:
+                red_index = RED_TILE_TO_INDEX[tile]
+                if self.wall_red[red_index] == 0:
+                    raise ValueError(f"negative red wall count after drawing {tile}")
+                self.wall_red[red_index] -= 1
             self.last_kan_tile = None
         elif kind == "dahai":
             actor, tile = int(event["actor"]), event["pai"]
@@ -161,6 +175,11 @@ class FullState:
             if self.wall[index] == 0:
                 raise ValueError(f"negative wall count after dora marker {marker}")
             self.wall[index] -= 1
+            if marker in RED_TILE_TO_INDEX:
+                red_index = RED_TILE_TO_INDEX[marker]
+                if self.wall_red[red_index] == 0:
+                    raise ValueError(f"negative red wall count after dora marker {marker}")
+                self.wall_red[red_index] -= 1
         elif kind in {"hora", "ryukyoku"}:
             deltas = event.get("deltas")
             if isinstance(deltas, list):
@@ -171,6 +190,12 @@ class FullState:
         for tile, count in self.hands[player].items():
             counts[tile34_index(tile)] += count
         return counts
+
+    def concealed_red_counts(self, player: int) -> np.ndarray:
+        return np.asarray(
+            [self.hands[player].get(tile, 0) for tile in RED_TILES],
+            dtype=np.uint8,
+        )
 
     def winning_tiles(self, actor: int, target: int) -> list[str]:
         tiles = list(self.hands[actor].elements())

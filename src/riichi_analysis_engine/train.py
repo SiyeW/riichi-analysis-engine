@@ -130,8 +130,16 @@ def validate(
             outputs["concealed_count"].argmax(-1) == batch["concealed_count"],
         )
         add_metric(
+            "concealedRedCountAccuracy",
+            outputs["concealed_red_count"].argmax(-1) == batch["concealed_red_count"],
+        )
+        add_metric(
             "wallCountAccuracy",
             outputs["wall_count"].argmax(-1) == batch["wall_count"],
+        )
+        add_metric(
+            "wallRedCountAccuracy",
+            outputs["wall_red_count"].argmax(-1) == batch["wall_red_count"],
         )
         add_metric(
             "doraMae",
@@ -218,7 +226,7 @@ def save_checkpoint(
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "format": "riichi-analysis-model-v2",
+            "format": "riichi-analysis-model-v3",
             "epoch": epoch,
             "batchInEpoch": batch_in_epoch,
             "step": step,
@@ -278,7 +286,7 @@ def main() -> None:
     samples_seen = 0
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
-        if checkpoint.get("format") != "riichi-analysis-model-v2":
+        if checkpoint.get("format") != "riichi-analysis-model-v3":
             raise RuntimeError("resume checkpoint has an unsupported format")
         if checkpoint.get("predictionValues") != {
             "dora": list(DORA_VALUES),

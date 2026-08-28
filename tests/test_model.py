@@ -10,6 +10,8 @@ def test_output_shapes() -> None:
     assert outputs["deal_in_tile"].shape == (2, 3, 34)
     assert outputs["concealed_count"].shape == (2, 3, 34, 5)
     assert outputs["wall_count"].shape == (2, 34, 5)
+    assert outputs["concealed_red_count"].shape == (2, 3, 3, 2)
+    assert outputs["wall_red_count"].shape == (2, 3, 2)
     assert outputs["dora_distribution"].shape == (2, 3, 8)
     assert outputs["dora_point"].shape == (2, 3)
     assert outputs["score_distribution"].shape == (2, 3, 59)
@@ -25,13 +27,18 @@ def test_default_parameter_budget() -> None:
     model = RiichiAnalysisModel()
     assert count_parameters(model) == {
         "encoder": 23_663_488,
-        "state": 1_875_750,
+        "state": 1_900_350,
         "future": 990_216,
         "policy": 47_150,
-        "total": 26_576_604,
+        "total": 26_601_204,
     }
 
 
 def test_legacy_parameter_budget_is_stable() -> None:
     model = RiichiAnalysisModel(format_version=1)
     assert count_parameters(model)["total"] == 26_430_494
+
+
+def test_v2_parameter_budget_is_stable() -> None:
+    model = RiichiAnalysisModel(format_version=2)
+    assert count_parameters(model)["total"] == 26_576_604
