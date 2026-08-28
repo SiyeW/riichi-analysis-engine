@@ -81,6 +81,8 @@ class HeadDimensions:
     deal_in_tile: int = 3 * 34
     concealed_count: int = 3 * 34 * 5
     wall_count: int = 34 * 5
+    concealed_red_count: int = 3 * 3 * 2
+    wall_red_count: int = 3 * 2
     dora_distribution: int = 3 * len(DORA_VALUES)
     dora_point: int = 3
     score_distribution: int = 3 * len(SCORE_VALUES)
@@ -101,6 +103,8 @@ class HeadDimensions:
             + self.deal_in_tile
             + self.concealed_count
             + self.wall_count
+            + self.concealed_red_count
+            + self.wall_red_count
         )
 
     @property
@@ -118,6 +122,12 @@ class HeadDimensions:
             + self.placement
             + self.match_score
         )
+
+
+@dataclass(frozen=True)
+class HeadDimensionsV2(HeadDimensions):
+    concealed_red_count: int = 0
+    wall_red_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -170,13 +180,19 @@ class RiichiAnalysisModel(nn.Module):
         blocks: int = 54,
         state_width: int = 1024,
         future_width: int = 768,
-        format_version: int = 2,
+        format_version: int = 3,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2}:
+        if format_version not in {1, 2, 3}:
             raise ValueError(f"unsupported model format version: {format_version}")
         self.format_version = format_version
-        self.dimensions = HeadDimensionsV1() if format_version == 1 else HeadDimensions()
+        self.dimensions = (
+            HeadDimensionsV1()
+            if format_version == 1
+            else HeadDimensionsV2()
+            if format_version == 2
+            else HeadDimensions()
+        )
         self.encoder = MortalV4Encoder(channels=channels, blocks=blocks)
         self.state_adapter = nn.Sequential(
             nn.Linear(1024, state_width),
@@ -204,10 +220,18 @@ class RiichiAnalysisModel(nn.Module):
         state = self.state_head(self.state_adapter(latent))
         future = self.future_head(self.future_adapter(latent))
 
-        shanten, furiten, deal_in, concealed, wall = self._split(
-            state,
-            (d.shanten, d.furiten_no_yaku, d.deal_in_tile, d.concealed_count, d.wall_count),
+        state_dimensions = (
+            d.shanten,
+            d.furiten_no_yaku,
+            d.deal_in_tile,
+            d.concealed_count,
+            d.wall_count,
         )
+        if self.format_version >= 3:
+            assert isinstance(d, HeadDimensions)
+            state_dimensions += (d.concealed_red_count, d.wall_red_count)
+        state_parts = self._split(state, state_dimensions)
+        shanten, furiten, deal_in, concealed, wall = state_parts[:5]
         batch = observation.shape[0]
         outputs = {
             "shanten": shanten.view(batch, 3, 7),
@@ -217,6 +241,14 @@ class RiichiAnalysisModel(nn.Module):
             "wall_count": wall.view(batch, 34, 5),
             "policy": self.policy_head(latent),
         }
+        if self.format_version >= 3:
+            concealed_red, wall_red = state_parts[5:]
+            outputs.update(
+                {
+                    "concealed_red_count": concealed_red.view(batch, 3, 3, 2),
+                    "wall_red_count": wall_red.view(batch, 3, 2),
+                }
+            )
         if self.format_version == 1:
             assert isinstance(d, HeadDimensionsV1)
             dora, score, outcome, deal_player, target, delta, placement, match_score = self._split(

@@ -65,9 +65,14 @@ def main() -> None:
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     model_format = checkpoint.get("format")
-    if model_format not in {"riichi-analysis-model-v1", "riichi-analysis-model-v2"}:
+    formats = {
+        "riichi-analysis-model-v1": 1,
+        "riichi-analysis-model-v2": 2,
+        "riichi-analysis-model-v3": 3,
+    }
+    if model_format not in formats:
         raise RuntimeError("checkpoint has an unsupported format")
-    format_version = 1 if model_format == "riichi-analysis-model-v1" else 2
+    format_version = formats[model_format]
     model = RiichiAnalysisModel(format_version=format_version)
     model.load_state_dict(checkpoint["model"], strict=True)
     payload = {
@@ -92,7 +97,7 @@ def main() -> None:
             "sourceRevision": training_source_revision(checkpoint),
         },
     }
-    if format_version == 2:
+    if format_version >= 2:
         prediction_values = {
             "dora": list(DORA_VALUES),
             "score": list(SCORE_VALUES),

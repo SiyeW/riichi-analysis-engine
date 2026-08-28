@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from .constants import TILE37_TO_ACTION, TILES_34, relative_players, tile34_index
+from .constants import RED_TILES, TILE37_TO_ACTION, TILES_34, relative_players, tile34_index
 from .model import RiichiAnalysisModel
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 
@@ -105,10 +105,15 @@ class AnalysisRuntime:
         self.device = torch.device(device)
         payload = torch.load(Path(checkpoint), map_location="cpu", weights_only=True)
         model_format = payload.get("format")
-        if model_format not in {"riichi-analysis-model-v1", "riichi-analysis-model-v2"}:
+        formats = {
+            "riichi-analysis-model-v1": 1,
+            "riichi-analysis-model-v2": 2,
+            "riichi-analysis-model-v3": 3,
+        }
+        if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
-        self.format_version = 1 if model_format == "riichi-analysis-model-v1" else 2
-        if self.format_version == 2:
+        self.format_version = formats[model_format]
+        if self.format_version >= 2:
             expected_values = {
                 "dora": list(DORA_VALUES),
                 "score": list(SCORE_VALUES),
@@ -183,6 +188,11 @@ class AnalysisRuntime:
             ]
         }
         concealed = outputs["concealed_count"].softmax(-1).numpy()
+        concealed_red = (
+            outputs["concealed_red_count"].softmax(-1).numpy()
+            if self.format_version >= 3
+            else None
+        )
         results["opponent-concealed-tile-count"] = {
             "players": [
                 {
@@ -191,16 +201,43 @@ class AnalysisRuntime:
                         tile: _prediction_from_distribution(concealed[index, tile_index])
                         for tile_index, tile in enumerate(TILES_34)
                     },
+                    **(
+                        {
+                            "redTiles": {
+                                tile: _prediction_from_distribution(
+                                    concealed_red[index, tile_index]
+                                )
+                                for tile_index, tile in enumerate(RED_TILES)
+                            }
+                        }
+                        if concealed_red is not None and protocol_minor >= 2
+                        else {}
+                    ),
                 }
                 for index, seat in enumerate(opponents)
             ]
         }
         wall = outputs["wall_count"].softmax(-1).numpy()
+        wall_red = (
+            outputs["wall_red_count"].softmax(-1).numpy()
+            if self.format_version >= 3
+            else None
+        )
         results["wall-tile-count"] = {
             "tiles": {
                 tile: _prediction_from_distribution(wall[tile_index])
                 for tile_index, tile in enumerate(TILES_34)
-            }
+            },
+            **(
+                {
+                    "redTiles": {
+                        tile: _prediction_from_distribution(wall_red[tile_index])
+                        for tile_index, tile in enumerate(RED_TILES)
+                    }
+                }
+                if wall_red is not None and protocol_minor >= 2
+                else {}
+            ),
         }
         if self.format_version == 1:
             dora_predictions = [
