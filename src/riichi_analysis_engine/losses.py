@@ -18,8 +18,7 @@ DEFAULT_WEIGHTS = {
     "dora": 0.2,
     "score": 0.2,
     "outcome": 0.7,
-    "deal_in_player": 0.3,
-    "target": 0.2,
+    "outcome_summary": 0.5,
     "kyoku_delta": 0.2,
     "placement": 0.5,
     "match_score": 0.2,
@@ -120,18 +119,16 @@ def multitask_loss(
     winner_loss = F.binary_cross_entropy_with_logits(
         outputs["outcome_winner"], batch["win"].float(), reduction="none"
     )
-    losses["outcome"] = any_win_loss + _masked_mean(
+    winner_summary_loss = _masked_mean(
         winner_loss, any_win.unsqueeze(-1).expand_as(winner_loss)
     )
-    losses["deal_in_player"] = F.binary_cross_entropy_with_logits(
+    deal_in_summary_loss = F.binary_cross_entropy_with_logits(
         outputs["deal_in_player"], batch["deal_in_player"].float()
     )
-    target_error = F.cross_entropy(
-        outputs["target"].reshape(-1, 4),
-        batch["target"].clamp_min(0).reshape(-1).long(),
-        reduction="none",
-    ).reshape_as(batch["target"])
-    losses["target"] = _masked_mean(target_error, batch["target"] >= 0)
+    losses["outcome"] = F.cross_entropy(outputs["outcome"], batch["outcome"].long())
+    losses["outcome_summary"] = (
+        any_win_loss + winner_summary_loss + deal_in_summary_loss
+    )
     losses["kyoku_delta"] = F.smooth_l1_loss(
         outputs["kyoku_delta"], batch["kyoku_delta"].float() / 10_000.0
     )

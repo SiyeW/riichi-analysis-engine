@@ -15,6 +15,7 @@ import torch
 from torch.nn import functional as F
 
 from .constants import RED_TILES, TILE37_TO_ACTION, TILES_34, relative_players, tile34_index
+from .kyoku_outcome import OUTCOME_CLASSES
 from .model import RiichiAnalysisModel
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 
@@ -109,6 +110,7 @@ class AnalysisRuntime:
             "riichi-analysis-model-v1": 1,
             "riichi-analysis-model-v2": 2,
             "riichi-analysis-model-v3": 3,
+            "riichi-analysis-model-v4": 4,
         }
         if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
@@ -293,6 +295,7 @@ class AnalysisRuntime:
                 for index, seat in enumerate(opponents)
             ]
         }
+        outcome_distribution: np.ndarray | None = None
         if self.format_version == 1:
             outcome = outputs["outcome"].softmax(-1).numpy()
             draw = _finite(outcome[0])
@@ -307,23 +310,71 @@ class AnalysisRuntime:
             any_win = outputs["outcome_any_win"].sigmoid()
             draw = _finite(1.0 - any_win)
             win = (any_win * outputs["outcome_winner"].sigmoid()).numpy()
+            if self.format_version >= 4:
+                outcome_distribution = outputs["outcome"].softmax(-1).numpy()
         deal_player = outputs["deal_in_player"].sigmoid().numpy()
-        target = outputs["target"].softmax(-1).numpy()
-        results["kyoku-outcome"] = {
+        outcome_result: dict[str, Any] = {
             "drawProbability": draw,
             "players": [
                 {
                     "seat": seat,
                     "winProbability": _finite(win[relative]),
                     "dealInProbability": _finite(deal_player[relative]),
-                    "targetGivenWin": [
-                        {"seat": target_seat, "probability": _finite(target[relative, target_relative])}
-                        for target_relative, target_seat in enumerate(order)
-                    ],
                 }
                 for relative, seat in enumerate(order)
             ],
         }
+        if protocol_minor >= 2 and outcome_distribution is not None:
+            serialized_outcomes: list[dict[str, Any]] = []
+            for outcome_class, outcome_probability in zip(
+                OUTCOME_CLASSES, outcome_distribution, strict=True
+            ):
+                item: dict[str, Any] = {
+                    "type": outcome_class.kind,
+                    "probability": _finite(outcome_probability),
+                }
+                if outcome_class.kind == "tsumo":
+                    item["winner"] = order[outcome_class.winners[0]]
+                elif outcome_class.kind == "ron":
+                    assert outcome_class.target is not None
+                    item["winners"] = [order[winner] for winner in outcome_class.winners]
+                    item["target"] = order[outcome_class.target]
+                serialized_outcomes.append(item)
+            outcome_result["outcomes"] = serialized_outcomes
+        elif protocol_minor < 2:
+            if outcome_distribution is None:
+                target = outputs["target"].softmax(-1).numpy()
+            else:
+                target = np.zeros((4, 4), dtype=np.float32)
+                for outcome_class, outcome_probability in zip(
+                    OUTCOME_CLASSES, outcome_distribution, strict=True
+                ):
+                    if outcome_class.kind == "draw":
+                        continue
+                    target_relative = (
+                        outcome_class.winners[0]
+                        if outcome_class.kind == "tsumo"
+                        else outcome_class.target
+                    )
+                    assert target_relative is not None
+                    for winner in outcome_class.winners:
+                        target[winner, target_relative] += outcome_probability
+                totals = target.sum(axis=-1, keepdims=True)
+                target = np.divide(
+                    target,
+                    totals,
+                    out=np.full_like(target, 0.25),
+                    where=totals > 0,
+                )
+            for relative, player in enumerate(outcome_result["players"]):
+                player["targetGivenWin"] = [
+                    {
+                        "seat": target_seat,
+                        "probability": _finite(target[relative, target_relative]),
+                    }
+                    for target_relative, target_seat in enumerate(order)
+                ]
+        results["kyoku-outcome"] = outcome_result
         delta = (outputs["kyoku_delta"] * 10_000.0).numpy()
         results["kyoku-score-delta"] = {
             "players": [

@@ -70,7 +70,7 @@ def _sample_targets(
         "draw": future["draw"],
         "win": future["win"],
         "deal_in_player": future["deal_in_player"],
-        "target": future["target"],
+        "outcome": future["outcome"],
         "kyoku_delta": future["kyoku_delta"],
         "placement": future["placement"],
         "match_score": future["match_score"],

@@ -69,6 +69,7 @@ def main() -> None:
         "riichi-analysis-model-v1": 1,
         "riichi-analysis-model-v2": 2,
         "riichi-analysis-model-v3": 3,
+        "riichi-analysis-model-v4": 4,
     }
     if model_format not in formats:
         raise RuntimeError("checkpoint has an unsupported format")
