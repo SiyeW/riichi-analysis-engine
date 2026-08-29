@@ -15,6 +15,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from .dataset import ShardDataset
+from .kyoku_outcome import OUTCOME_DEAL_IN_INDICATORS, OUTCOME_WINNER_INDICATORS
 from .losses import DEFAULT_WEIGHTS, multitask_loss, score_class_indices
 from .model import RiichiAnalysisModel, count_parameters
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
@@ -163,22 +164,22 @@ def validate(
             (F.softplus(outputs["score_point"]) * 1000.0 - batch["score"].float()).abs(),
             winner_mask,
         )
-        any_win_probability = outputs["outcome_any_win"].sigmoid()
+        outcome_probability = outputs["outcome"].softmax(-1)
+        winner_indicators = outcome_probability.new_tensor(OUTCOME_WINNER_INDICATORS)
+        deal_in_indicators = outcome_probability.new_tensor(OUTCOME_DEAL_IN_INDICATORS)
+        win_probability = outcome_probability @ winner_indicators
+        deal_in_probability = outcome_probability @ deal_in_indicators
         add_metric(
             "outcomeDrawBrier",
-            ((1.0 - any_win_probability) - batch["draw"].float()).square(),
+            (outcome_probability[:, 0] - batch["draw"].float()).square(),
         )
         add_metric(
             "outcomeWinnerBrier",
-            (
-                any_win_probability.unsqueeze(-1)
-                * outputs["outcome_winner"].sigmoid()
-                - batch["win"].float()
-            ).square(),
+            (win_probability - batch["win"].float()).square(),
         )
         add_metric(
             "dealInPlayerBrier",
-            (outputs["deal_in_player"].sigmoid() - batch["deal_in_player"].float()).square(),
+            (deal_in_probability - batch["deal_in_player"].float()).square(),
         )
         add_metric(
             "outcomeAccuracy",
@@ -225,7 +226,7 @@ def save_checkpoint(
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "format": "riichi-analysis-model-v4",
+            "format": "riichi-analysis-model-v5",
             "epoch": epoch,
             "batchInEpoch": batch_in_epoch,
             "step": step,
@@ -285,7 +286,7 @@ def main() -> None:
     samples_seen = 0
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
-        if checkpoint.get("format") != "riichi-analysis-model-v4":
+        if checkpoint.get("format") != "riichi-analysis-model-v5":
             raise RuntimeError("resume checkpoint has an unsupported format")
         if checkpoint.get("predictionValues") != {
             "dora": list(DORA_VALUES),

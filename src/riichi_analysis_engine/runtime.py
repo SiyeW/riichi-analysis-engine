@@ -15,7 +15,7 @@ import torch
 from torch.nn import functional as F
 
 from .constants import RED_TILES, TILE37_TO_ACTION, TILES_34, relative_players, tile34_index
-from .kyoku_outcome import OUTCOME_CLASSES
+from .kyoku_outcome import OUTCOME_CLASSES, outcome_marginals
 from .model import RiichiAnalysisModel
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 
@@ -111,6 +111,7 @@ class AnalysisRuntime:
             "riichi-analysis-model-v2": 2,
             "riichi-analysis-model-v3": 3,
             "riichi-analysis-model-v4": 4,
+            "riichi-analysis-model-v5": 5,
         }
         if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
@@ -306,13 +307,18 @@ class AnalysisRuntime:
                 ],
                 dtype=np.float32,
             )
+            deal_player = outputs["deal_in_player"].sigmoid().numpy()
+        elif self.format_version >= 5:
+            outcome_distribution = outputs["outcome"].softmax(-1).numpy()
+            draw, win, deal_player = outcome_marginals(outcome_distribution)
+            draw = _finite(draw)
         else:
             any_win = outputs["outcome_any_win"].sigmoid()
             draw = _finite(1.0 - any_win)
             win = (any_win * outputs["outcome_winner"].sigmoid()).numpy()
+            deal_player = outputs["deal_in_player"].sigmoid().numpy()
             if self.format_version >= 4:
                 outcome_distribution = outputs["outcome"].softmax(-1).numpy()
-        deal_player = outputs["deal_in_player"].sigmoid().numpy()
         outcome_result: dict[str, Any] = {
             "drawProbability": draw,
             "players": [
