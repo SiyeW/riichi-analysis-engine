@@ -142,6 +142,13 @@ class HeadDimensionsV4(HeadDimensions):
 
 
 @dataclass(frozen=True)
+class HeadDimensionsV5(HeadDimensionsV4):
+    outcome_any_win: int = 0
+    outcome_winner: int = 0
+    deal_in_player: int = 0
+
+
+@dataclass(frozen=True)
 class HeadDimensionsV1:
     shanten: int = 3 * 7
     furiten_no_yaku: int = 3
@@ -191,10 +198,10 @@ class RiichiAnalysisModel(nn.Module):
         blocks: int = 54,
         state_width: int = 1024,
         future_width: int = 768,
-        format_version: int = 4,
+        format_version: int = 5,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2, 3, 4}:
+        if format_version not in {1, 2, 3, 4, 5}:
             raise ValueError(f"unsupported model format version: {format_version}")
         self.format_version = format_version
         self.dimensions = (
@@ -202,6 +209,8 @@ class RiichiAnalysisModel(nn.Module):
             if format_version == 1
             else HeadDimensionsV2()
             if format_version == 2
+            else HeadDimensionsV5()
+            if format_version == 5
             else HeadDimensionsV4()
             if format_version == 4
             else HeadDimensions()
@@ -292,6 +301,44 @@ class RiichiAnalysisModel(nn.Module):
             return outputs
 
         assert isinstance(d, HeadDimensions)
+        if self.format_version == 5:
+            assert isinstance(d, HeadDimensionsV5)
+            (
+                dora_distribution,
+                dora_point,
+                score_distribution,
+                score_point,
+                outcome,
+                delta,
+                placement,
+                match_score,
+            ) = self._split(
+                future,
+                (
+                    d.dora_distribution,
+                    d.dora_point,
+                    d.score_distribution,
+                    d.score_point,
+                    d.outcome,
+                    d.kyoku_delta,
+                    d.placement,
+                    d.match_score,
+                ),
+            )
+            outputs.update(
+                {
+                    "dora_distribution": dora_distribution.view(batch, 3, len(DORA_VALUES)),
+                    "dora_point": dora_point.view(batch, 3),
+                    "score_distribution": score_distribution.view(batch, 3, len(SCORE_VALUES)),
+                    "score_point": score_point.view(batch, 3),
+                    "outcome": outcome.view(batch, OUTCOME_COUNT),
+                    "kyoku_delta": delta.view(batch, 4),
+                    "placement": placement.view(batch, 24),
+                    "match_score": match_score.view(batch, 4),
+                }
+            )
+            return outputs
+
         if self.format_version == 4:
             assert isinstance(d, HeadDimensionsV4)
             (

@@ -28,6 +28,33 @@ OUTCOME_CLASSES = (
 )
 OUTCOME_COUNT = len(OUTCOME_CLASSES)
 OUTCOME_INDEX = {outcome: index for index, outcome in enumerate(OUTCOME_CLASSES)}
+OUTCOME_WINNER_INDICATORS = np.asarray(
+    [
+        [float(player in outcome.winners) for player in range(4)]
+        for outcome in OUTCOME_CLASSES
+    ],
+    dtype=np.float32,
+)
+OUTCOME_DEAL_IN_INDICATORS = np.asarray(
+    [
+        [float(outcome.kind == "ron" and outcome.target == player) for player in range(4)]
+        for outcome in OUTCOME_CLASSES
+    ],
+    dtype=np.float32,
+)
+
+
+def outcome_marginals(
+    probabilities: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    values = np.asarray(probabilities, dtype=np.float32)
+    if values.shape[-1:] != (OUTCOME_COUNT,):
+        raise ValueError(f"outcome probabilities must end with {OUTCOME_COUNT} classes")
+    return (
+        values[..., 0],
+        values @ OUTCOME_WINNER_INDICATORS,
+        values @ OUTCOME_DEAL_IN_INDICATORS,
+    )
 
 
 def outcome_class_index(win: np.ndarray, targets: np.ndarray) -> int:

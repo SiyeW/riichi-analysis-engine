@@ -1,8 +1,10 @@
 import numpy as np
+import pytest
 
 from riichi_analysis_engine.kyoku_outcome import (
     OUTCOME_CLASSES,
     OUTCOME_COUNT,
+    outcome_marginals,
     outcome_class_index,
 )
 
@@ -22,3 +24,13 @@ def test_double_ron_is_one_result_with_two_winners() -> None:
     assert OUTCOME_CLASSES[index].kind == "ron"
     assert OUTCOME_CLASSES[index].winners == (1, 2)
     assert OUTCOME_CLASSES[index].target == 0
+
+
+def test_marginals_are_derived_from_the_joint_distribution() -> None:
+    probabilities = np.full(OUTCOME_COUNT, 1.0 / OUTCOME_COUNT, dtype=np.float32)
+
+    draw, win, deal_in = outcome_marginals(probabilities)
+
+    assert draw == pytest.approx(1 / 33)
+    assert win.tolist() == pytest.approx([13 / 33] * 4)
+    assert deal_in.tolist() == pytest.approx([7 / 33] * 4)
