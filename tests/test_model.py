@@ -18,7 +18,8 @@ def test_output_shapes() -> None:
     assert outputs["score_point"].shape == (2, 3)
     assert outputs["outcome_any_win"].shape == (2,)
     assert outputs["outcome_winner"].shape == (2, 4)
-    assert outputs["target"].shape == (2, 4, 4)
+    assert outputs["deal_in_player"].shape == (2, 4)
+    assert outputs["outcome"].shape == (2, 33)
     assert outputs["placement"].shape == (2, 24)
     assert outputs["policy"].shape == (2, 46)
 
@@ -28,9 +29,9 @@ def test_default_parameter_budget() -> None:
     assert count_parameters(model) == {
         "encoder": 23_663_488,
         "state": 1_900_350,
-        "future": 990_216,
+        "future": 1_003_289,
         "policy": 47_150,
-        "total": 26_601_204,
+        "total": 26_614_277,
     }
 
 

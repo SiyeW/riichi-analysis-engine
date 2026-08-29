@@ -12,6 +12,8 @@ from typing import Any
 
 import numpy as np
 
+from .kyoku_outcome import outcome_class_index
+
 from .constants import (
     PLAYERS,
     RED_TILES,
@@ -547,6 +549,7 @@ def rotated_future(
         "win": annotation.win[order],
         "deal_in_player": annotation.deal_in[order],
         "target": target_relative,
+        "outcome": outcome_class_index(annotation.win[order], target_relative),
         "dora": annotation.dora[list(opponents)],
         "score": annotation.score[list(opponents)],
         "kyoku_delta": (annotation.final_kyoku_scores - current_scores)[order],

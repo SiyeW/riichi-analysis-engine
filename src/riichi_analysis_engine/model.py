@@ -7,6 +7,7 @@ import torch
 from torch import Tensor, nn
 
 from .constants import ACTION_SPACE, OBS_CHANNELS, TILE_TYPES
+from .kyoku_outcome import OUTCOME_COUNT
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 
 
@@ -131,6 +132,16 @@ class HeadDimensionsV2(HeadDimensions):
 
 
 @dataclass(frozen=True)
+class HeadDimensionsV4(HeadDimensions):
+    target: int = 0
+    outcome: int = OUTCOME_COUNT
+
+    @property
+    def future_total(self) -> int:
+        return super().future_total + self.outcome
+
+
+@dataclass(frozen=True)
 class HeadDimensionsV1:
     shanten: int = 3 * 7
     furiten_no_yaku: int = 3
@@ -180,10 +191,10 @@ class RiichiAnalysisModel(nn.Module):
         blocks: int = 54,
         state_width: int = 1024,
         future_width: int = 768,
-        format_version: int = 3,
+        format_version: int = 4,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2, 3}:
+        if format_version not in {1, 2, 3, 4}:
             raise ValueError(f"unsupported model format version: {format_version}")
         self.format_version = format_version
         self.dimensions = (
@@ -191,6 +202,8 @@ class RiichiAnalysisModel(nn.Module):
             if format_version == 1
             else HeadDimensionsV2()
             if format_version == 2
+            else HeadDimensionsV4()
+            if format_version == 4
             else HeadDimensions()
         )
         self.encoder = MortalV4Encoder(channels=channels, blocks=blocks)
@@ -279,6 +292,53 @@ class RiichiAnalysisModel(nn.Module):
             return outputs
 
         assert isinstance(d, HeadDimensions)
+        if self.format_version == 4:
+            assert isinstance(d, HeadDimensionsV4)
+            (
+                dora_distribution,
+                dora_point,
+                score_distribution,
+                score_point,
+                outcome_any_win,
+                outcome_winner,
+                deal_player,
+                outcome,
+                delta,
+                placement,
+                match_score,
+            ) = self._split(
+                future,
+                (
+                    d.dora_distribution,
+                    d.dora_point,
+                    d.score_distribution,
+                    d.score_point,
+                    d.outcome_any_win,
+                    d.outcome_winner,
+                    d.deal_in_player,
+                    d.outcome,
+                    d.kyoku_delta,
+                    d.placement,
+                    d.match_score,
+                ),
+            )
+            outputs.update(
+                {
+                    "dora_distribution": dora_distribution.view(batch, 3, len(DORA_VALUES)),
+                    "dora_point": dora_point.view(batch, 3),
+                    "score_distribution": score_distribution.view(batch, 3, len(SCORE_VALUES)),
+                    "score_point": score_point.view(batch, 3),
+                    "outcome_any_win": outcome_any_win.view(batch),
+                    "outcome_winner": outcome_winner.view(batch, 4),
+                    "deal_in_player": deal_player.view(batch, 4),
+                    "outcome": outcome.view(batch, OUTCOME_COUNT),
+                    "kyoku_delta": delta.view(batch, 4),
+                    "placement": placement.view(batch, 24),
+                    "match_score": match_score.view(batch, 4),
+                }
+            )
+            return outputs
+
         (
             dora_distribution,
             dora_point,

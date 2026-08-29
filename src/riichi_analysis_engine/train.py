@@ -181,9 +181,8 @@ def validate(
             (outputs["deal_in_player"].sigmoid() - batch["deal_in_player"].float()).square(),
         )
         add_metric(
-            "targetAccuracy",
-            outputs["target"].argmax(-1) == batch["target"],
-            batch["target"] >= 0,
+            "outcomeAccuracy",
+            outputs["outcome"].argmax(-1) == batch["outcome"],
         )
         add_metric(
             "kyokuDeltaMaePoints",
@@ -226,7 +225,7 @@ def save_checkpoint(
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "format": "riichi-analysis-model-v3",
+            "format": "riichi-analysis-model-v4",
             "epoch": epoch,
             "batchInEpoch": batch_in_epoch,
             "step": step,
@@ -286,7 +285,7 @@ def main() -> None:
     samples_seen = 0
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
-        if checkpoint.get("format") != "riichi-analysis-model-v3":
+        if checkpoint.get("format") != "riichi-analysis-model-v4":
             raise RuntimeError("resume checkpoint has an unsupported format")
         if checkpoint.get("predictionValues") != {
             "dora": list(DORA_VALUES),

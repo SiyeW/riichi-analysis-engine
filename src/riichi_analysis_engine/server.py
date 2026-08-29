@@ -11,7 +11,7 @@ import torch
 from .runtime import AnalysisRuntime
 
 PROTOCOL = {"name": "riichi-engine-protocol", "major": 2, "minor": 2}
-ENGINE_VERSION = "0.1.0-dev.2"
+ENGINE_VERSION = "0.1.0-dev.3"
 OUTPUT_IDS = [
     "action-recommendation",
     "opponent-shanten",
@@ -74,6 +74,10 @@ def numeric_representations(output_id: str, protocol_minor: int) -> list[str] | 
     return NUMERIC_REPRESENTATIONS.get(output_id)
 
 
+def output_version(output_id: str, protocol_minor: int) -> int:
+    return 2 if output_id == "kyoku-outcome" and protocol_minor >= 2 else 1
+
+
 def output_declaration(
     output_id: str,
     protocol_minor: int,
@@ -81,7 +85,10 @@ def output_declaration(
     initialized: bool = False,
     representations: list[str] | None = None,
 ) -> dict[str, Any]:
-    result: dict[str, Any] = {"id": output_id, "version": 1}
+    result: dict[str, Any] = {
+        "id": output_id,
+        "version": output_version(output_id, protocol_minor),
+    }
     representations = (
         numeric_representations(output_id, protocol_minor)
         if representations is None
@@ -131,7 +138,10 @@ class Engine:
                     "id": "model",
                     "title": {"default": "Model weights", "zh-CN": "模型权重", "ja-JP": "モデルの重み"},
                     "formats": [{"id": "riichi-analysis-pytorch-v1", "extensions": [".pt"]}],
-                    "requiredForOutputs": [{"id": value, "version": 1} for value in outputs],
+                    "requiredForOutputs": [
+                        {"id": value, "version": output_version(value, self.protocol_minor)}
+                        for value in outputs
+                    ],
                 }
             ],
             "devices": devices,
@@ -145,7 +155,12 @@ class Engine:
         enabled = params.get("enabledOutputs")
         if not isinstance(enabled, list) or not enabled:
             raise ProtocolError("enabledOutputs must be non-empty", "UNSUPPORTED_OUTPUT")
-        ids = [item.get("id") for item in enabled if isinstance(item, dict) and item.get("version") == 1]
+        ids = [
+            item.get("id")
+            for item in enabled
+            if isinstance(item, dict)
+            and item.get("version") == output_version(item.get("id"), self.protocol_minor)
+        ]
         available = set(available_output_ids(self.protocol_minor))
         if len(ids) != len(enabled) or len(set(ids)) != len(ids) or not set(ids).issubset(available):
             raise ProtocolError("enabledOutputs contains an unavailable output", "UNSUPPORTED_OUTPUT")
@@ -197,7 +212,12 @@ class Engine:
             raise ProtocolError("standard non-empty history is required", "INVALID_HISTORY")
         if not isinstance(requested, list) or not requested:
             raise ProtocolError("outputs must be non-empty", "UNSUPPORTED_OUTPUT")
-        ids = [item.get("id") for item in requested if isinstance(item, dict) and item.get("version") == 1]
+        ids = [
+            item.get("id")
+            for item in requested
+            if isinstance(item, dict)
+            and item.get("version") == output_version(item.get("id"), self.protocol_minor or 0)
+        ]
         if len(ids) != len(requested) or len(set(ids)) != len(ids) or not set(ids).issubset(self.enabled):
             raise ProtocolError("outputs contains an unavailable output", "UNSUPPORTED_OUTPUT")
         try:
@@ -207,7 +227,14 @@ class Engine:
         except (KeyError, TypeError, ValueError) as error:
             raise ProtocolError(str(error), "INVALID_HISTORY") from error
         return {
-            "outputs": [{"id": value, "version": 1, "data": data[value]} for value in ids],
+            "outputs": [
+                {
+                    "id": value,
+                    "version": output_version(value, self.protocol_minor or 0),
+                    "data": data[value],
+                }
+                for value in ids
+            ],
             "timing": {"totalMs": elapsed},
         }
 
