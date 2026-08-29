@@ -65,8 +65,10 @@ def test_hello_only_declares_features_from_the_negotiated_minor() -> None:
     assert "kyoku-outcome" not in old_outputs
     assert "point-estimate" not in old_outputs["opponent-dora-count"]["representations"]
     assert "kyoku-outcome" in current_outputs
-    assert current_outputs["kyoku-outcome"]["version"] == 2
+    assert "version" not in current_outputs["kyoku-outcome"]
     assert previous_outputs["kyoku-outcome"]["version"] == 1
+    assert all(item["version"] == 1 for item in old["outputContracts"])
+    assert all("version" not in item for item in current["weightSlots"][0]["requiredForOutputs"])
     assert "point-estimate" in current_outputs["opponent-dora-count"]["representations"]
 
 
