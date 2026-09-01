@@ -18,6 +18,11 @@ from .constants import RED_TILES, TILE37_TO_ACTION, TILES_34, relative_players, 
 from .kyoku_outcome import OUTCOME_CLASSES, outcome_marginals
 from .model import RiichiAnalysisModel
 from .prediction_values import DORA_VALUES, SCORE_VALUES
+from .rule_certainties import (
+    PublicRuleState,
+    apply_opponent_rule_certainties,
+    constrain_distribution,
+)
 
 PERMUTATIONS = tuple(itertools.permutations(range(4)))
 
@@ -164,12 +169,21 @@ class AnalysisRuntime:
         with torch.inference_mode():
             raw = self.model(tensor)
         outputs = {name: value[0].float().cpu() for name, value in raw.items()}
+        rule_state = PublicRuleState.from_events(events)
         order = [(controlled_seat + offset) % 4 for offset in range(4)]
         opponents = relative_players(controlled_seat)
         results: dict[str, dict[str, Any]] = {}
 
         shanten = outputs["shanten"].softmax(-1).numpy()
         furiten = outputs["furiten_no_yaku"].sigmoid().numpy()
+        waits = outputs["deal_in_tile"].sigmoid().numpy()
+        for index, seat in enumerate(opponents):
+            shanten[index], waits[index] = apply_opponent_rule_certainties(
+                shanten[index],
+                waits[index],
+                is_riichi=rule_state.riichi[seat],
+                forbidden_tiles=rule_state.forbidden_tiles[seat],
+            )
         results["opponent-shanten"] = {
             "players": [
                 {
@@ -180,7 +194,6 @@ class AnalysisRuntime:
                 for index, seat in enumerate(opponents)
             ]
         }
-        waits = outputs["deal_in_tile"].sigmoid().numpy()
         results["opponent-deal-in-probability"] = {
             "players": [
                 {
@@ -196,6 +209,18 @@ class AnalysisRuntime:
             if self.format_version >= 3
             else None
         )
+        for index, seat in enumerate(opponents):
+            for tile_index, tile in enumerate(TILES_34):
+                concealed[index, tile_index] = constrain_distribution(
+                    concealed[index, tile_index],
+                    *rule_state.concealed_range(seat, tile),
+                )
+            if concealed_red is not None:
+                for tile_index, tile in enumerate(RED_TILES):
+                    concealed_red[index, tile_index] = constrain_distribution(
+                        concealed_red[index, tile_index],
+                        *rule_state.concealed_red_range(seat, tile),
+                    )
         results["opponent-concealed-tile-count"] = {
             "players": [
                 {
@@ -226,6 +251,17 @@ class AnalysisRuntime:
             if self.format_version >= 3
             else None
         )
+        for tile_index, tile in enumerate(TILES_34):
+            wall[tile_index] = constrain_distribution(
+                wall[tile_index],
+                *rule_state.wall_range(tile),
+            )
+        if wall_red is not None:
+            for tile_index, tile in enumerate(RED_TILES):
+                wall_red[tile_index] = constrain_distribution(
+                    wall_red[tile_index],
+                    *rule_state.wall_red_range(tile),
+                )
         results["wall-tile-count"] = {
             "tiles": {
                 tile: _prediction_from_distribution(wall[tile_index])

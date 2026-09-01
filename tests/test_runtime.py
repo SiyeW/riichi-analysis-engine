@@ -2,6 +2,8 @@ import numpy as np
 
 from riichi_analysis_engine.runtime import (
     AnalysisRuntime,
+    _distribution,
+    _prediction_from_distribution,
     _valued_distribution,
     candidate_action_index,
 )
@@ -29,6 +31,23 @@ def test_open_ended_dora_bucket_remains_a_string() -> None:
         {"value": 0, "probability": 0.25},
         {"value": "7+", "probability": 0.75},
     ]
+
+
+def test_probability_serializers_preserve_exact_endpoints() -> None:
+    probabilities = np.asarray([1.0, 0.0, 0.0])
+    assert _distribution(probabilities) == [
+        {"value": 0, "probability": 1.0},
+        {"value": 1, "probability": 0.0},
+        {"value": 2, "probability": 0.0},
+    ]
+    assert _prediction_from_distribution(probabilities) == {
+        "distribution": [
+            {"value": 0, "probability": 1.0},
+            {"value": 1, "probability": 0.0},
+            {"value": 2, "probability": 0.0},
+        ],
+        "expectedValue": 0.0,
+    }
 
 
 def test_v2_representations_follow_the_negotiated_protocol() -> None:

@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "id": "org.riichi.analysis",
   "name": "Riichi Analysis Engine",
-  "version": "0.1.0-dev.5",
+  "version": "0.1.0-dev.6",
   "sourceUrl": "https://github.com/SiyeW/riichi-analysis-engine",
   "protocol": {
     "name": "riichi-engine-protocol",
