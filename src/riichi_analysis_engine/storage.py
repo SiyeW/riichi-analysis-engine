@@ -11,7 +11,9 @@ from .constants import ACTION_SPACE, OBS_CHANNELS, TILE_TYPES
 OBS_ELEMENTS = OBS_CHANNELS * TILE_TYPES
 OBS_BYTES = (OBS_ELEMENTS + 7) // 8
 ACTION_BYTES = (ACTION_SPACE + 7) // 8
-STORAGE_FORMAT = "dual-bitpack-sparse-float16-v2"
+# v3 adds rank-augmented observations.  The format marker prevents a training
+# run from silently mixing earlier 1,012-channel shards with the new layout.
+STORAGE_FORMAT = "dual-bitpack-sparse-float16-v3"
 
 
 @dataclass

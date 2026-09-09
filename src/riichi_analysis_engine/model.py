@@ -1,20 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 
 import torch
 from torch import Tensor, nn
 
-from .constants import ACTION_SPACE, OBS_CHANNELS, TILE_TYPES
+from .constants import ACTION_SPACE, MORTAL_OBS_CHANNELS, OBS_CHANNELS, TILE_TYPES
+from .architecture import ModelArchitecture
 from .kyoku_outcome import OUTCOME_COUNT
+from .observation_layout import ANALYSIS_CHANNELS, POLICY_CONTEXT_CHANNELS, POLICY_CONTEXT_START
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 
 
 class ChannelAttention(nn.Module):
     def __init__(self, channels: int, ratio: int = 16) -> None:
         super().__init__()
-        hidden = channels // ratio
+        hidden = max(1, channels // ratio)
         self.shared_mlp = nn.Sequential(
             nn.Linear(channels, hidden),
             nn.Mish(inplace=True),
@@ -49,13 +51,20 @@ class ResidualBlock(nn.Module):
         return value + self.attention(self.residual(value))
 
 
-class MortalV4Encoder(nn.Module):
-    """Mortal v4-style residual encoder for public observations."""
+class ResidualEncoder(nn.Module):
+    """Mortal-style residual encoder with an explicit input boundary."""
 
-    def __init__(self, channels: int = 256, blocks: int = 54) -> None:
+    def __init__(
+        self,
+        input_channels: int,
+        *,
+        channels: int,
+        blocks: int,
+        latent_width: int,
+    ) -> None:
         super().__init__()
         layers: list[nn.Module] = [
-            nn.Conv1d(OBS_CHANNELS, channels, 3, padding=1, bias=False),
+            nn.Conv1d(input_channels, channels, 3, padding=1, bias=False),
         ]
         layers.extend(ResidualBlock(channels) for _ in range(blocks))
         layers.extend(
@@ -65,7 +74,7 @@ class MortalV4Encoder(nn.Module):
                 nn.Conv1d(channels, 32, 3, padding=1),
                 nn.Mish(inplace=True),
                 nn.Flatten(),
-                nn.Linear(32 * TILE_TYPES, 1024),
+                nn.Linear(32 * TILE_TYPES, latent_width),
                 nn.Mish(inplace=True),
             ]
         )
@@ -73,6 +82,18 @@ class MortalV4Encoder(nn.Module):
 
     def forward(self, observation: Tensor) -> Tensor:
         return self.net(observation)
+
+
+class MortalV4Encoder(ResidualEncoder):
+    """Legacy full-observation encoder retained for v1--v5 weights."""
+
+    def __init__(self, channels: int = 256, blocks: int = 54) -> None:
+        super().__init__(
+            MORTAL_OBS_CHANNELS,
+            channels=channels,
+            blocks=blocks,
+            latent_width=1024,
+        )
 
 
 @dataclass(frozen=True)
@@ -189,44 +210,97 @@ class HeadDimensionsV1:
 
 
 class RiichiAnalysisModel(nn.Module):
-    """One shared encoder with separate state, future and policy adapters."""
+    """Shared state analysis with a separate decision-only feature path.
+
+    Formats v1--v5 preserve the old full-observation architecture solely for
+    loading already exported artifacts.  New training uses v6, where policy
+    phase/action features and single-player EV tables no longer consume the
+    shared prediction encoder's capacity.
+    """
 
     def __init__(
         self,
         *,
-        channels: int = 256,
-        blocks: int = 54,
-        state_width: int = 1024,
-        future_width: int = 768,
-        format_version: int = 5,
+        channels: int | None = None,
+        blocks: int | None = None,
+        state_width: int | None = None,
+        future_width: int | None = None,
+        format_version: int = 6,
+        architecture: ModelArchitecture | None = None,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2, 3, 4, 5}:
+        if format_version not in {1, 2, 3, 4, 5, 6}:
             raise ValueError(f"unsupported model format version: {format_version}")
+        if architecture is not None and format_version != 6:
+            raise ValueError("only model format v6 accepts explicit architecture metadata")
         self.format_version = format_version
+        self.architecture: ModelArchitecture | None = None
         self.dimensions = (
             HeadDimensionsV1()
             if format_version == 1
             else HeadDimensionsV2()
             if format_version == 2
             else HeadDimensionsV5()
-            if format_version == 5
+            if format_version in {5, 6}
             else HeadDimensionsV4()
             if format_version == 4
             else HeadDimensions()
         )
-        self.encoder = MortalV4Encoder(channels=channels, blocks=blocks)
+        if format_version == 6:
+            configured = architecture or ModelArchitecture()
+            overrides: dict[str, int] = {}
+            if channels is not None:
+                overrides["analysis_channels"] = channels
+            if blocks is not None:
+                overrides["analysis_blocks"] = blocks
+            if state_width is not None:
+                overrides["state_width"] = state_width
+            if future_width is not None:
+                overrides["future_width"] = future_width
+            self.architecture = replace(configured, **overrides)
+            architecture = self.architecture
+            self.encoder = ResidualEncoder(
+                ANALYSIS_CHANNELS,
+                channels=architecture.analysis_channels,
+                blocks=architecture.analysis_blocks,
+                latent_width=architecture.analysis_latent_width,
+            )
+            self.policy_context = ResidualEncoder(
+                POLICY_CONTEXT_CHANNELS,
+                channels=architecture.policy_context_channels,
+                blocks=architecture.policy_context_blocks,
+                latent_width=architecture.policy_context_width,
+            )
+            latent_width = architecture.analysis_latent_width
+            state_width = architecture.state_width
+            future_width = architecture.future_width
+            self.policy_adapter = nn.Sequential(
+                nn.Linear(
+                    architecture.analysis_latent_width + architecture.policy_context_width,
+                    architecture.policy_width,
+                ),
+                nn.Mish(inplace=True),
+            )
+            self.policy_head = nn.Linear(architecture.policy_width, ACTION_SPACE)
+        else:
+            legacy_channels = 256 if channels is None else channels
+            legacy_blocks = 54 if blocks is None else blocks
+            latent_width = 1024
+            state_width = 1024 if state_width is None else state_width
+            future_width = 768 if future_width is None else future_width
+            self.encoder = MortalV4Encoder(channels=legacy_channels, blocks=legacy_blocks)
         self.state_adapter = nn.Sequential(
-            nn.Linear(1024, state_width),
+            nn.Linear(latent_width, state_width),
             nn.Mish(inplace=True),
         )
         self.state_head = nn.Linear(state_width, self.dimensions.state_total)
         self.future_adapter = nn.Sequential(
-            nn.Linear(1024, future_width),
+            nn.Linear(latent_width, future_width),
             nn.Mish(inplace=True),
         )
         self.future_head = nn.Linear(future_width, self.dimensions.future_total)
-        self.policy_head = nn.Linear(1024, ACTION_SPACE)
+        if format_version != 6:
+            self.policy_head = nn.Linear(latent_width, ACTION_SPACE)
 
         nn.init.zeros_(self.state_head.bias)
         nn.init.zeros_(self.future_head.bias)
@@ -237,7 +311,15 @@ class RiichiAnalysisModel(nn.Module):
         return value.split(dimensions, dim=-1)
 
     def forward(self, observation: Tensor) -> dict[str, Tensor]:
-        latent = self.encoder(observation)
+        if self.format_version == 6:
+            if observation.shape[1:] != (OBS_CHANNELS, TILE_TYPES):
+                raise ValueError(f"wrong observation shape: {tuple(observation.shape)}")
+            latent = self.encoder(observation[:, :ANALYSIS_CHANNELS])
+            policy_context = self.policy_context(observation[:, POLICY_CONTEXT_START:])
+            policy = self.policy_head(self.policy_adapter(torch.cat((latent, policy_context), dim=-1)))
+        else:
+            latent = self.encoder(observation)
+            policy = self.policy_head(latent)
         d = self.dimensions
         state = self.state_head(self.state_adapter(latent))
         future = self.future_head(self.future_adapter(latent))
@@ -261,7 +343,7 @@ class RiichiAnalysisModel(nn.Module):
             "deal_in_tile": deal_in.view(batch, 3, 34),
             "concealed_count": concealed.view(batch, 3, 34, 5),
             "wall_count": wall.view(batch, 34, 5),
-            "policy": self.policy_head(latent),
+            "policy": policy,
         }
         if self.format_version >= 3:
             concealed_red, wall_red = state_parts[5:]
@@ -301,7 +383,7 @@ class RiichiAnalysisModel(nn.Module):
             return outputs
 
         assert isinstance(d, HeadDimensions)
-        if self.format_version == 5:
+        if self.format_version in {5, 6}:
             assert isinstance(d, HeadDimensionsV5)
             (
                 dora_distribution,
@@ -433,12 +515,16 @@ class RiichiAnalysisModel(nn.Module):
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
-    groups = {
+    groups: dict[str, nn.Module] = {
         "encoder": model.encoder,
         "state": nn.ModuleList([model.state_adapter, model.state_head]),
         "future": nn.ModuleList([model.future_adapter, model.future_head]),
-        "policy": model.policy_head,
     }
+    if model.format_version == 6:
+        groups["policy_context"] = model.policy_context
+        groups["policy"] = nn.ModuleList([model.policy_adapter, model.policy_head])
+    else:
+        groups["policy"] = model.policy_head
     counts = {
         name: sum(parameter.numel() for parameter in module.parameters())
         for name, module in groups.items()

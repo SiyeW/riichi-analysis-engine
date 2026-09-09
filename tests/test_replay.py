@@ -1,8 +1,9 @@
 import numpy as np
+from types import SimpleNamespace
 
 from riichi_analysis_engine.prediction_values import SCORE_VALUE_SET, SCORE_VALUES
 from riichi_analysis_engine.prepare import mortal_validation_members, stable_fraction
-from riichi_analysis_engine.replay import FullState, hand_score, placement_label
+from riichi_analysis_engine.replay import FullState, action_label, hand_score, placement_label
 
 
 def test_wall_and_red_dora_tracking() -> None:
@@ -65,3 +66,26 @@ def test_manifest_selection_is_order_independent(tmp_path) -> None:
     assert mortal_validation_members(["x.mjson", "y.mjson"]) == mortal_validation_members(
         ["y.mjson", "x.mjson"]
     )
+
+
+def _empty_cans() -> SimpleNamespace:
+    return SimpleNamespace(
+        can_ryukyoku=False,
+        can_chi_low=False,
+        can_chi_mid=False,
+        can_chi_high=False,
+        can_pon=False,
+        can_daiminkan=False,
+        can_ron_agari=False,
+    )
+
+
+def test_kan_labels_belong_only_to_the_player_who_declared_the_kan() -> None:
+    state = SimpleNamespace(ankan_candidates=["1m", "2m"], kakan_candidates=[])
+    events = [
+        {"type": "tsumo", "actor": 1, "pai": "3m"},
+        {"type": "ankan", "actor": 1, "consumed": ["2m"] * 4},
+    ]
+
+    assert action_label(0, state, _empty_cans(), events, 0) == (None, None)
+    assert action_label(1, state, _empty_cans(), events, 0) == (42, 1)

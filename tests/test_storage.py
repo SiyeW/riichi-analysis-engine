@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from riichi_analysis_engine.constants import ACTION_SPACE, OBS_CHANNELS, TILE_TYPES
 from riichi_analysis_engine.storage import (
@@ -7,6 +8,7 @@ from riichi_analysis_engine.storage import (
     pack_observations,
     unpack_action_masks,
     unpack_observations,
+    load_shard,
 )
 
 
@@ -28,3 +30,10 @@ def test_action_mask_round_trip() -> None:
     source[1, [37, 43]] = True
     np.testing.assert_array_equal(unpack_action_masks(pack_action_masks(source)), source)
 
+
+def test_rank_augmented_storage_rejects_older_schema_marker(tmp_path) -> None:
+    path = tmp_path / "legacy.npz"
+    np.savez_compressed(path, storage_format=np.asarray("dual-bitpack-sparse-float16-v2"))
+
+    with pytest.raises(ValueError, match="unsupported storage format"):
+        load_shard(path)

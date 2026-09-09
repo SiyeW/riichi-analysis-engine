@@ -6,6 +6,7 @@
 /data/manifests/
 /data/processed/
 /data/processed-v2/
+/data/processed-v3/
 /runs/
 /weights/
 .env

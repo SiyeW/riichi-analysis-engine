@@ -1,5 +1,6 @@
 import numpy as np
 
+from riichi_analysis_engine.constants import OBS_CHANNELS, TILE_TYPES
 from riichi_analysis_engine.dataset import ShardDataset
 from riichi_analysis_engine.storage import save_shard
 
@@ -10,7 +11,7 @@ def test_batches_continue_across_shards(tmp_path) -> None:
         save_shard(
             tmp_path / f"game-{index}.npz",
             {
-                "obs": np.zeros((length, 1012, 34), dtype=np.float32),
+                    "obs": np.zeros((length, OBS_CHANNELS, TILE_TYPES), dtype=np.float32),
                 "action_mask": np.ones((length, 46), dtype=bool),
                 "policy": np.arange(index * length, (index + 1) * length, dtype=np.int8),
             },

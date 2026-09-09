@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from .constants import OBS_VERSION, relative_players
+from .observations import add_all_player_ranks
 from .replay import (
     FRAME_EVENTS,
     ExactTargetTracker,
@@ -22,6 +23,7 @@ from .replay import (
     rotated_future,
 )
 from .storage import STORAGE_FORMAT, save_shard
+from .score_state import relative_scores
 
 
 def read_manifest(path: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
@@ -98,6 +100,9 @@ def convert_game(
         kan_select: bool,
     ) -> None:
         observation, action_mask = states[perspective].encode_obs(OBS_VERSION, kan_select)
+        observation = add_all_player_ranks(
+            observation, relative_scores(full_state.scores, perspective)
+        )
         if policy >= 0 and not bool(action_mask[policy]):
             raise ValueError(
                 f"illegal policy label {policy} at {source_id}:{event_index}, "
@@ -277,7 +282,7 @@ def main() -> None:
                         f"samples={converted_samples}; failures={len(failures)}"
                     )
         summary = {
-            "format": "riichi-analysis-multitask-v2",
+            "format": "riichi-analysis-multitask-v3",
             "manifest": metadata,
             "requestedGames": len(records),
             "convertedGames": converted_games,
@@ -330,7 +335,7 @@ def main() -> None:
     flush()
 
     summary = {
-        "format": "riichi-analysis-multitask-v2",
+        "format": "riichi-analysis-multitask-v3",
         "manifest": metadata,
         "requestedGames": len(records),
         "convertedGames": converted_games,

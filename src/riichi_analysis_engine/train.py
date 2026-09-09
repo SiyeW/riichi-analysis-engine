@@ -14,9 +14,10 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
+from .architecture import ModelArchitecture
 from .dataset import ShardDataset
 from .kyoku_outcome import OUTCOME_DEAL_IN_INDICATORS, OUTCOME_WINNER_INDICATORS
-from .losses import DEFAULT_WEIGHTS, multitask_loss, score_class_indices
+from .losses import LOSS_TERMS, LearnedUncertaintyBalancer, multitask_loss, score_class_indices
 from .model import RiichiAnalysisModel, count_parameters
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
 
@@ -81,13 +82,15 @@ def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str
 @torch.no_grad()
 def validate(
     model: RiichiAnalysisModel,
+    balancer: LearnedUncertaintyBalancer,
     loader: DataLoader,
     device: torch.device,
     *,
     progress_every: int = 100,
 ) -> dict[str, float]:
     model.eval()
-    totals: dict[str, float] = {"total": 0.0, **{name: 0.0 for name in DEFAULT_WEIGHTS}}
+    totals: dict[str, float] = {"total": 0.0, **{name: 0.0 for name in LOSS_TERMS}}
+    balance_totals: dict[str, float] = {name: 0.0 for name in LOSS_TERMS}
     batches = 0
     metric_sums: dict[str, float] = {}
     metric_counts: dict[str, int] = {}
@@ -102,10 +105,12 @@ def validate(
     for batch in loader:
         batch = move_batch(batch, device)
         outputs = model(batch["obs"].float())
-        total, losses = multitask_loss(outputs, batch)
+        total, losses, _active, weights = multitask_loss(outputs, batch, balancer)
         totals["total"] += float(total)
         for name, value in losses.items():
             totals[name] += float(value)
+        for name, value in weights.items():
+            balance_totals[name] += float(value)
         policy_valid = batch["policy"] >= 0
         policy_logits = outputs["policy"].masked_fill(~batch["action_mask"], -torch.inf)
         add_metric(
@@ -200,6 +205,12 @@ def validate(
     result = {name: value / max(1, batches) for name, value in totals.items()}
     result.update(
         {
+            f"lossWeight/{name}": balance_totals[name] / max(1, batches)
+            for name in LOSS_TERMS
+        }
+    )
+    result.update(
+        {
             f"metric/{name}": metric_sums[name] / max(1, metric_counts[name])
             for name in metric_sums
         }
@@ -212,6 +223,8 @@ def save_checkpoint(
     model: RiichiAnalysisModel,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
+    balancer: LearnedUncertaintyBalancer,
+    architecture: ModelArchitecture,
     *,
     epoch: int,
     batch_in_epoch: int,
@@ -226,16 +239,20 @@ def save_checkpoint(
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "format": "riichi-analysis-model-v5",
+            "format": "riichi-analysis-model-v6",
             "epoch": epoch,
             "batchInEpoch": batch_in_epoch,
             "step": step,
             "samplesSeen": samples_seen,
             "model": model.state_dict(),
+            "modelArchitecture": architecture.to_dict(),
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
+            "lossBalancer": {
+                "terms": list(balancer.names),
+                "state": balancer.state_dict(),
+            },
             "parameters": parameters,
-            "lossWeights": DEFAULT_WEIGHTS,
             "predictionValues": {
                 "dora": list(DORA_VALUES),
                 "score": list(SCORE_VALUES),
@@ -257,7 +274,17 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--analysis-channels", type=int, default=192)
+    parser.add_argument("--analysis-blocks", type=int, default=36)
+    parser.add_argument("--analysis-latent-width", type=int, default=768)
+    parser.add_argument("--state-width", type=int, default=768)
+    parser.add_argument("--future-width", type=int, default=640)
+    parser.add_argument("--policy-context-channels", type=int, default=96)
+    parser.add_argument("--policy-context-blocks", type=int, default=4)
+    parser.add_argument("--policy-context-width", type=int, default=256)
+    parser.add_argument("--policy-width", type=int, default=640)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-validation-samples", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -274,10 +301,33 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
     amp_dtype = torch.float16 if device.type == "cuda" else None
 
-    model = RiichiAnalysisModel().to(device)
+    architecture = ModelArchitecture(
+        analysis_channels=args.analysis_channels,
+        analysis_blocks=args.analysis_blocks,
+        analysis_latent_width=args.analysis_latent_width,
+        state_width=args.state_width,
+        future_width=args.future_width,
+        policy_context_channels=args.policy_context_channels,
+        policy_context_blocks=args.policy_context_blocks,
+        policy_context_width=args.policy_context_width,
+        policy_width=args.policy_width,
+    )
+    model = RiichiAnalysisModel(architecture=architecture).to(device)
+    balancer = LearnedUncertaintyBalancer().to(device)
     parameters = count_parameters(model)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+        [
+            {
+                "params": model.parameters(),
+                "lr": args.learning_rate,
+                "weight_decay": args.weight_decay,
+            },
+            {
+                "params": balancer.parameters(),
+                "lr": args.loss_balance_learning_rate,
+                "weight_decay": 0.0,
+            },
+        ]
     )
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
     start_epoch = 0
@@ -286,14 +336,20 @@ def main() -> None:
     samples_seen = 0
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
-        if checkpoint.get("format") != "riichi-analysis-model-v5":
+        if checkpoint.get("format") != "riichi-analysis-model-v6":
             raise RuntimeError("resume checkpoint has an unsupported format")
+        if checkpoint.get("modelArchitecture") != architecture.to_dict():
+            raise RuntimeError("resume checkpoint uses a different model architecture")
         if checkpoint.get("predictionValues") != {
             "dora": list(DORA_VALUES),
             "score": list(SCORE_VALUES),
         }:
             raise RuntimeError("resume checkpoint uses different prediction values")
         model.load_state_dict(checkpoint["model"], strict=True)
+        balance = checkpoint.get("lossBalancer")
+        if not isinstance(balance, dict) or balance.get("terms") != list(LOSS_TERMS):
+            raise RuntimeError("resume checkpoint has incompatible loss-balance state")
+        balancer.load_state_dict(balance["state"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint.get("epoch", 0))
@@ -339,6 +395,7 @@ def main() -> None:
         "run": str(args.run.resolve()),
         "effectiveDevice": str(device),
         "parameters": parameters,
+        "modelArchitecture": architecture.to_dict(),
         "datasets": datasets,
         "environment": environment,
     }
@@ -365,10 +422,12 @@ def main() -> None:
                 device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None
             ):
                 outputs = model(batch["obs"].float())
-                total, losses = multitask_loss(outputs, batch)
+                total, losses, _active, weights = multitask_loss(outputs, batch, balancer)
             scaler.scale(total).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            torch.nn.utils.clip_grad_norm_(
+                [*model.parameters(), *balancer.parameters()], 5.0
+            )
             scaler.step(optimizer)
             scaler.update()
             step += 1
@@ -381,6 +440,10 @@ def main() -> None:
                     "elapsedSeconds": time.perf_counter() - started,
                     "total": float(total.detach()),
                     **{name: float(value.detach()) for name, value in losses.items()},
+                    **{
+                        f"lossWeight/{name}": float(value.detach())
+                        for name, value in weights.items()
+                    },
                 }
                 if device.type == "cuda":
                     record["peakAllocatedMiB"] = torch.cuda.max_memory_allocated(device) / 2**20
@@ -394,6 +457,8 @@ def main() -> None:
                     model,
                     optimizer,
                     scaler,
+                    balancer,
+                    architecture,
                     epoch=epoch,
                     batch_in_epoch=batch_in_epoch,
                     step=step,
@@ -404,7 +469,7 @@ def main() -> None:
                     validation=None,
                 )
 
-        metrics = validate(model, validation_loader, device)
+        metrics = validate(model, balancer, validation_loader, device)
         record = {"phase": "validation", "epoch": epoch, "step": step, **metrics}
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -414,6 +479,8 @@ def main() -> None:
             model,
             optimizer,
             scaler,
+            balancer,
+            architecture,
             epoch=epoch + 1,
             batch_in_epoch=0,
             step=step,
