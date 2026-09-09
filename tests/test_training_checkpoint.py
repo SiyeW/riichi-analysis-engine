@@ -3,7 +3,7 @@ import torch
 from riichi_analysis_engine.architecture import ModelArchitecture
 from riichi_analysis_engine.losses import LOSS_TERMS, LearnedUncertaintyBalancer
 from riichi_analysis_engine.model import RiichiAnalysisModel
-from riichi_analysis_engine.train import save_checkpoint
+from riichi_analysis_engine.train import save_checkpoint, step_budget_reached
 
 
 def test_v6_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> None:
@@ -50,3 +50,9 @@ def test_v6_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> 
     assert payload["format"] == "riichi-analysis-model-v6"
     assert payload["modelArchitecture"] == architecture.to_dict()
     assert payload["lossBalancer"]["terms"] == list(LOSS_TERMS)
+
+
+def test_step_budget_is_off_until_a_positive_limit_is_reached() -> None:
+    assert not step_budget_reached(10, 0)
+    assert not step_budget_reached(9, 10)
+    assert step_budget_reached(10, 10)

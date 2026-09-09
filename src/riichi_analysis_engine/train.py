@@ -79,6 +79,10 @@ def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str
     return {name: value.to(device, non_blocking=True) for name, value in batch.items()}
 
 
+def step_budget_reached(step: int, max_steps: int) -> bool:
+    return max_steps > 0 and step >= max_steps
+
+
 @torch.no_grad()
 def validate(
     model: RiichiAnalysisModel,
@@ -287,12 +291,18 @@ def main() -> None:
     parser.add_argument("--policy-width", type=int, default=640)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-validation-samples", type=int, default=0)
+    parser.add_argument("--max-steps", type=int, default=0)
+    parser.add_argument("--shuffle-buffer-samples", type=int, default=1024)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--checkpoint-every", type=int, default=2000)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int, default=20252026)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+    if args.max_steps < 0:
+        raise ValueError("max steps must be non-negative")
+    if args.shuffle_buffer_samples < args.batch_size:
+        raise ValueError("shuffle buffer must hold at least one batch")
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
@@ -362,6 +372,7 @@ def main() -> None:
         seed=args.seed,
         max_samples=args.max_train_samples,
         batch_size=args.batch_size,
+        shuffle_buffer_samples=args.shuffle_buffer_samples,
     )
     validation_data = ShardDataset(
         args.validation,
@@ -397,6 +408,11 @@ def main() -> None:
         "parameters": parameters,
         "modelArchitecture": architecture.to_dict(),
         "datasets": datasets,
+        "trainingOrder": {
+            "type": "bounded-cross-game-buffer-v1",
+            "seed": args.seed,
+            "bufferSamples": args.shuffle_buffer_samples,
+        },
         "environment": environment,
     }
     (args.run / "config.json").write_text(
@@ -409,6 +425,7 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
+    stopped_at_budget = False
     for epoch in range(start_epoch, args.epochs):
         train_data.set_epoch(epoch)
         model.train()
@@ -468,21 +485,35 @@ def main() -> None:
                     environment=environment,
                     validation=None,
                 )
+            if step_budget_reached(step, args.max_steps):
+                stopped_at_budget = True
+                break
 
         metrics = validate(model, balancer, validation_loader, device)
-        record = {"phase": "validation", "epoch": epoch, "step": step, **metrics}
+        record = {
+            "phase": "validation",
+            "epoch": epoch,
+            "step": step,
+            "stopReason": "max-steps" if stopped_at_budget else None,
+            **metrics,
+        }
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         print(json.dumps(record, ensure_ascii=False))
+        checkpoint_name = (
+            f"checkpoint-step-{step}.pt"
+            if stopped_at_budget
+            else f"checkpoint-epoch-{epoch + 1}.pt"
+        )
         save_checkpoint(
-            args.run / f"checkpoint-epoch-{epoch + 1}.pt",
+            args.run / checkpoint_name,
             model,
             optimizer,
             scaler,
             balancer,
             architecture,
-            epoch=epoch + 1,
-            batch_in_epoch=0,
+            epoch=epoch if stopped_at_budget else epoch + 1,
+            batch_in_epoch=batch_in_epoch if stopped_at_budget else 0,
             step=step,
             samples_seen=samples_seen,
             parameters=parameters,
@@ -490,6 +521,8 @@ def main() -> None:
             environment=environment,
             validation=metrics,
         )
+        if stopped_at_budget:
+            break
 
 
 if __name__ == "__main__":

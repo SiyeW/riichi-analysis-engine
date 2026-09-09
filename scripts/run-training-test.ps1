@@ -3,7 +3,9 @@ param(
     [Parameter(Mandatory = $true)] [string] $Zip2026,
     [Parameter(Mandatory = $true)] [string] $MortalPythonRoot,
     [int] $Workers = 4,
-    [int] $BatchSize = 64
+    [int] $BatchSize = 32,
+    [int] $MaxSteps = 5000,
+    [string] $RunName = "v6-default-s5000-b32"
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,9 +14,9 @@ $python = Join-Path $project ".venv\Scripts\python.exe"
 $manifests = Join-Path $project "data\manifests"
 $train = Join-Path $project "data\processed-v3\train-2025-1of20"
 $validation = Join-Path $project "data\processed-v3\validation-2026"
-$run = Join-Path $project "runs\train-2025-1of20-v6-test"
-$weights = Join-Path $project "weights\riichi-analysis-2025-1of20-v6-test.pt"
-$log = Join-Path $project "runs\train-2025-1of20-v6-test.log"
+$run = Join-Path $project "runs\$RunName"
+$weights = Join-Path $project "weights\riichi-analysis-$RunName.pt"
+$log = Join-Path $project "runs\$RunName.log"
 
 if (-not (Test-Path -LiteralPath $python)) {
     throw "Create .venv and install the training dependencies first."
@@ -69,13 +71,14 @@ try {
         --train $train `
         --validation $validation `
         --run $run `
-        --epochs 1 `
+        --epochs 20 `
         --batch-size $BatchSize `
+        --max-steps $MaxSteps `
         --device cuda
     if ($LASTEXITCODE -ne 0) { throw "Training failed." }
 
     & $python -m riichi_analysis_engine.export_weights `
-        (Join-Path $run "checkpoint-epoch-1.pt") `
+        (Join-Path $run "checkpoint-step-$MaxSteps.pt") `
         $weights
     if ($LASTEXITCODE -ne 0) { throw "Weight export failed." }
 
