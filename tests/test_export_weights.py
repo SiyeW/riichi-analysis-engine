@@ -7,8 +7,8 @@ from riichi_analysis_engine.export_weights import (
 def test_exported_provenance_omits_local_paths() -> None:
     checkpoint = {
         "datasets": {
-            "train": {"path": "D:/private/data", "games": 10},
-            "validation": {"path": "D:/private/validation", "games": 2},
+            "train": {"path": "private-training-corpus", "games": 10},
+            "validation": {"path": "private-validation-corpus", "games": 2},
         },
         "environment": {"sourceRevision": "abc123", "sourceDirty": False},
     }

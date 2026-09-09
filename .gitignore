@@ -2,11 +2,16 @@
 /.pytest_cache/
 /build/
 /dist/
+/data/raw/
 /data/manifests/
 /data/processed/
 /data/processed-v2/
 /runs/
 /weights/
+.env
+.env.*
+!.env.example
+*.log
 *.egg-info/
 __pycache__/
 *.py[cod]

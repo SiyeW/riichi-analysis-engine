@@ -47,7 +47,14 @@ def main() -> None:
     forbidden = [path for path in files if path.suffix.lower() in forbidden_suffixes]
     require(not forbidden, "generated data or weights found in the source tree")
 
-    local_path = re.compile(r"(?i)\b[a-z]:\\")
+    environment_files = [
+        path
+        for path in files
+        if path.name == ".env" or (path.name.startswith(".env.") and path.name != ".env.example")
+    ]
+    require(not environment_files, "local environment file found in the source tree")
+
+    local_path = re.compile(r"(?i)\b[a-z]:[\\/]")
     for path in files:
         if path.suffix.lower() not in {".json", ".md", ".ps1", ".py", ".toml"}:
             continue
