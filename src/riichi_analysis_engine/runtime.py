@@ -14,15 +14,26 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from .constants import RED_TILES, TILE37_TO_ACTION, TILES_34, relative_players, tile34_index
+from .architecture import ModelArchitecture
+from .constants import (
+    MORTAL_OBS_CHANNELS,
+    OBS_CHANNELS,
+    RED_TILES,
+    TILE37_TO_ACTION,
+    TILES_34,
+    relative_players,
+    tile34_index,
+)
 from .kyoku_outcome import OUTCOME_CLASSES, outcome_marginals
 from .model import RiichiAnalysisModel
+from .observations import add_all_player_ranks
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 from .rule_certainties import (
     PublicRuleState,
     apply_opponent_rule_certainties,
     constrain_distribution,
 )
+from .score_state import PublicScoreState
 
 PERMUTATIONS = tuple(itertools.permutations(range(4)))
 
@@ -106,6 +117,114 @@ def candidate_action_index(action: dict[str, Any]) -> int:
     raise ValueError(f"unsupported action candidate type: {kind!r}")
 
 
+def _kan_selection_tile(action: dict[str, Any]) -> int | None:
+    """Return Mortal's conditional kan-selection tile for a final action."""
+
+    kind = action.get("type")
+    if kind == "ankan":
+        consumed = action.get("consumed")
+        if not isinstance(consumed, list) or len(consumed) != 4:
+            raise ValueError("ankan candidates require four consumed tiles")
+        return tile34_index(consumed[0])
+    if kind == "kakan":
+        pai = action.get("pai")
+        if not isinstance(pai, str):
+            raise ValueError("kakan candidates require pai")
+        return tile34_index(pai)
+    return None
+
+
+def _selected_softmax(logits: np.ndarray, indices: list[int]) -> dict[int, float]:
+    if not indices:
+        raise ValueError("cannot normalize an empty candidate set")
+    values = np.asarray(logits, dtype=np.float64)[indices]
+    shifted = values - values.max()
+    probabilities = np.exp(shifted)
+    probabilities /= probabilities.sum()
+    return {index: _finite(probability) for index, probability in zip(indices, probabilities)}
+
+
+def complete_candidate_policy(
+    primary_logits: np.ndarray,
+    candidates: list[dict[str, Any]],
+    *,
+    kan_selection_logits: np.ndarray | None = None,
+    kan_selection_mask: np.ndarray | None = None,
+) -> dict[str, float]:
+    """Score final protocol candidates from Mortal's internal action factors.
+
+    Mortal represents ankan/kakan as ``P(kan) * P(tile | kan)``.  The protocol
+    represents a fully executable action, so this boundary is where those two
+    internal steps are composed.  Studio never has to request the second step.
+    """
+
+    if not candidates:
+        raise ValueError("action-recommendation requires non-empty candidates")
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for candidate in candidates:
+        candidate_id = candidate.get("candidateId")
+        action = candidate.get("action")
+        if not isinstance(candidate_id, str) or not isinstance(action, dict):
+            raise ValueError("action candidates require candidateId and action")
+        grouped[candidate_action_index(action)].append(candidate)
+
+    primary = _selected_softmax(primary_logits, sorted(grouped))
+    values: dict[str, float] = {}
+    for action_index, grouped_candidates in grouped.items():
+        if action_index != 42:
+            share = primary[action_index] / len(grouped_candidates)
+            for candidate in grouped_candidates:
+                values[candidate["candidateId"]] = _finite(share)
+
+    kan_candidates = grouped.get(42, [])
+    if not kan_candidates:
+        return values
+    selection_candidates = [
+        candidate
+        for candidate in kan_candidates
+        if _kan_selection_tile(candidate["action"]) is not None
+    ]
+    if not selection_candidates:
+        share = primary[42] / len(kan_candidates)
+        for candidate in kan_candidates:
+            values[candidate["candidateId"]] = _finite(share)
+        return values
+    if len(selection_candidates) != len(kan_candidates):
+        raise ValueError("cannot combine daiminkan with ankan/kakan in one action state")
+    if kan_selection_logits is None or kan_selection_mask is None:
+        raise ValueError("ankan/kakan candidates require conditional kan policy logits")
+
+    by_tile: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for candidate in selection_candidates:
+        tile = _kan_selection_tile(candidate["action"])
+        assert tile is not None
+        by_tile[tile].append(candidate)
+    selection_tiles = sorted(by_tile)
+    mask = np.asarray(kan_selection_mask, dtype=bool)
+    unsupported = [tile for tile in selection_tiles if tile >= len(mask) or not mask[tile]]
+    if unsupported:
+        raise ValueError(f"kan candidates are unavailable in the engine state: {unsupported}")
+    conditional = _selected_softmax(kan_selection_logits, selection_tiles)
+    for tile, tile_candidates in by_tile.items():
+        share = primary[42] * conditional[tile] / len(tile_candidates)
+        for candidate in tile_candidates:
+            values[candidate["candidateId"]] = _finite(share)
+    return values
+
+
+def best_candidate(candidates: list[dict[str, Any]], values: dict[str, float]) -> dict[str, Any]:
+    """Choose deterministically without letting host array order break ties."""
+
+    return min(
+        candidates,
+        key=lambda candidate: (
+            -values[candidate["candidateId"]],
+            json.dumps(candidate["action"], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            candidate["candidateId"],
+        ),
+    )
+
+
 class AnalysisRuntime:
     def __init__(self, checkpoint: str | Path, device: str) -> None:
         self.device = torch.device(device)
@@ -117,6 +236,7 @@ class AnalysisRuntime:
             "riichi-analysis-model-v3": 3,
             "riichi-analysis-model-v4": 4,
             "riichi-analysis-model-v5": 5,
+            "riichi-analysis-model-v6": 6,
         }
         if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
@@ -131,12 +251,23 @@ class AnalysisRuntime:
                 "predictionValues"
             ) != expected_values:
                 raise RuntimeError("weight file uses different prediction values")
-        self.model = RiichiAnalysisModel(format_version=self.format_version)
+        if self.format_version == 6:
+            architecture = payload.get("architecture")
+            if not isinstance(architecture, dict):
+                raise RuntimeError("v6 weight file has no architecture metadata")
+            try:
+                model_architecture = ModelArchitecture.from_dict(architecture.get("model"))
+            except ValueError as error:
+                raise RuntimeError(f"v6 weight file has invalid architecture metadata: {error}") from error
+            self.model = RiichiAnalysisModel(architecture=model_architecture)
+        else:
+            self.model = RiichiAnalysisModel(format_version=self.format_version)
         self.model.load_state_dict(payload["model"], strict=True)
         self.model.to(self.device).eval()
         self.player_state_type = _load_player_state()
+        observation_channels = OBS_CHANNELS if self.format_version == 6 else MORTAL_OBS_CHANNELS
         with torch.inference_mode():
-            self.model(torch.zeros(1, 1012, 34, device=self.device))
+            self.model(torch.zeros(1, observation_channels, 34, device=self.device))
 
     def representations(self, output_id: str, protocol_minor: int) -> list[str]:
         if output_id not in {"opponent-dora-count", "opponent-score"}:
@@ -149,12 +280,29 @@ class AnalysisRuntime:
             return ["distribution", "expected-value"]
         return ["expected-value"]
 
-    def _observation(self, events: list[dict[str, Any]], controlled_seat: int) -> np.ndarray:
+    def _state(self, events: list[dict[str, Any]], controlled_seat: int) -> Any:
         state = self.player_state_type(controlled_seat)
         for event in events:
             state.update(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
-        observation, _mask = state.encode_obs(4, False)
-        return np.asarray(observation, dtype=np.float32)
+        return state
+
+    def _encode_observation(
+        self, state: Any, score_state: PublicScoreState, *, at_kan_select: bool
+    ) -> tuple[np.ndarray, np.ndarray]:
+        observation, mask = state.encode_obs(4, at_kan_select)
+        if self.format_version == 6:
+            observation = add_all_player_ranks(observation, score_state.relative(state.player_id))
+        return np.asarray(observation, dtype=np.float32), np.asarray(mask, dtype=bool)
+
+    def _observation(self, events: list[dict[str, Any]], controlled_seat: int) -> np.ndarray:
+        state = self._state(events, controlled_seat)
+        score_state = PublicScoreState()
+        for event in events:
+            score_state.process(event)
+        observation, _mask = self._encode_observation(
+            state, score_state, at_kan_select=False
+        )
+        return observation
 
     def predict(
         self,
@@ -164,7 +312,13 @@ class AnalysisRuntime:
         protocol_minor: int = 1,
     ) -> tuple[dict[str, dict[str, Any]], float]:
         started = time.perf_counter()
-        observation = self._observation(events, controlled_seat)
+        state = self._state(events, controlled_seat)
+        score_state = PublicScoreState()
+        for event in events:
+            score_state.process(event)
+        observation, _primary_mask = self._encode_observation(
+            state, score_state, at_kan_select=False
+        )
         tensor = torch.from_numpy(observation).unsqueeze(0).to(self.device)
         with torch.inference_mode():
             raw = self.model(tensor)
@@ -453,17 +607,28 @@ class AnalysisRuntime:
             candidates = policy_request.get("parameters", {}).get("candidates")
             if not isinstance(candidates, list) or not candidates:
                 raise ValueError("action-recommendation requires non-empty candidates")
-            grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
-            for candidate in candidates:
-                grouped[candidate_action_index(candidate["action"])].append(candidate)
-            indices = list(grouped)
-            group_probabilities = outputs["policy"][indices].softmax(0).numpy()
-            values: dict[str, float] = {}
-            for probability, index in zip(group_probabilities, indices):
-                share = _finite(probability) / len(grouped[index])
-                for candidate in grouped[index]:
-                    values[candidate["candidateId"]] = share
-            best = max(candidates, key=lambda item: values[item["candidateId"]])
+            needs_kan_selection = any(
+                isinstance(candidate, dict)
+                and isinstance(candidate.get("action"), dict)
+                and candidate["action"].get("type") in {"ankan", "kakan"}
+                for candidate in candidates
+            )
+            kan_selection_logits: np.ndarray | None = None
+            kan_selection_mask: np.ndarray | None = None
+            if needs_kan_selection:
+                selection_observation, kan_selection_mask = self._encode_observation(
+                    state, score_state, at_kan_select=True
+                )
+                selection_tensor = torch.from_numpy(selection_observation).unsqueeze(0).to(self.device)
+                with torch.inference_mode():
+                    kan_selection_logits = self.model(selection_tensor)["policy"][0].float().cpu().numpy()
+            values = complete_candidate_policy(
+                outputs["policy"].numpy(),
+                candidates,
+                kan_selection_logits=kan_selection_logits,
+                kan_selection_mask=kan_selection_mask,
+            )
+            best = best_candidate(candidates, values)
             results["action-recommendation"] = {
                 "bestCandidateId": best["candidateId"],
                 "candidates": [

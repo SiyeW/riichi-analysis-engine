@@ -3,22 +3,41 @@ param(
     [Parameter(Mandatory = $true)] [string] $Zip2026,
     [Parameter(Mandatory = $true)] [string] $MortalPythonRoot,
     [int] $Workers = 4,
-    [int] $BatchSize = 256
+    [int] $BatchSize = 64
 )
 
 $ErrorActionPreference = "Stop"
 $project = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $project ".venv\Scripts\python.exe"
 $manifests = Join-Path $project "data\manifests"
-$train = Join-Path $project "data\processed-v2\train-2025-1of20"
-$validation = Join-Path $project "data\processed-v2\validation-2026"
-$run = Join-Path $project "runs\train-2025-1of20-v2-test"
-$weights = Join-Path $project "weights\riichi-analysis-2025-1of20-v2-test.pt"
-$log = Join-Path $project "runs\train-2025-1of20-v2-test.log"
+$train = Join-Path $project "data\processed-v3\train-2025-1of20"
+$validation = Join-Path $project "data\processed-v3\validation-2026"
+$run = Join-Path $project "runs\train-2025-1of20-v6-test"
+$weights = Join-Path $project "weights\riichi-analysis-2025-1of20-v6-test.pt"
+$log = Join-Path $project "runs\train-2025-1of20-v6-test.log"
 
 if (-not (Test-Path -LiteralPath $python)) {
     throw "Create .venv and install the training dependencies first."
 }
+
+function Reset-GeneratedDirectory([string] $Path) {
+    $projectFull = [IO.Path]::GetFullPath($project).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $targetFull = [IO.Path]::GetFullPath($Path)
+    if (-not $targetFull.StartsWith($projectFull, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove a directory outside this engine project: $targetFull"
+    }
+    if (Test-Path -LiteralPath $targetFull) {
+        Remove-Item -LiteralPath $targetFull -Recurse -Force
+    }
+}
+
+# Converted shards and checkpoints are derived outputs. Start this controlled
+# test from a clean conversion rather than silently reusing an earlier schema.
+Reset-GeneratedDirectory $train
+Reset-GeneratedDirectory $validation
+Reset-GeneratedDirectory $run
+Reset-GeneratedDirectory (Join-Path $project "data\processed")
+Reset-GeneratedDirectory (Join-Path $project "data\processed-v2")
 
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) | Out-Null
 $Host.UI.RawUI.WindowTitle = "Riichi Analysis Engine - convert and train"

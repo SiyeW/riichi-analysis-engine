@@ -461,9 +461,9 @@ def action_label(
     kind = next_event["type"]
     kan_select: int | None = None
 
-    if kind == "dahai":
+    if kind == "dahai" and int(next_event["actor"]) == player:
         return TILE37_TO_ACTION[next_event["pai"]], None
-    if kind == "reach":
+    if kind == "reach" and int(next_event["actor"]) == player:
         return 37, None
     if kind == "chi" and int(next_event["actor"]) == player:
         called = tile34_index(next_event["pai"])
@@ -474,13 +474,13 @@ def action_label(
         return 41, None
     if kind == "daiminkan" and int(next_event["actor"]) == player:
         return 42, None
-    if kind == "kakan":
+    if kind == "kakan" and int(next_event["actor"]) == player:
         candidates = player_state.kakan_candidates
         candidates = candidates() if callable(candidates) else candidates
         if len(candidates) > 1:
             kan_select = tile34_index(next_event["pai"])
         return 42, kan_select
-    if kind == "ankan":
+    if kind == "ankan" and int(next_event["actor"]) == player:
         candidates = player_state.ankan_candidates
         candidates = candidates() if callable(candidates) else candidates
         if len(candidates) > 1:
