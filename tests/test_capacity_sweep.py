@@ -41,7 +41,7 @@ def test_capacity_grid_is_strictly_increasing_and_keeps_completed_run_names() ->
 def test_completed_validation_requires_the_controlled_step_budget(tmp_path: Path) -> None:
     metrics = tmp_path / "metrics.jsonl"
     metrics.write_text(
-        "\\n".join(
+        "\n".join(
             [
                 json.dumps({"phase": "validation", "step": 4999}),
                 json.dumps(
@@ -49,7 +49,7 @@ def test_completed_validation_requires_the_controlled_step_budget(tmp_path: Path
                 ),
             ]
         )
-        + "\\n",
+        + "\n",
         encoding="utf-8",
     )
     assert capacity_sweep.completed_validation(tmp_path, 5000) == {
