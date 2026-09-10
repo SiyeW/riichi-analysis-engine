@@ -232,7 +232,7 @@ def write_summary(destination: Path, *, args: argparse.Namespace, rows: Iterable
         },
         "points": list(rows),
     }
-    destination.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
+    destination.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def selected_points(keys: list[str]) -> tuple[CapacityPoint, ...]:
