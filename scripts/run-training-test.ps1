@@ -3,12 +3,16 @@ param(
     [Parameter(Mandatory = $true)] [string] $Zip2026,
     [Parameter(Mandatory = $true)] [string] $MortalPythonRoot,
     [int] $Workers = 4,
+    [int] $TrainGames = 1024,
     [int] $BatchSize = 32,
     [int] $MaxSteps = 5000,
-    [string] $RunName = "v6-default-s5000-b32"
+    [string] $RunName = "v6-default-g1024-s5000-b32"
 )
 
 $ErrorActionPreference = "Stop"
+if ($TrainGames -le 0) { throw "TrainGames must be positive." }
+if ($BatchSize -le 0) { throw "BatchSize must be positive." }
+if ($MaxSteps -le 0) { throw "MaxSteps must be positive for a controlled comparison." }
 $project = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $project ".venv\Scripts\python.exe"
 $manifests = Join-Path $project "data\manifests"
@@ -64,7 +68,8 @@ try {
         --manifest (Join-Path $manifests "train-2025-1of20.jsonl") `
         --output $train `
         --mortal-python-root $MortalPythonRoot `
-        --workers $Workers
+        --workers $Workers `
+        --max-games $TrainGames
     if ($LASTEXITCODE -ne 0) { throw "Training-data conversion failed." }
 
     & $python -m riichi_analysis_engine.train `
