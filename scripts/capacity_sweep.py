@@ -147,8 +147,6 @@ def make_train_command(
         str(args.batch_size),
         "--max-steps",
         str(max_steps),
-        "--shuffle-buffer-samples",
-        str(args.shuffle_buffer_samples),
         "--checkpoint-every",
         str(args.checkpoint_every),
         "--device",
@@ -226,7 +224,6 @@ def write_summary(destination: Path, *, args: argparse.Namespace, rows: Iterable
             "validation": str(args.validation),
             "batchSize": args.batch_size,
             "maxSteps": args.max_steps,
-            "shuffleBufferSamples": args.shuffle_buffer_samples,
             "seed": args.seed,
             "device": args.device,
         },
@@ -254,7 +251,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-steps", type=int, default=5000)
-    parser.add_argument("--shuffle-buffer-samples", type=int, default=1024)
     parser.add_argument("--checkpoint-every", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=20252026)
     parser.add_argument(
@@ -272,8 +268,6 @@ def main() -> None:
     args = parse_args()
     if args.batch_size <= 0 or args.max_steps <= 0:
         raise ValueError("batch size and max steps must be positive")
-    if args.shuffle_buffer_samples < args.batch_size:
-        raise ValueError("shuffle buffer must hold at least one batch")
     if not args.python.is_file():
         raise FileNotFoundError(f"Python executable not found: {args.python}")
     if not args.train.is_dir() or not args.validation.is_dir():

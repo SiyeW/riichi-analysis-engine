@@ -1,6 +1,20 @@
+"""Read a globally mixed pack directory in the order it was written.
+
+Packing decides the training order once, and this loader follows it: one pass
+over the packs in manifest order, which is exactly one pass over the corpus
+with neighbouring samples coming from different games. Nothing here shuffles,
+buffers or reorders samples, because doing any of that would only undo work
+the packer already did and would make the training order depend on the loader
+configuration.
+
+Memory does not grow with the pack size. A pack holds tens of thousands of
+samples in its packed form, but observations are only expanded for the batch
+being yielded, so a larger pack costs file size rather than memory.
+"""
+
 from __future__ import annotations
 
-import random
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -8,163 +22,116 @@ import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-from .storage import load_shard
+from .packing import MANIFEST_FORMAT
+from .storage import read_packed_shard, slice_packed, unpack_shard_arrays
+
+# Provenance the packer records alongside every sample. It stays out of the
+# batches: the model sees observations and targets, nothing else.
+METADATA_FIELDS = frozenset(
+    {"perspective", "event_index", "source_game", "pack_index", "kyoku_index"}
+)
 
 
-class ShardDataset(IterableDataset[dict[str, torch.Tensor]]):
+def read_manifest(root: str | Path) -> dict[str, object]:
+    """Read and check the manifest that defines the training order."""
+
+    path = Path(root) / "manifest.json"
+    if not path.exists():
+        raise FileNotFoundError(f"{root} holds no manifest.json, so it is not a pack directory")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("format") != MANIFEST_FORMAT:
+        raise ValueError(f"{path} declares an unsupported manifest format")
+    packs = manifest.get("packs")
+    if not isinstance(packs, list) or not packs:
+        raise ValueError(f"{path} lists no packs")
+    return manifest
+
+
+class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
+    """Iterate a pack directory once, in manifest order."""
+
     def __init__(
         self,
         root: str | Path,
         *,
-        shuffle: bool,
-        seed: int = 20252026,
+        batch_size: int,
         max_samples: int = 0,
-        batch_size: int = 256,
-        shuffle_buffer_samples: int = 1024,
     ) -> None:
         super().__init__()
+        if batch_size <= 0:
+            raise ValueError("batch size must be positive")
         self.root = Path(root)
-        self.shuffle = shuffle
-        self.seed = seed
-        self.max_samples = max_samples
         self.batch_size = batch_size
-        if shuffle_buffer_samples < batch_size:
-            raise ValueError("shuffle buffer must hold at least one batch")
-        self.shuffle_buffer_samples = shuffle_buffer_samples
-        self.epoch = 0
+        self.max_samples = max_samples
+        self.manifest = read_manifest(self.root)
+        self.packs = [self.root / str(entry["pack"]) for entry in self.manifest["packs"]]
+        missing = [path for path in self.packs if not path.exists()]
+        if missing:
+            raise FileNotFoundError(f"{missing[0]} is listed in the manifest but missing")
+        self.samples = int(self.manifest["samples"])
 
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = epoch
+    def selected_packs(self, worker_id: int = 0, worker_count: int = 1) -> list[Path]:
+        """The packs one worker reads. The workers together cover every pack once."""
 
-    def _shards(self) -> list[Path]:
-        shards = sorted(self.root.glob("*.npz"))
-        if not shards:
-            raise FileNotFoundError(f"no shards under {self.root}")
-        worker = get_worker_info()
-        if worker is not None:
-            shards = shards[worker.id :: worker.num_workers]
-        if self.shuffle:
-            random.Random(self.seed + self.epoch).shuffle(shards)
-        return shards
+        if not 0 <= worker_id < worker_count:
+            raise ValueError("worker id must be inside the worker count")
+        return self.packs[worker_id::worker_count]
 
     @staticmethod
-    def _selected(arrays: dict[str, np.ndarray], indices: np.ndarray) -> dict[str, np.ndarray]:
-        return {
-            name: value[indices]
-            for name, value in arrays.items()
-            if name not in {"perspective", "event_index"}
-        }
+    def _sample_count(packed: dict[str, np.ndarray]) -> int:
+        return len(packed["obs_offsets"]) - 1
+
+    def _dense(self, packed: dict[str, np.ndarray], start: int, stop: int) -> dict[str, np.ndarray]:
+        arrays = unpack_shard_arrays(slice_packed(packed, start, stop))
+        return {name: value for name, value in arrays.items() if name not in METADATA_FIELDS}
 
     @staticmethod
-    def _concatenate(parts: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    def _merge(
+        parts: list[dict[str, np.ndarray]],
+    ) -> dict[str, np.ndarray]:
+        return {name: np.concatenate([part[name] for part in parts], axis=0) for name in parts[0]}
+
+    @staticmethod
+    def _torch(arrays: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
         return {
-            name: np.concatenate([part[name] for part in parts], axis=0)
-            for name in parts[0]
+            name: torch.from_numpy(np.ascontiguousarray(value)) for name, value in arrays.items()
         }
-
-    def _batch_stream(
-        self, arrays: dict[str, np.ndarray], pending: dict[str, np.ndarray] | None
-    ) -> tuple[Iterator[dict[str, torch.Tensor]], dict[str, np.ndarray] | None]:
-        """Return full batches and a tail kept for the next mixed chunk."""
-
-        if pending is not None:
-            arrays = self._concatenate([pending, arrays])
-        sample_count = len(next(iter(arrays.values())))
-        stop = sample_count - sample_count % self.batch_size
-
-        def batches() -> Iterator[dict[str, torch.Tensor]]:
-            for start in range(0, stop, self.batch_size):
-                yield {
-                    name: torch.from_numpy(np.ascontiguousarray(value[start : start + self.batch_size]))
-                    for name, value in arrays.items()
-                }
-
-        tail = (
-            {name: np.ascontiguousarray(value[stop:]) for name, value in arrays.items()}
-            if stop < sample_count
-            else None
-        )
-        return batches(), tail
-
-    def _iter_sequential(self) -> Iterator[dict[str, torch.Tensor]]:
-        accepted = 0
-        pending: dict[str, np.ndarray] | None = None
-        for path in self._shards():
-            arrays = load_shard(path)
-            length = len(arrays["policy"])
-            indices = np.arange(length)
-            if self.max_samples:
-                remaining = self.max_samples - accepted
-                if remaining <= 0:
-                    break
-                indices = indices[:remaining]
-            accepted += len(indices)
-            batches, pending = self._batch_stream(self._selected(arrays, indices), pending)
-            yield from batches
-        if pending is not None:
-            yield {
-                name: torch.from_numpy(np.ascontiguousarray(value))
-                for name, value in pending.items()
-            }
-
-    def _iter_bounded_cross_game_mixed(
-        self, rng: np.random.Generator
-    ) -> Iterator[dict[str, torch.Tensor]]:
-        """Mix bounded cross-game windows before assembling optimizer batches."""
-
-        accepted = 0
-        buffer: dict[str, np.ndarray] | None = None
-        pending: dict[str, np.ndarray] | None = None
-        for path in self._shards():
-            arrays = load_shard(path)
-            indices = rng.permutation(len(arrays["policy"]))
-            if self.max_samples:
-                remaining = self.max_samples - accepted
-                if remaining <= 0:
-                    break
-                indices = indices[:remaining]
-            accepted += len(indices)
-            selected = self._selected(arrays, indices)
-            cursor = 0
-            while cursor < len(indices):
-                take = min(self.shuffle_buffer_samples, len(indices) - cursor)
-                incoming = {
-                    name: np.ascontiguousarray(value[cursor : cursor + take])
-                    for name, value in selected.items()
-                }
-                cursor += take
-                if buffer is None:
-                    buffer = incoming
-                    continue
-                combined = self._concatenate([buffer, incoming])
-                order = rng.permutation(len(combined["policy"]))
-                keep = min(self.shuffle_buffer_samples, len(order))
-                buffer = {
-                    name: np.ascontiguousarray(value[order[:keep]])
-                    for name, value in combined.items()
-                }
-                outgoing = {
-                    name: np.ascontiguousarray(value[order[keep:]])
-                    for name, value in combined.items()
-                }
-                batches, pending = self._batch_stream(outgoing, pending)
-                yield from batches
-        if buffer is not None:
-            order = rng.permutation(len(buffer["policy"]))
-            outgoing = {
-                name: np.ascontiguousarray(value[order]) for name, value in buffer.items()
-            }
-            batches, pending = self._batch_stream(outgoing, pending)
-            yield from batches
-        if pending is not None:
-            yield {
-                name: torch.from_numpy(np.ascontiguousarray(value))
-                for name, value in pending.items()
-            }
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        rng = np.random.default_rng(self.seed + self.epoch)
-        if self.shuffle:
-            yield from self._iter_bounded_cross_game_mixed(rng)
+        worker = get_worker_info()
+        if worker is None:
+            packs = self.selected_packs()
         else:
-            yield from self._iter_sequential()
+            packs = self.selected_packs(worker.id, worker.num_workers)
+        accepted = 0
+        # A pack rarely divides into whole batches, so the samples left over at
+        # the end of one pack are carried into the next one instead of dropped.
+        pending: dict[str, np.ndarray] | None = None
+        for path in packs:
+            packed = read_packed_shard(path)
+            count = self._sample_count(packed)
+            start = 0
+            if pending is not None:
+                take = min(self.batch_size - len(next(iter(pending.values()))), count)
+                if take:
+                    pending = self._merge([pending, self._dense(packed, 0, take)])
+                    start = take
+                if len(next(iter(pending.values()))) == self.batch_size:
+                    accepted += self.batch_size
+                    yield self._torch(pending)
+                    pending = None
+            whole = (count - start) // self.batch_size * self.batch_size
+            for offset in range(start, start + whole, self.batch_size):
+                if self.max_samples and accepted + self.batch_size > self.max_samples:
+                    yield self._torch(
+                        self._dense(packed, offset, offset + self.max_samples - accepted)
+                    )
+                    return
+                accepted += self.batch_size
+                yield self._torch(self._dense(packed, offset, offset + self.batch_size))
+            if start + whole < count:
+                pending = self._dense(packed, start + whole, count)
+            if self.max_samples and accepted >= self.max_samples:
+                return
+        if pending is not None:
+            yield self._torch(pending)

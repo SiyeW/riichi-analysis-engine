@@ -15,6 +15,7 @@ from riichi_analysis_engine.storage import (
     read_chunk_archive_meta,
     read_chunk_payload,
     save_chunk_archive,
+    slice_packed,
     unpack_action_masks,
     unpack_observations,
     unpack_shard_arrays,
@@ -106,6 +107,26 @@ def test_permute_rejects_an_incomplete_order() -> None:
     for order in (np.asarray([0, 1]), np.asarray([0, 1, 3])):
         with pytest.raises(ValueError):
             permute_packed(packed, order)
+
+
+def test_slice_packed_matches_the_unpacked_range() -> None:
+    arrays = sample_arrays(9, kyoku=1)
+    packed = pack_shard_arrays(arrays)
+    expected = unpack_shard_arrays(packed)
+
+    for start, stop in ((0, 9), (2, 5), (0, 1), (8, 9), (4, 4)):
+        sliced = unpack_shard_arrays(slice_packed(packed, start, stop))
+        assert len(sliced["policy"]) == stop - start
+        np.testing.assert_allclose(sliced["obs"], expected["obs"][start:stop], rtol=0, atol=5e-4)
+        for name in ("action_mask", "policy", "perspective", "event_index", "kyoku_index"):
+            np.testing.assert_array_equal(sliced[name], expected[name][start:stop])
+
+
+def test_slice_packed_rejects_a_range_outside_the_shard() -> None:
+    packed = pack_shard_arrays(sample_arrays(3))
+    for start, stop in ((-1, 2), (0, 4), (2, 1)):
+        with pytest.raises(ValueError, match="outside"):
+            slice_packed(packed, start, stop)
 
 
 def test_chunk_archive_round_trip(tmp_path) -> None:
