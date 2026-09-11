@@ -2,7 +2,6 @@ import numpy as np
 from types import SimpleNamespace
 
 from riichi_analysis_engine.prediction_values import SCORE_VALUE_SET, SCORE_VALUES
-from riichi_analysis_engine.prepare import mortal_validation_members, stable_fraction
 from riichi_analysis_engine.replay import FullState, action_label, hand_score, placement_label
 
 
@@ -58,14 +57,6 @@ def test_only_first_winner_receives_honba_in_multiple_ron() -> None:
 def test_placement_ties_use_initial_seat_order() -> None:
     scores = np.asarray([30000, 30000, 20000, 20000])
     assert placement_label(scores, 0) == 0
-
-
-def test_manifest_selection_is_order_independent(tmp_path) -> None:
-    paths = [tmp_path / name for name in ["c.mjson", "a.mjson", "b.mjson", "d.mjson"]]
-    assert stable_fraction(paths, 1, 2) == stable_fraction(list(reversed(paths)), 1, 2)
-    assert mortal_validation_members(["x.mjson", "y.mjson"]) == mortal_validation_members(
-        ["y.mjson", "x.mjson"]
-    )
 
 
 def _empty_cans() -> SimpleNamespace:

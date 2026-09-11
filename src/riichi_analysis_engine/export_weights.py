@@ -60,7 +60,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Export inference-only model weights.")
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--training-data", default="2025-1of20")
+    parser.add_argument("--training-data", default="2025-train")
     parser.add_argument("--validation-data", default="2026-md5-holdout")
     args = parser.parse_args()
 
