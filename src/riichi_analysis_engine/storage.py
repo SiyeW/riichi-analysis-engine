@@ -14,8 +14,9 @@ from .constants import ACTION_SPACE, OBS_CHANNELS, TILE_TYPES
 OBS_ELEMENTS = OBS_CHANNELS * TILE_TYPES
 OBS_BYTES = (OBS_ELEMENTS + 7) // 8
 ACTION_BYTES = (ACTION_SPACE + 7) // 8
-# v4 adds the kyoku index that the packer needs to keep a resampled corpus
-# reproducible.  The marker prevents a run from mixing earlier shards silently.
+# v4 adds the kyoku index, so a corpus can later be resampled a whole kyoku at
+# a time instead of a sample at a time.  The marker prevents a run from mixing
+# earlier shards silently.
 STORAGE_FORMAT = "dual-bitpack-sparse-float16-v4"
 STAGED_GAME_FORMAT = "riichi-analysis-staged-game-v1"
 PACK_FORMAT = "riichi-analysis-global-pack-v1"
@@ -219,6 +220,33 @@ def permute_packed(packed: dict[str, np.ndarray], order: np.ndarray) -> dict[str
         if name in result or name == "storage_format":
             continue
         result[name] = value[order]
+    return result
+
+
+def slice_packed(packed: dict[str, np.ndarray], start: int, stop: int) -> dict[str, np.ndarray]:
+    """Take a range of samples out of a packed shard without expanding it.
+
+    The packed observations store one offset per sample, so a contiguous range
+    can be copied out and its offsets rebased. This is what lets training read
+    a whole pack while only ever holding one batch of dense observations.
+    """
+
+    offsets = packed["obs_offsets"]
+    count = _sample_count(packed)
+    if start < 0 or stop > count or start > stop:
+        raise ValueError(f"sample range {start}:{stop} is outside 0:{count}")
+
+    result: dict[str, np.ndarray] = {
+        "storage_format": packed["storage_format"],
+        "obs_offsets": (offsets[start : stop + 1] - offsets[start]).astype(
+            offsets.dtype, copy=False
+        ),
+        "obs_values": packed["obs_values"][int(offsets[start]) : int(offsets[stop])],
+    }
+    for name, value in packed.items():
+        if name in result or name == "storage_format":
+            continue
+        result[name] = value[start:stop]
     return result
 
 

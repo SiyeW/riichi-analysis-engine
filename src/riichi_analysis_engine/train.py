@@ -15,7 +15,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from .architecture import ModelArchitecture
-from .dataset import ShardDataset
+from .dataset import PackDataset
 from .kyoku_outcome import OUTCOME_DEAL_IN_INDICATORS, OUTCOME_WINNER_INDICATORS
 from .losses import LOSS_TERMS, LearnedUncertaintyBalancer, multitask_loss, score_class_indices
 from .model import RiichiAnalysisModel, count_parameters
@@ -63,15 +63,26 @@ def environment_metadata(device: torch.device) -> dict[str, object]:
 
 
 def dataset_metadata(root: Path) -> dict[str, object]:
-    summary_path = root / "summary.json"
-    if not summary_path.exists():
+    """Record what a run trained on, without recording where the machine keeps it.
+
+    This metadata reaches the exported weights, so it carries the manifest's
+    own numbers and leaves out the local path the packing command was given.
+    """
+
+    manifest_path = root / "manifest.json"
+    if not manifest_path.exists():
         return {"path": str(root.resolve())}
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    audit = manifest.get("audit")
     return {
         "path": str(root.resolve()),
-        "manifest": summary.get("manifest"),
-        "games": summary.get("convertedGames"),
-        "samples": summary.get("convertedSamples"),
+        "format": manifest.get("format"),
+        "seed": manifest.get("seed"),
+        "packs": len(manifest.get("packs", [])),
+        "samples": manifest.get("samples"),
+        "chunks": manifest.get("chunks"),
+        "sourceGames": manifest.get("sourceGames"),
+        "verified": audit.get("verified") if isinstance(audit, dict) else None,
     }
 
 
@@ -292,7 +303,6 @@ def main() -> None:
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-validation-samples", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=0)
-    parser.add_argument("--shuffle-buffer-samples", type=int, default=1024)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--checkpoint-every", type=int, default=2000)
     parser.add_argument("--resume", type=Path)
@@ -301,8 +311,6 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_steps < 0:
         raise ValueError("max steps must be non-negative")
-    if args.shuffle_buffer_samples < args.batch_size:
-        raise ValueError("shuffle buffer must hold at least one batch")
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
@@ -366,18 +374,15 @@ def main() -> None:
         resume_batch = int(checkpoint.get("batchInEpoch", 0))
         step = int(checkpoint.get("step", 0))
         samples_seen = int(checkpoint.get("samplesSeen", 0))
-    train_data = ShardDataset(
+    # The order comes from the training manifest: one pass over globally mixed
+    # packs, with no shuffling left for the loader to do.
+    train_data = PackDataset(
         args.train,
-        shuffle=True,
-        seed=args.seed,
         max_samples=args.max_train_samples,
         batch_size=args.batch_size,
-        shuffle_buffer_samples=args.shuffle_buffer_samples,
     )
-    validation_data = ShardDataset(
+    validation_data = PackDataset(
         args.validation,
-        shuffle=False,
-        seed=args.seed,
         max_samples=args.max_validation_samples,
         batch_size=args.batch_size,
     )
@@ -409,9 +414,9 @@ def main() -> None:
         "modelArchitecture": architecture.to_dict(),
         "datasets": datasets,
         "trainingOrder": {
-            "type": "bounded-cross-game-buffer-v1",
-            "seed": args.seed,
-            "bufferSamples": args.shuffle_buffer_samples,
+            "type": "globally-mixed-packs-v1",
+            "trainSeed": datasets["train"].get("seed"),
+            "verified": datasets["train"].get("verified"),
         },
         "environment": environment,
     }
@@ -427,7 +432,6 @@ def main() -> None:
 
     stopped_at_budget = False
     for epoch in range(start_epoch, args.epochs):
-        train_data.set_epoch(epoch)
         model.train()
         for batch_in_epoch, batch in enumerate(train_loader, start=1):
             if epoch == start_epoch and batch_in_epoch <= resume_batch:
