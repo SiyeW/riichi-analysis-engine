@@ -29,7 +29,6 @@ from riichi_analysis_engine.storage import (
     write_packed_shard,
 )
 
-
 MERGE_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "merge_packs.py"
 MERGE_SPEC = importlib.util.spec_from_file_location("merge_packs", MERGE_SCRIPT)
 assert MERGE_SPEC is not None and MERGE_SPEC.loader is not None
