@@ -256,6 +256,29 @@ def validate(
     return result
 
 
+def learning_rate_at(
+    step: int,
+    warmup_steps: int,
+    cooldown_steps: int,
+    peak_rate: float,
+    base_rate: float,
+) -> float:
+    """Linear warmup to the peak rate, then a linear drop to the plateau rate.
+
+    The shanten predictor project settled this shape: a fast warmup, a short
+    cooldown, and a constant plateau instead of a decay to zero. The rate
+    depends only on the step, so a resumed run needs no scheduler state. Both
+    lengths default to zero, which leaves the plateau rate constant.
+    """
+
+    if warmup_steps > 0 and step <= warmup_steps:
+        return peak_rate * step / warmup_steps
+    if cooldown_steps > 0 and step <= warmup_steps + cooldown_steps:
+        progress = (step - warmup_steps) / cooldown_steps
+        return peak_rate + (base_rate - peak_rate) * progress
+    return base_rate
+
+
 def _label_entropy(counts: np.ndarray) -> float:
     """Entropy in nats of a label distribution, the score of a null predictor."""
 
@@ -435,6 +458,19 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--checkpoint-every", type=int, default=2000)
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=0,
+        help="linear warmup to the peak rate over this many steps",
+    )
+    parser.add_argument("--cooldown-steps", type=int, default=0)
+    parser.add_argument(
+        "--peak-learning-rate",
+        type=float,
+        default=0.0,
+        help="rate the warmup reaches; defaults to the plateau rate",
+    )
     parser.add_argument("--keep-checkpoints", type=int, default=5)
     parser.add_argument("--best-metric", default="Selection/core_score")
     parser.add_argument("--resume", type=Path)
@@ -608,6 +644,17 @@ def main() -> None:
             train_loader, start=resume_batch if resumed else 1
         ):
             batch = move_batch(batch, device)
+            peak = args.peak_learning_rate or args.learning_rate
+            optimizer.param_groups[0]["lr"] = learning_rate_at(
+                step, args.warmup_steps, args.cooldown_steps, peak, args.learning_rate
+            )
+            optimizer.param_groups[1]["lr"] = learning_rate_at(
+                step,
+                args.warmup_steps,
+                args.cooldown_steps,
+                args.loss_balance_learning_rate,
+                args.loss_balance_learning_rate,
+            )
             samples_seen += len(batch["policy"])
             optimizer.zero_grad(set_to_none=True)
             try:
