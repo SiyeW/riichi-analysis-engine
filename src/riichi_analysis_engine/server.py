@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sys
+import tempfile
+import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -247,6 +251,43 @@ class Engine:
         }
 
 
+def log_path() -> Path:
+    """Where this engine writes what happened to it.
+
+    A host only sees an exit code when an engine dies, so the engine keeps its
+    own record next to itself, falling back to the user's temporary directory
+    when it cannot write there.
+    """
+
+    beside = Path(sys.executable).resolve().parent
+    for candidate in (beside, Path(tempfile.gettempdir()) / "riichi-analysis-engine"):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / "engine.log"
+            with probe.open("a", encoding="utf-8"):
+                pass
+            return probe
+        except OSError:
+            continue
+    return Path(os.devnull)
+
+
+LOG_LIMIT_BYTES = 2 * 1024 * 1024
+
+
+def log(message: str) -> None:
+    try:
+        path = log_path()
+        # The log outlives the process, so it keeps itself bounded: a played
+        # session writes one line per analysis.
+        if path.exists() and path.stat().st_size > LOG_LIMIT_BYTES:
+            path.unlink()
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {os.getpid()} {message}\n")
+    except OSError:
+        pass
+
+
 def emit(payload: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
     sys.stdout.flush()
@@ -259,7 +300,23 @@ def error_payload(error: Exception) -> dict[str, Any]:
 
 
 def main() -> None:
+    log(f"started, log file {log_path()}")
     engine = Engine()
+    exited_by = "stdin closed"
+    try:
+        _serve(engine)
+    except SystemExit as stop:
+        exited_by = f"exit {stop.code}"
+        raise
+    except BaseException:
+        log("crashed:\n" + traceback.format_exc())
+        exited_by = "unhandled exception"
+        raise
+    finally:
+        log(f"stopping ({exited_by})")
+
+
+def _serve(engine: "Engine") -> None:
     for line in sys.stdin:
         request: Any = None
         try:
@@ -284,9 +341,11 @@ def main() -> None:
                     raise ProtocolError("method not found", "METHOD_NOT_FOUND", -32601)
             if "id" in request:
                 emit({"jsonrpc": "2.0", "id": request["id"], "result": result})
+            log(f"{method} -> ok")
             if method == "engine.shutdown":
                 break
         except Exception as error:  # noqa: BLE001 -- JSON-RPC errors belong on the wire
+            log(f"request failed: {type(error).__name__}: {error}\n{traceback.format_exc()}")
             if not isinstance(request, dict) or "id" in request:
                 emit({"jsonrpc": "2.0", "id": request.get("id") if isinstance(request, dict) else None, "error": error_payload(error)})
 
