@@ -5,6 +5,7 @@ import concurrent.futures
 import json
 import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,7 @@ from .replay import (
     read_events,
     rotated_future,
 )
-from .storage import STORAGE_FORMAT, save_shard
+from .storage import read_chunk_archive_meta, save_chunk_archive
 from .score_state import relative_scores
 
 
@@ -90,6 +91,7 @@ def convert_game(
     exact_tracker = ExactTargetTracker()
     states = [player_state_type(player) for player in range(4)]
     samples: dict[str, list[Any]] = {}
+    kyoku_index = -1
 
     def append_sample(
         event_index: int,
@@ -119,12 +121,15 @@ def convert_game(
             "policy": np.int8(policy),
             "perspective": np.uint8(perspective),
             "event_index": np.int32(event_index),
+            "kyoku_index": np.int32(kyoku_index),
             **targets,
         }
         for name, value in values.items():
             samples.setdefault(name, []).append(value)
 
     for index, event in enumerate(events):
+        if event["type"] == "start_kyoku":
+            kyoku_index += 1
         event_json = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         candidates = [state.update(event_json) for state in states]
         full_state.process(event)
@@ -176,28 +181,22 @@ def convert_game(
     return {name: np.asarray(values) for name, values in samples.items()}
 
 
-def concatenate_games(games: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
-    names = set(games[0])
-    if any(set(game) != names for game in games):
-        raise ValueError("game array schemas differ")
-    return {name: np.concatenate([game[name] for game in games], axis=0) for name in names}
-
-
-def convert_record_to_shard(
+def convert_record_to_archive(
     record_index: int,
     record: dict[str, str],
     output: str,
     mortal_python_root: str,
     overwrite: bool,
+    chunk_samples: int,
 ) -> tuple[int, str, int, str | None]:
-    destination = Path(output) / f"game-{record_index:06d}.npz"
+    """Stage one game as independently compressed sample chunks."""
+
+    destination = Path(output) / f"game-{record_index:06d}.zip"
     if destination.exists() and not overwrite:
         try:
-            with np.load(destination, allow_pickle=False) as source:
-                if source["storage_format"].item() != STORAGE_FORMAT:
-                    raise ValueError("unsupported storage format")
-                return record_index, record["sourceId"], len(source["policy"]), None
-        except (OSError, ValueError, KeyError, EOFError):
+            meta = read_chunk_archive_meta(destination)
+            return record_index, record["sourceId"], int(meta["samples"]), None
+        except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
             destination.unlink()
     if mortal_python_root not in sys.path:
         sys.path.insert(0, mortal_python_root)
@@ -210,8 +209,8 @@ def convert_record_to_shard(
             record["sourceId"],
             player_state_type=PlayerState,
         )
-        save_shard(destination, arrays)
-        return record_index, record["sourceId"], len(arrays["policy"]), None
+        meta = save_chunk_archive(destination, arrays, chunk_samples)
+        return record_index, record["sourceId"], int(meta["samples"]), None
     except Exception as error:  # noqa: BLE001 -- one malformed game must not stop a batch
         return record_index, record["sourceId"], 0, repr(error)
 
@@ -222,7 +221,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--mortal-python-root", type=Path, required=True)
     parser.add_argument("--label-source-root", type=Path, help=argparse.SUPPRESS)
-    parser.add_argument("--games-per-shard", type=int, default=16)
+    parser.add_argument("--chunk-samples", type=int, default=16)
     parser.add_argument("--max-games", type=int, default=0)
     parser.add_argument("--start-game", type=int, default=0)
     parser.add_argument("--end-game", type=int, default=0)
@@ -247,99 +246,56 @@ def main() -> None:
     indexed_records = list(enumerate(records[start_game:end_game], start=start_game))
     if args.reverse:
         indexed_records.reverse()
-    records = [record for _index, record in indexed_records]
     args.output.mkdir(parents=True, exist_ok=True)
-    if args.workers > 1:
-        converted_games = 0
-        converted_samples = 0
-        failures: list[dict[str, str]] = []
-        start = time.perf_counter()
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as pool:
-            futures = [
-                pool.submit(
-                    convert_record_to_shard,
-                    index,
-                    record,
-                    str(args.output.resolve()),
-                    mortal_root,
-                    args.overwrite,
-                )
-                for index, record in indexed_records
-            ]
-            for completed, future in enumerate(
-                concurrent.futures.as_completed(futures), start=1
-            ):
-                _index, source_id, samples, error = future.result()
-                if error is None:
-                    converted_games += 1
-                    converted_samples += samples
-                else:
-                    failures.append({"sourceId": source_id, "error": error})
-                    print(f"FAILED {source_id}: {error}", file=sys.stderr)
-                if completed == 1 or completed % 25 == 0 or completed == len(records):
-                    print(
-                        f"converted {completed}/{len(records)} games; "
-                        f"samples={converted_samples}; failures={len(failures)}"
-                    )
-        summary = {
-            "format": "riichi-analysis-multitask-v3",
-            "manifest": metadata,
-            "requestedGames": len(records),
-            "convertedGames": converted_games,
-            "convertedSamples": converted_samples,
-            "workers": args.workers,
-            "failures": failures,
-            "elapsedSeconds": time.perf_counter() - start,
-        }
-        (args.output / args.summary_name).write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
-        if failures:
-            raise SystemExit(1)
-        return
-
-    shard_games: list[dict[str, np.ndarray]] = []
     converted_games = 0
     converted_samples = 0
     failures: list[dict[str, str]] = []
     start = time.perf_counter()
+    output_root = str(args.output.resolve())
+    jobs = [
+        (index, record, output_root, mortal_root, args.overwrite, args.chunk_samples)
+        for index, record in indexed_records
+    ]
 
-    def flush() -> None:
-        nonlocal converted_samples
-        if not shard_games:
-            return
-        shard = concatenate_games(shard_games)
-        destination = args.output / f"shard-{converted_games - len(shard_games):06d}-{converted_games - 1:06d}.npz"
-        save_shard(destination, shard)
-        converted_samples += len(shard["policy"])
-        print(f"wrote {destination.name}: {len(shard['policy'])} samples")
-        shard_games.clear()
-
-    for record in records:
-        try:
-            events = read_events(record["path"])
-            shard_games.append(
-                convert_game(
-                    events,
-                    record["sourceId"],
-                    player_state_type=PlayerState,
-                )
-            )
+    def collect(result: tuple[int, str, int, str | None]) -> None:
+        nonlocal converted_games, converted_samples
+        _index, source_id, samples, error = result
+        if error is None:
             converted_games += 1
-            if len(shard_games) >= args.games_per_shard:
-                flush()
-        except Exception as error:  # noqa: BLE001 -- report and continue with later games
-            failures.append({"sourceId": record["sourceId"], "error": repr(error)})
-            print(f"FAILED {record['sourceId']}: {error!r}", file=sys.stderr)
-    flush()
+            converted_samples += samples
+        else:
+            failures.append({"sourceId": source_id, "error": error})
+            print(f"FAILED {source_id}: {error}", file=sys.stderr)
+
+    def report(completed: int) -> None:
+        print(
+            f"converted {completed}/{len(indexed_records)} games; "
+            f"samples={converted_samples}; failures={len(failures)}"
+        )
+
+    if args.workers > 1:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(convert_record_to_archive, *job) for job in jobs]
+            for completed, future in enumerate(
+                concurrent.futures.as_completed(futures), start=1
+            ):
+                collect(future.result())
+                if completed == 1 or completed % 25 == 0 or completed == len(indexed_records):
+                    report(completed)
+    else:
+        for completed, job in enumerate(jobs, start=1):
+            collect(convert_record_to_archive(*job))
+            if completed % 25 == 0 or completed == len(indexed_records):
+                report(completed)
 
     summary = {
-        "format": "riichi-analysis-multitask-v3",
+        "format": "riichi-analysis-staged-games-v1",
         "manifest": metadata,
-        "requestedGames": len(records),
+        "requestedGames": len(indexed_records),
         "convertedGames": converted_games,
         "convertedSamples": converted_samples,
+        "chunkSamples": args.chunk_samples,
+        "workers": args.workers,
         "failures": failures,
         "elapsedSeconds": time.perf_counter() - start,
     }
