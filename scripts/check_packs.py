@@ -14,6 +14,7 @@ on a corpus that is not what it claims to be.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import statistics
 from pathlib import Path
@@ -22,7 +23,7 @@ import numpy as np
 
 from riichi_analysis_engine.dataset import PackDataset, read_manifest
 from riichi_analysis_engine.packing import audit_packs, read_plan, staged_games
-from riichi_analysis_engine.storage import read_chunk_archive_meta
+from riichi_analysis_engine.storage import read_chunk_archive_meta, read_packed_shard
 
 
 def build_arguments() -> argparse.Namespace:
@@ -34,7 +35,46 @@ def build_arguments() -> argparse.Namespace:
     parser.add_argument("--window", type=int, default=0, help="window for game diversity (default: batch size)")
     parser.add_argument("--windows", type=int, default=4096, help="how many windows to sample")
     parser.add_argument("--loader-samples", type=int, default=4096, help="samples read through the loader")
+    parser.add_argument(
+        "--verify-storage",
+        action="store_true",
+        help="read every pack and check each one is internally consistent",
+    )
+    parser.add_argument("--workers", type=int, default=1)
     return parser.parse_args()
+
+
+def check_one_pack(path: Path) -> dict[str, object]:
+    """Check one written pack against the layout its own arrays claim."""
+
+    packed = read_packed_shard(path)
+    samples = len(packed["obs_offsets"]) - 1
+    if len(packed["obs_values"]) != int(packed["obs_offsets"][-1]):
+        raise SystemExit(f"{path.name} holds {len(packed['obs_values'])} values for its offsets")
+    for name in ("obs_nonzero", "obs_nonone", "action_mask"):
+        if len(packed[name]) != samples:
+            raise SystemExit(f"{path.name} holds {len(packed[name])} {name} for {samples} samples")
+    for name, value in packed.items():
+        if name.startswith("obs_") or value.ndim == 0 or len(value) == samples:
+            continue
+        raise SystemExit(f"{path.name} holds {name} with {len(value)} rows for {samples} samples")
+    return {"pack": path.name, "samples": samples, "values": len(packed["obs_values"])}
+
+
+def verify_storage(root: Path, manifest: dict[str, object], workers: int) -> dict[str, object]:
+    """Read every pack and report what the whole corpus holds."""
+
+    paths = [root / str(entry["pack"]) for entry in manifest["packs"]]
+    if workers > 1:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(check_one_pack, paths))
+    else:
+        results = [check_one_pack(path) for path in paths]
+    return {
+        "packs": len(results),
+        "samples": sum(int(result["samples"]) for result in results),
+        "values": sum(int(result["values"]) for result in results),
+    }
 
 
 def game_stream(root: Path, manifest: dict[str, object]) -> np.ndarray:
@@ -132,6 +172,14 @@ def main() -> None:
         raise SystemExit("the loader yielded an empty batch")
     if report["loader"]["shortBatches"] > 1:
         raise SystemExit(f"the loader yielded {report['loader']['shortBatches']} short batches")
+
+    if arguments.verify_storage:
+        storage = verify_storage(arguments.packs, manifest, arguments.workers)
+        if storage["samples"] != len(stream):
+            raise SystemExit(
+                f"reading every pack found {storage['samples']} samples, the manifest says {len(stream)}"
+            )
+        report["storage"] = storage
 
     report["verified"] = True
     print(json.dumps(report, ensure_ascii=False, indent=2))
