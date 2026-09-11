@@ -122,11 +122,13 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
                     pending = None
             whole = (count - start) // self.batch_size * self.batch_size
             for offset in range(start, start + whole, self.batch_size):
-                if self.max_samples and accepted + self.batch_size > self.max_samples:
-                    yield self._torch(
-                        self._dense(packed, offset, offset + self.max_samples - accepted)
-                    )
-                    return
+                if self.max_samples:
+                    remaining = self.max_samples - accepted
+                    if remaining <= 0:
+                        return
+                    if remaining < self.batch_size:
+                        yield self._torch(self._dense(packed, offset, offset + remaining))
+                        return
                 accepted += self.batch_size
                 yield self._torch(self._dense(packed, offset, offset + self.batch_size))
             if start + whole < count:
