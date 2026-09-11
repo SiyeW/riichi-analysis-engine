@@ -105,6 +105,10 @@ def validate(
 ) -> dict[str, float]:
     model.eval()
     totals: dict[str, float] = {"total": 0.0, **{name: 0.0 for name in LOSS_TERMS}}
+    # Label marginals, kept to build the null baseline each loss is compared
+    # against: what a model that only knows the label distribution would score.
+    policy_labels = np.zeros(46, dtype=np.int64)
+    shanten_labels = np.zeros(7, dtype=np.int64)
     balance_totals: dict[str, float] = {name: 0.0 for name in LOSS_TERMS}
     batches = 0
     metric_sums: dict[str, float] = {}
@@ -127,6 +131,12 @@ def validate(
         for name, value in weights.items():
             balance_totals[name] += float(value)
         policy_valid = batch["policy"] >= 0
+        policy_labels += np.bincount(
+            batch["policy"][policy_valid].numpy(), minlength=46
+        )
+        shanten_labels += np.bincount(
+            batch["shanten"].reshape(-1).numpy(), minlength=7
+        )
         policy_logits = outputs["policy"].masked_fill(~batch["action_mask"], -torch.inf)
         add_metric(
             "policyAccuracy",
@@ -218,6 +228,18 @@ def validate(
         if progress_every > 0 and batches % progress_every == 0:
             print(json.dumps({"phase": "validation-progress", "batches": batches}))
     result = {name: value / max(1, batches) for name, value in totals.items()}
+    nulls = {
+        "policy": _label_entropy(policy_labels),
+        "shanten": _label_entropy(shanten_labels),
+    }
+    for name, value in nulls.items():
+        result[f"null/{name}"] = value
+    if nulls["policy"] > 0 and nulls["shanten"] > 0:
+        score = 0.5 * (
+            result["policy"] / nulls["policy"] + result["shanten"] / nulls["shanten"]
+        )
+        result["Selection/core_score"] = score
+        result["Selection/core_skill"] = 1.0 - score
     result.update(
         {
             f"lossWeight/{name}": balance_totals[name] / max(1, batches)
@@ -231,6 +253,52 @@ def validate(
         }
     )
     return result
+
+
+def _label_entropy(counts: np.ndarray) -> float:
+    """Entropy in nats of a label distribution, the score of a null predictor."""
+
+    total = float(counts.sum())
+    if total <= 0:
+        return 0.0
+    probabilities = counts[counts > 0] / total
+    return float(-(probabilities * np.log(probabilities)).sum())
+
+
+def open_dashboard(run: Path) -> object | None:
+    """TensorBoard writer for the run, or None when tensorboard is not installed."""
+
+    try:
+        from torch.utils.tensorboard.writer import SummaryWriter
+    except ImportError:
+        print("tensorboard is not installed; the run logs to metrics.jsonl only")
+        return None
+    return SummaryWriter(log_dir=str(run / "tensorboard"))
+
+
+def write_dashboard(writer: object | None, metrics: dict[str, float], step: int) -> None:
+    """Write the validation dashboard, dropping metrics that carry no signal.
+
+    A metric that never moves, or that repeats a value another tag already has,
+    is noise on a dashboard that has to stay readable over days.
+    """
+
+    if writer is None:
+        return
+    seen: dict[float, str] = {}
+    for name, value in metrics.items():
+        if name == "total" or name.startswith("metric/"):
+            tag = "Metrics/" + name.removeprefix("metric/")
+        elif name.startswith("Selection/"):
+            tag = name
+        else:
+            tag = "Validation/" + name
+        if not isinstance(value, float) or value != value:
+            continue
+        if value in seen:
+            continue
+        seen[value] = tag
+        writer.add_scalar(tag, value, step)
 
 
 def save_checkpoint(
@@ -425,6 +493,7 @@ def main() -> None:
         encoding="utf-8",
     )
     log_path = args.run / "metrics.jsonl"
+    writer = open_dashboard(args.run)
     started = time.perf_counter()
     print(json.dumps({"device": str(device), "parameters": parameters}, indent=2))
     if device.type == "cuda":
@@ -451,8 +520,15 @@ def main() -> None:
                 total, losses, _active, weights = multitask_loss(outputs, batch, balancer)
             scaler.scale(total).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                [*model.parameters(), *balancer.parameters()], 5.0
+            gradient_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    [*model.parameters(), *balancer.parameters()], 5.0
+                )
+            )
+            gradient_max = max(
+                float(parameter.grad.abs().max())
+                for parameter in model.parameters()
+                if parameter.grad is not None
             )
             scaler.step(optimizer)
             scaler.update()
@@ -477,6 +553,17 @@ def main() -> None:
                 with log_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                 print(json.dumps(record, ensure_ascii=False))
+                if writer is not None:
+                    writer.add_scalar("Loss/train_batch", float(total.detach()), step)
+                    for name, value in losses.items():
+                        writer.add_scalar(f"Loss/train_{name}_batch", float(value.detach()), step)
+                    for name, value in weights.items():
+                        writer.add_scalar(f"LossBalance/{name}", float(value), step)
+                    writer.add_scalar("Gradient/norm", gradient_norm, step)
+                    writer.add_scalar("Gradient/max", gradient_max, step)
+                    writer.add_scalar(
+                        "LR", optimizer.param_groups[0]["lr"], step
+                    )
             if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
                 save_checkpoint(
                     args.run / "checkpoint-latest.pt",
@@ -509,6 +596,7 @@ def main() -> None:
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         print(json.dumps(record, ensure_ascii=False))
+        write_dashboard(writer, metrics, step)
         checkpoint_name = (
             f"checkpoint-step-{step}.pt"
             if stopped_at_budget
