@@ -56,6 +56,7 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
         *,
         batch_size: int,
         max_samples: int = 0,
+        skip_batches: int = 0,
     ) -> None:
         super().__init__()
         if batch_size <= 0:
@@ -63,8 +64,14 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
         self.root = Path(root)
         self.batch_size = batch_size
         self.max_samples = max_samples
+        # Resuming a run does not have to read what it already trained on: the
+        # batches of the order are fixed slices of the sample stream, so a count
+        # of batches is a count of samples, and whole packs inside that prefix
+        # are skipped without being opened.
+        self.skip_batches = skip_batches
         self.manifest = read_manifest(self.root)
-        self.packs = [self.root / str(entry["pack"]) for entry in self.manifest["packs"]]
+        self.entries = [entry for entry in self.manifest["packs"]]
+        self.packs = [self.root / str(entry["pack"]) for entry in self.entries]
         missing = [path for path in self.packs if not path.exists()]
         if missing:
             raise FileNotFoundError(f"{missing[0]} is listed in the manifest but missing")
@@ -102,15 +109,24 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
         if worker is None:
             packs = self.selected_packs()
         else:
+            if self.skip_batches:
+                raise ValueError("skipping batches is only supported with a single worker")
             packs = self.selected_packs(worker.id, worker.num_workers)
         accepted = 0
+        skip = self.skip_batches * self.batch_size
         # A pack rarely divides into whole batches, so the samples left over at
         # the end of one pack are carried into the next one instead of dropped.
         pending: dict[str, np.ndarray] | None = None
-        for path in packs:
+        for entry, path in zip(self.entries, packs, strict=True):
+            count = int(entry["samples"])
+            if skip >= count:
+                skip -= count
+                continue
             packed = read_packed_shard(path)
-            count = self._sample_count(packed)
-            start = 0
+            if self._sample_count(packed) != count:
+                raise ValueError(f"{path.name} holds a different sample count than the manifest")
+            start = skip
+            skip = 0
             if pending is not None:
                 take = min(self.batch_size - len(next(iter(pending.values()))), count)
                 if take:

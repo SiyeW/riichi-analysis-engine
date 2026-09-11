@@ -433,9 +433,14 @@ def main() -> None:
     stopped_at_budget = False
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        for batch_in_epoch, batch in enumerate(train_loader, start=1):
-            if epoch == start_epoch and batch_in_epoch <= resume_batch:
-                continue
+        # A resumed epoch starts where the checkpoint stopped; the loader skips
+        # the packs it already trained on instead of reading and discarding
+        # them. Later epochs read the whole corpus again.
+        resumed = epoch == start_epoch and resume_batch > 0
+        train_data.skip_batches = resume_batch if resumed else 0
+        for batch_in_epoch, batch in enumerate(
+            train_loader, start=resume_batch if resumed else 1
+        ):
             batch = move_batch(batch, device)
             samples_seen += len(batch["policy"])
             optimizer.zero_grad(set_to_none=True)
