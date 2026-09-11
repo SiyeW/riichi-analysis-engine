@@ -58,21 +58,31 @@ def staged_games(stage: Path) -> list[Path]:
     return paths
 
 
-def plan_corpus(game_paths: list[Path], seed: int) -> dict[str, np.ndarray]:
-    """Enumerate every staged chunk and apply one seeded corpus-wide permutation."""
+def plan_corpus(
+    game_paths: list[Path], seed: int, game_offset: int = 0
+) -> dict[str, np.ndarray]:
+    """Enumerate every staged chunk and apply one seeded permutation.
+
+    A game offset numbers the games of this stage after the games of every stage
+    packed before it, so a corpus built in pieces still carries one set of
+    source-game ids and the merged plan can be audited as a whole.
+    """
 
     games: list[int] = []
     members: list[int] = []
     lengths: list[int] = []
     for game_index, path in enumerate(game_paths):
         chunk_lengths = [int(value) for value in read_chunk_archive_meta(path)["chunkLengths"]]
-        games.extend([game_index] * len(chunk_lengths))
+        games.extend([game_index + game_offset] * len(chunk_lengths))
         members.extend(range(len(chunk_lengths)))
         lengths.extend(chunk_lengths)
     if not lengths:
         raise ValueError("staged games contain no chunks")
     order = np.random.default_rng(seed).permutation(len(lengths))
     return {
+        # The stage's own first game id, so a loader holding this stage's files
+        # can turn a global id back into an index into its own list.
+        "game_offset": np.asarray(game_offset, dtype=np.uint32),
         "source_game": np.asarray(games, dtype=np.uint32)[order],
         "source_member": np.asarray(members, dtype=np.uint16)[order],
         "length": np.asarray(lengths, dtype=np.uint16)[order],
@@ -124,7 +134,10 @@ def seam_game(plan: dict[str, np.ndarray], slot: PackSlot) -> int | None:
 
 
 def nonadjacent_order(
-    source_game: np.ndarray, seed: int, forbidden_first: int | None = None
+    source_game: np.ndarray,
+    seed: int,
+    forbidden_first: int | None = None,
+    last_game: int | None = None,
 ) -> np.ndarray:
     """Order the samples so that every source game is spread evenly.
 
@@ -140,16 +153,53 @@ def nonadjacent_order(
     that game is served whenever it comes due at all. Without that rule a pack
     can run out of partners for its largest game and end with two of its
     samples next to each other.
+
+    `last_game` reserves the final position for one sample of that game, which
+    is how the seam between two packs is kept safe: the next pack then knows
+    what to avoid from the plan alone, without waiting for this pack.
     """
 
     rng = np.random.default_rng(seed)
-    groups: dict[int, list[int]] = {}
+    indices_by_game: dict[int, list[int]] = {}
     for game in np.unique(source_game):
         indices = np.flatnonzero(source_game == game)
         rng.shuffle(indices)
-        groups[int(game)] = indices.astype(int).tolist()
+        indices_by_game[int(game)] = indices.astype(int).tolist()
 
-    total = len(source_game)
+    reserved: int | None = None
+    if last_game is not None and indices_by_game.get(int(last_game)):
+        reserved = indices_by_game[int(last_game)].pop()
+        if not indices_by_game[int(last_game)]:
+            del indices_by_game[int(last_game)]
+
+    order: list[int] = []
+    for attempt in range(16):
+        groups = {game: list(indices) for game, indices in indices_by_game.items()}
+        order = _spread_order(groups, source_game, seed + attempt, forbidden_first)
+        # The reserved sample goes last, so the sample before it must not come
+        # from the same game. Re-running with another shuffle is cheaper than
+        # steering the tail of the schedule, and it almost never happens: the
+        # chance is one game's share of the pack.
+        if reserved is None or not order or int(source_game[order[-1]]) != int(last_game):
+            break
+    else:
+        raise RuntimeError(f"cannot keep the pack's last sample away from game {last_game}")
+
+    if reserved is not None:
+        order.append(reserved)
+    return np.asarray(order, dtype=np.int64)
+
+
+def _spread_order(
+    groups: dict[int, list[int]],
+    source_game: np.ndarray,
+    seed: int,
+    forbidden_first: int | None,
+) -> list[int]:
+    """Spread every game of the groups across one order, consuming the groups."""
+
+    rng = np.random.default_rng(seed)
+    total = sum(len(indices) for indices in groups.values())
     largest = max(len(indices) for indices in groups.values())
     if largest > (total + 1) // 2:
         raise RuntimeError(f"cannot avoid adjacent source games: largest group {largest}/{total}")
@@ -195,7 +245,7 @@ def nonadjacent_order(
             heapq.heappush(due_heap, item)
         if remaining[game]:
             heapq.heappush(due_heap, (due + spacing[game], float(rng.random()), game))
-    return np.asarray(order, dtype=np.int64)
+    return order
 
 
 def _take_next(
@@ -231,12 +281,15 @@ def load_slot(
 ) -> dict[str, np.ndarray]:
     """Read every chunk a slot needs, opening each staged game at most once."""
 
+    offset = int(plan["game_offset"]) if "game_offset" in plan else 0
+    # The plan numbers games globally so a corpus built in pieces keeps one set
+    # of ids; only the file lookup needs this stage's own numbering.
     games = plan["source_game"][slot.start : slot.stop]
     members = plan["source_member"][slot.start : slot.stop]
     lengths = plan["length"][slot.start : slot.stop]
 
     positions_by_game: dict[int, list[int]] = defaultdict(list)
-    for position, game in enumerate(games.tolist()):
+    for position, game in enumerate((games - offset).tolist()):
         positions_by_game[game].append(position)
 
     payloads: list[bytes | None] = [None] * len(games)
@@ -273,6 +326,9 @@ def build_pack(
         combined["source_game"],
         seed=int(np.random.SeedSequence([seed, slot.index]).generate_state(1)[0]),
         forbidden_first=forbidden_first,
+        # The next pack derives its own seam rule from the plan, so this pack
+        # has to end on the game the plan ends on.
+        last_game=int(combined["source_game"][-1]),
     )
     permuted = permute_packed(combined, order)
     permuted["pack_index"] = np.full(len(order), slot.index, dtype=np.uint32)

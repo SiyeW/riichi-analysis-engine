@@ -1,4 +1,7 @@
+import importlib.util
+import json
 import shutil
+import sys
 import uuid
 from itertools import pairwise
 from pathlib import Path
@@ -25,6 +28,14 @@ from riichi_analysis_engine.storage import (
     save_chunk_archive,
     write_packed_shard,
 )
+
+
+MERGE_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "merge_packs.py"
+MERGE_SPEC = importlib.util.spec_from_file_location("merge_packs", MERGE_SCRIPT)
+assert MERGE_SPEC is not None and MERGE_SPEC.loader is not None
+merge_packs = importlib.util.module_from_spec(MERGE_SPEC)
+sys.modules[MERGE_SPEC.name] = merge_packs
+MERGE_SPEC.loader.exec_module(merge_packs)
 
 
 @pytest.fixture()
@@ -168,7 +179,11 @@ def test_nonadjacent_order_handles_a_game_holding_half_the_pack() -> None:
     assert not np.any(np.diff(games) == 0)
     positions = np.flatnonzero(games == 0)
     assert positions[0] in (0, 1)
-    assert set(np.diff(positions).tolist()) == {2}
+    # Twenty samples in forty slots leave room for one gap of three at most,
+    # and never for two of the game's samples next to each other.
+    gaps = np.diff(positions).tolist()
+    assert set(gaps) <= {2, 3}
+    assert gaps.count(3) <= 1
 
 
 def test_nonadjacent_order_avoids_the_previous_pack() -> None:
@@ -177,6 +192,30 @@ def test_nonadjacent_order_avoids_the_previous_pack() -> None:
 
     assert int(source[order[0]]) != 2
     assert not np.any(np.diff(source[order]) == 0)
+
+
+def test_nonadjacent_order_reserves_the_last_sample() -> None:
+    counts = [20, 4, 4, 4, 4, 4]
+    source = np.repeat(np.arange(len(counts), dtype=np.uint32), counts)
+
+    order = nonadjacent_order(source, 20252026, last_game=3)
+    assert int(source[order[-1]]) == 3
+    assert not np.any(np.diff(source[order]) == 0)
+    assert sorted(order.tolist()) == list(range(len(source)))
+
+
+def test_every_pack_ends_on_the_game_the_plan_ends_on(scratch: Path) -> None:
+    # The seam between packs is derived from the plan, so a pack has to end on
+    # the game its own last chunk belongs to.
+    stage = stage_corpus(scratch, games=6, chunks=4, samples=8)
+    output = scratch / "packs"
+    games = staged_games(stage)
+    plan = plan_corpus(games, 20252026)
+    slots = pack_slots(plan["length"], 128)
+
+    for slot in slots:
+        meta, _ = build_pack(games, output, plan, slot, 20252026, seam_game(plan, slot))
+        assert meta["lastGame"] == int(plan["source_game"][slot.stop - 1])
 
 
 def test_nonadjacent_order_refuses_an_impossible_pack() -> None:
@@ -236,6 +275,83 @@ def test_audit_rejects_packs_that_lose_samples(scratch: Path) -> None:
     manifest["packs"][1]["samples"] = int(manifest["packs"][1]["samples"]) - 16
     with pytest.raises(ValueError, match="manifest says"):
         audit_packs(output, manifest, plan)
+
+
+def pack_segment(
+    stage: Path,
+    output: Path,
+    *,
+    seed: int = 20252026,
+    pack_samples: int = 256,
+    game_offset: int = 0,
+    first_forbidden: int | None = None,
+) -> dict[str, object]:
+    """Pack one segment the way the packing command does for a split build."""
+
+    games = staged_games(stage)
+    plan = plan_corpus(games, seed, game_offset)
+    write_plan(output / "plan.npz", plan)
+    entries: list[dict[str, object]] = []
+    for slot in pack_slots(plan["length"], pack_samples):
+        forbidden = seam_game(plan, slot)
+        if slot.index == 0 and first_forbidden is not None:
+            forbidden = first_forbidden
+        meta, _ = build_pack(games, output, plan, slot, seed, forbidden)
+        entries.append(meta)
+    manifest: dict[str, object] = {
+        "format": MANIFEST_FORMAT,
+        "stage": str(stage),
+        "seed": seed,
+        "packSamples": pack_samples,
+        "gameOffset": game_offset,
+        "samples": int(plan["length"].sum()),
+        "chunks": len(plan["length"]),
+        "sourceGames": int(plan["source_game"].max()) + 1,
+        "packs": entries,
+    }
+    write_manifest(output / "manifest.json", manifest)
+    return manifest
+
+
+def test_a_corpus_built_in_segments_merges_into_one_order(scratch: Path) -> None:
+    root = scratch / "packs"
+    first = pack_segment(stage_corpus(scratch, games=8), root / "a", game_offset=0)
+    # The second segment continues the game numbering and keeps its first sample
+    # away from the game the first segment ended on.
+    pack_segment(
+        stage_corpus(scratch / "second", games=8),
+        root / "b",
+        game_offset=8,
+        first_forbidden=int(first["packs"][-1]["lastGame"]),
+    )
+
+    report = merge_packs.merge(root, ["a", "b"])
+    assert report["verified"] is True
+    assert report["sourceGames"] == 16
+    assert report["samples"] == 768 * 2
+    assert report["adjacentSameGamePairs"] == 0
+
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert [entry["pack"] for entry in manifest["packs"]] == [
+        f"pack-{index:05d}.npz" for index in range(len(manifest["packs"]))
+    ]
+    stream = np.concatenate(
+        [
+            np.load(root / str(entry["pack"]), allow_pickle=False)["source_game"]
+            for entry in manifest["packs"]
+        ]
+    )
+    assert sorted(np.unique(stream).tolist()) == list(range(16))
+    assert not np.any(np.diff(stream) == 0)
+
+
+def test_merge_rejects_a_segment_that_restarts_the_numbering(scratch: Path) -> None:
+    root = scratch / "packs"
+    pack_segment(stage_corpus(scratch, games=8), root / "a", game_offset=0)
+    pack_segment(stage_corpus(scratch / "second", games=8), root / "b", game_offset=0)
+
+    with pytest.raises(ValueError, match="starts at game 0"):
+        merge_packs.merge(root, ["a", "b"])
 
 
 def test_audit_rejects_a_dropped_pack(scratch: Path) -> None:

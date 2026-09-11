@@ -48,6 +48,18 @@ def build_arguments() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True, help="directory to write packs into")
     parser.add_argument("--seed", type=int, default=20252026)
     parser.add_argument(
+        "--game-offset",
+        type=int,
+        default=0,
+        help="number this stage's games after the games of the stages before it",
+    )
+    parser.add_argument(
+        "--first-forbidden-game",
+        type=int,
+        default=-1,
+        help="source game the first sample must avoid, for a build split in pieces",
+    )
+    parser.add_argument(
         "--pack-samples",
         type=int,
         default=65536,
@@ -69,21 +81,23 @@ def build_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _initialize_worker(games: list[Path], plan: dict, output: Path, seed: int) -> None:
-    _WORKER.update(games=games, plan=plan, output=output, seed=seed)
+def _initialize_worker(
+    games: list[Path], plan: dict, output: Path, seed: int, forbidden_first: int | None
+) -> None:
+    _WORKER.update(
+        games=games, plan=plan, output=output, seed=seed, forbidden_first=forbidden_first
+    )
 
 
 def _build_slot(slot) -> tuple[int, dict[str, object]]:
     plan = _WORKER["plan"]
     # A pack starts where the previous one ended, so the seam between two packs
     # cannot join two samples of the same game either.
+    forbidden = seam_game(plan, slot)
+    if slot.index == 0:
+        forbidden = _WORKER["forbidden_first"]
     meta, _ = build_pack(
-        _WORKER["games"],
-        _WORKER["output"],
-        plan,
-        slot,
-        _WORKER["seed"],
-        seam_game(plan, slot),
+        _WORKER["games"], _WORKER["output"], plan, slot, _WORKER["seed"], forbidden
     )
     return slot.index, meta
 
@@ -118,7 +132,7 @@ def main() -> None:
         plan = read_plan(plan_path)
         print(f"reused {plan_path} with {len(plan['length'])} chunks", file=sys.stderr)
     else:
-        plan = plan_corpus(games, arguments.seed)
+        plan = plan_corpus(games, arguments.seed, arguments.game_offset)
         write_plan(plan_path, plan)
         print(
             f"planned {len(plan['length'])} chunks over {len(games)} games "
@@ -126,6 +140,9 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    first_forbidden = (
+        arguments.first_forbidden_game if arguments.first_forbidden_game >= 0 else None
+    )
     slots = pack_slots(plan["length"], arguments.pack_samples)
     print(f"writing {len(slots)} packs", file=sys.stderr)
     entries: list[dict[str, object]] = []
@@ -133,13 +150,13 @@ def main() -> None:
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=arguments.workers,
             initializer=_initialize_worker,
-            initargs=(games, plan, arguments.output, arguments.seed),
+            initargs=(games, plan, arguments.output, arguments.seed, first_forbidden),
         ) as pool:
             for index, meta in pool.map(_build_slot, slots):
                 entries.append(meta)
                 report_progress(index, len(slots), started)
     else:
-        _initialize_worker(games, plan, arguments.output, arguments.seed)
+        _initialize_worker(games, plan, arguments.output, arguments.seed, first_forbidden)
         for slot in slots:
             index, meta = _build_slot(slot)
             entries.append(meta)
@@ -150,6 +167,7 @@ def main() -> None:
         "format": MANIFEST_FORMAT,
         "stage": str(arguments.stage),
         "seed": arguments.seed,
+        "gameOffset": arguments.game_offset,
         "packSamples": arguments.pack_samples,
         "samples": int(plan["length"].sum()),
         "chunks": len(plan["length"]),
