@@ -96,6 +96,12 @@ try {
         --pack-samples $PackSamples
     if ($LASTEXITCODE -ne 0) { throw "Training packing failed." }
 
+    & $python (Join-Path $PSScriptRoot "check_packs.py") `
+        --packs $packsTrain `
+        --stage $stagedTrain `
+        --batch-size $BatchSize
+    if ($LASTEXITCODE -ne 0) { throw "Training packs failed verification." }
+
     # One epoch is one pass over the mixed corpus; the step budget ends the run.
     & $python -m riichi_analysis_engine.train `
         --train $packsTrain `

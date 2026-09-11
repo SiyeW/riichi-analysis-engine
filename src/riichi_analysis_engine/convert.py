@@ -216,10 +216,17 @@ def convert_record_to_archive(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Convert mjai logs into multi-task shards.")
+    parser = argparse.ArgumentParser(
+        description="Convert mjai logs into staged games of compressed sample chunks."
+    )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--mortal-python-root", type=Path, required=True)
+    parser.add_argument(
+        "--mortal-python-root",
+        type=Path,
+        required=True,
+        help="directory holding libriichi, usually <runtime>/mortal",
+    )
     parser.add_argument("--label-source-root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--chunk-samples", type=int, default=16)
     parser.add_argument("--max-games", type=int, default=0)
