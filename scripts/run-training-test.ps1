@@ -16,8 +16,8 @@ if ($MaxSteps -le 0) { throw "MaxSteps must be positive for a controlled compari
 $project = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $project ".venv\Scripts\python.exe"
 $manifests = Join-Path $project "data\manifests"
-$train = Join-Path $project "data\processed-v3\train-2025-1of20"
-$validation = Join-Path $project "data\processed-v3\validation-2026"
+$train = Join-Path $project "data\processed-v4\train-2025"
+$validation = Join-Path $project "data\processed-v4\validation-2026"
 $run = Join-Path $project "runs\$RunName"
 $weights = Join-Path $project "weights\riichi-analysis-$RunName.pt"
 $log = Join-Path $project "runs\$RunName.log"
@@ -65,7 +65,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Validation-data conversion failed." }
 
     & $python -m riichi_analysis_engine.convert `
-        --manifest (Join-Path $manifests "train-2025-1of20.jsonl") `
+        --manifest (Join-Path $manifests "train-2025.jsonl") `
         --output $train `
         --mortal-python-root $MortalPythonRoot `
         --workers $Workers `
