@@ -28,6 +28,10 @@ foreach ($Path in @($OutputRoot, $WorkRoot)) {
     }
 }
 
+# libriichi is a Rust extension that asks NumPy for its array API capsule by
+# importing numpy.core.multiarray. PyInstaller does not collect that module on
+# its own, and the extension panics with ModuleNotFoundError the first time it
+# encodes an observation without it.
 & $Python -m PyInstaller `
     --noconfirm `
     --clean `
@@ -39,6 +43,8 @@ foreach ($Path in @($OutputRoot, $WorkRoot)) {
     --paths (Join-Path $ProjectRoot 'src') `
     --paths $MortalPythonRoot `
     --hidden-import libriichi `
+    --hidden-import numpy.core.multiarray `
+    --hidden-import numpy.core._multiarray_umath `
     --add-binary "$Libriichi;." `
     (Join-Path $ProjectRoot 'engine.py')
 if ($LASTEXITCODE -ne 0) {
