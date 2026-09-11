@@ -268,12 +268,15 @@ def save_chunk_archive(
             stop = min(total, start + chunk_samples)
             chunk = {"storage_format": packed["storage_format"]}
             for name, value in packed.items():
-                if name not in {"storage_format", "obs_offsets"}:
+                if name not in {"storage_format", "obs_offsets", "obs_values"}:
                     chunk[name] = value[start:stop]
-            # A chunk keeps one more offset than it has samples so its own
-            # sparse-value runs stay addressable after the rebase.
+            # The sparse values are not one per sample, so they are cut by the
+            # offset window rather than by the sample range. A chunk keeps one
+            # more offset than it has samples so its own value runs stay
+            # addressable after the rebase.
             offsets = packed["obs_offsets"][start : stop + 1]
             chunk["obs_offsets"] = offsets - offsets[0]
+            chunk["obs_values"] = packed["obs_values"][int(offsets[0]) : int(offsets[-1])]
             buffer = io.BytesIO()
             np.savez_compressed(buffer, **chunk)
             archive.writestr(f"chunk_{member_index:05d}.npz", buffer.getvalue())
