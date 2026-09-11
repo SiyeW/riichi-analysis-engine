@@ -123,6 +123,16 @@ def test_max_samples_stops_the_pass_exactly(scratch: Path) -> None:
     assert [len(batch["policy"]) for batch in batches] == [8, 8, 4]
 
 
+def test_max_samples_does_not_emit_an_empty_batch(scratch: Path) -> None:
+    # A cap that lands exactly on a batch boundary used to leave the loop with
+    # nothing left to take and yield a batch of no samples at all.
+    root = pack_directory(scratch)
+    batches = collect(PackDataset(root, batch_size=8, max_samples=32))
+
+    assert [len(batch["policy"]) for batch in batches] == [8, 8, 8, 8]
+    assert all(len(batch["policy"]) for batch in batches)
+
+
 def test_metadata_stays_out_of_the_batches(scratch: Path) -> None:
     root = pack_directory(scratch)
     batch = next(iter(PackDataset(root, batch_size=4)))
