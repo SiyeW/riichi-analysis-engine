@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from test_storage import sample_arrays
 
+from riichi_analysis_engine import dataset
 from riichi_analysis_engine.dataset import METADATA_FIELDS, PackDataset, read_manifest
 from riichi_analysis_engine.packing import (
     MANIFEST_FORMAT,
@@ -131,6 +132,31 @@ def test_max_samples_does_not_emit_an_empty_batch(scratch: Path) -> None:
 
     assert [len(batch["policy"]) for batch in batches] == [8, 8, 8, 8]
     assert all(len(batch["policy"]) for batch in batches)
+
+
+def test_skipping_batches_matches_the_tail_of_the_pass(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = pack_directory(scratch)
+    full = collect(PackDataset(root, batch_size=8))
+    reference = np.concatenate([batch["sample_tag"] for batch in full])
+
+    # A resumed pass must not open the packs it skips, not merely discard their
+    # samples, so the packs it reads are recorded.
+    opened: list[str] = []
+    original = dataset.read_packed_shard
+
+    def recording(path: Path) -> dict[str, np.ndarray]:
+        opened.append(Path(path).name)
+        return original(path)
+
+    monkeypatch.setattr(dataset, "read_packed_shard", recording)
+    skipped = collect(PackDataset(root, batch_size=8, skip_batches=8))
+
+    assert opened == ["pack-00002.npz", "pack-00003.npz"]
+    np.testing.assert_array_equal(
+        np.concatenate([batch["sample_tag"] for batch in skipped]), reference[8 * 8 :]
+    )
 
 
 def test_metadata_stays_out_of_the_batches(scratch: Path) -> None:
