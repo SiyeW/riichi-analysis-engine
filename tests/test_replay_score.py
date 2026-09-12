@@ -39,8 +39,9 @@ def test_a_tsumo_yields_the_sum_of_every_payment() -> None:
 
 def test_a_ron_paid_by_two_players_still_yields_its_hand_value() -> None:
     # 2025061121gm-00a9-0000-5f8f6cdd: player 2 completes daisangen by ponning the
-    # third dragon from player 0, then wins on player 3's discard. Liability
-    # splits the payment between them, and the hand is a non-dealer yakuman.
+    # third dragon from player 0, then wins on player 3's discard. Player 0 is
+    # 包牌 (liable) for supplying the tile, so the payment is split between them;
+    # the hand is a non-dealer yakuman either way.
     event = {"actor": 2, "target": 3, "deltas": [-16300, 0, 34300, -16000]}
     assert hand_score(event, StubState(honba=1, kyotaku=2), first_winner=True) == 32000
 

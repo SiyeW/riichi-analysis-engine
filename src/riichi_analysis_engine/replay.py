@@ -222,9 +222,11 @@ class FullState:
 def hand_score(event: dict[str, Any], state: FullState, *, first_winner: bool) -> int:
     deltas = np.asarray(event["deltas"], dtype=np.int32)
     # The winner's total gain, taken from the settlement itself rather than from
-    # one assumed payer: liability rules (pao) let two players pay one ron, as in
-    # 2025061121gm-00a9-0000-5f8f6cdd, where a daisangen was completed by one
-    # discard and paid by two players.
+    # one assumed payer: 包牌 (pao, liability) makes the player who supplied the
+    # tile that completed daisangen or daisuushii responsible for part or all of
+    # the payment, so one ron can be paid by two players. See
+    # 2025061121gm-00a9-0000-5f8f6cdd, where a daisangen was completed from
+    # player 0's discard and won on player 3's.
     value = int(deltas[deltas > 0].sum())
     if first_winner:
         # Only the first winner collects the riichi sticks and the honba.
