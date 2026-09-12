@@ -223,13 +223,28 @@ def hand_score(event: dict[str, Any], state: FullState, *, first_winner: bool) -
     actor, target = int(event["actor"]), int(event["target"])
     deltas = np.asarray(event["deltas"], dtype=np.int32)
     if actor == target:
+        paid_by = [player for player in range(PLAYERS) if deltas[player] < 0]
+        if paid_by != [player for player in range(PLAYERS) if player != actor]:
+            raise ValueError(
+                f"hora is not a legal tsumo settlement: deltas={deltas.tolist()}"
+            )
         value = -int(deltas[np.arange(PLAYERS) != actor].sum())
     else:
+        # A ron is paid by the discarder alone. A replay where a second player
+        # also loses points is not a single-winner settlement, so no hand value
+        # can be derived from it; that is a problem with the replay, not with the
+        # published score table below.
+        if [player for player in range(PLAYERS) if deltas[player] < 0] != [target]:
+            raise ValueError(
+                f"hora is not a legal single-winner settlement: deltas={deltas.tolist()}"
+            )
         value = -int(deltas[target])
     if first_winner:
         value -= state.honba * 300
     if value not in SCORE_VALUE_SET:
-        raise ValueError(f"hora produced an unsupported hand score: {value}")
+        raise ValueError(
+            f"hora produced an unsupported hand score: {value} (deltas={deltas.tolist()})"
+        )
     return value
 
 
