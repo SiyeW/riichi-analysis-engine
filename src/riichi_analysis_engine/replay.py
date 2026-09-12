@@ -220,27 +220,15 @@ class FullState:
 
 
 def hand_score(event: dict[str, Any], state: FullState, *, first_winner: bool) -> int:
-    actor, target = int(event["actor"]), int(event["target"])
     deltas = np.asarray(event["deltas"], dtype=np.int32)
-    if actor == target:
-        paid_by = [player for player in range(PLAYERS) if deltas[player] < 0]
-        if paid_by != [player for player in range(PLAYERS) if player != actor]:
-            raise ValueError(
-                f"hora is not a legal tsumo settlement: deltas={deltas.tolist()}"
-            )
-        value = -int(deltas[np.arange(PLAYERS) != actor].sum())
-    else:
-        # A ron is paid by the discarder alone. A replay where a second player
-        # also loses points is not a single-winner settlement, so no hand value
-        # can be derived from it; that is a problem with the replay, not with the
-        # published score table below.
-        if [player for player in range(PLAYERS) if deltas[player] < 0] != [target]:
-            raise ValueError(
-                f"hora is not a legal single-winner settlement: deltas={deltas.tolist()}"
-            )
-        value = -int(deltas[target])
+    # The winner's total gain, taken from the settlement itself rather than from
+    # one assumed payer: liability rules (pao) let two players pay one ron, as in
+    # 2025061121gm-00a9-0000-5f8f6cdd, where a daisangen was completed by one
+    # discard and paid by two players.
+    value = int(deltas[deltas > 0].sum())
     if first_winner:
-        value -= state.honba * 300
+        # Only the first winner collects the riichi sticks and the honba.
+        value -= state.honba * 300 + state.kyotaku * 1000
     if value not in SCORE_VALUE_SET:
         raise ValueError(
             f"hora produced an unsupported hand score: {value} (deltas={deltas.tolist()})"

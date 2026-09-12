@@ -47,8 +47,11 @@ def test_score_values_follow_the_non_kiriage_table() -> None:
 
 
 def test_only_first_winner_receives_honba_in_multiple_ron() -> None:
+    # A settlement has to balance: the winner's gain is what the payers lost
+    # plus any riichi sticks on the table, which is what the hand value is read
+    # from. The first winner also receives the honba, so it is stripped again.
     state = FullState(honba=1)
-    first = {"actor": 2, "target": 0, "deltas": [-4200, 0, 6200, 0]}
+    first = {"actor": 2, "target": 0, "deltas": [-4200, 0, 4200, 0]}
     second = {"actor": 3, "target": 0, "deltas": [-1000, 0, 0, 1000]}
     assert hand_score(first, state, first_winner=True) == 3_900
     assert hand_score(second, state, first_winner=False) == 1_000
