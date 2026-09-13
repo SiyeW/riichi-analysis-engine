@@ -41,6 +41,12 @@ def build_arguments() -> argparse.Namespace:
         default=[],
         help="segment directory names in build order (default: every packed subdirectory, by name)",
     )
+    parser.add_argument(
+        "--expected-source-games",
+        type=int,
+        default=0,
+        help="require this many source games before writing the merged metadata",
+    )
     return parser.parse_args()
 
 
@@ -50,7 +56,9 @@ def segment_names(root: Path) -> list[str]:
     return sorted(path.name for path in root.iterdir() if (path / "manifest.json").exists())
 
 
-def merge(root: Path, names: list[str]) -> dict[str, object]:
+def merge(
+    root: Path, names: list[str], expected_source_games: int = 0
+) -> dict[str, object]:
     entries: list[dict[str, object]] = []
     plans: list[dict[str, np.ndarray]] = []
     seen_games: set[int] = set()
@@ -90,6 +98,11 @@ def merge(root: Path, names: list[str]) -> dict[str, object]:
     if not entries:
         raise ValueError("no packed segments were found")
     ordered_games = sorted(seen_games)
+    if expected_source_games and len(ordered_games) != expected_source_games:
+        raise ValueError(
+            f"the merged corpus holds {len(ordered_games)} source games, "
+            f"expected {expected_source_games}"
+        )
     expected_games = list(range(len(ordered_games)))
     if ordered_games != expected_games:
         missing = next(
@@ -129,7 +142,7 @@ def main() -> None:
     names = arguments.segments or segment_names(arguments.root)
     if not names:
         raise SystemExit(f"{arguments.root} holds no packed segments")
-    report = merge(arguments.root, names)
+    report = merge(arguments.root, names, arguments.expected_source_games)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
