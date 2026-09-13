@@ -98,11 +98,6 @@ def merge(
     if not entries:
         raise ValueError("no packed segments were found")
     ordered_games = sorted(seen_games)
-    if expected_source_games and len(ordered_games) != expected_source_games:
-        raise ValueError(
-            f"the merged corpus holds {len(ordered_games)} source games, "
-            f"expected {expected_source_games}"
-        )
     expected_games = list(range(len(ordered_games)))
     if ordered_games != expected_games:
         missing = next(
@@ -110,6 +105,11 @@ def merge(
             len(ordered_games),
         )
         raise ValueError(f"the merged corpus is missing source game {missing}")
+    if expected_source_games and len(ordered_games) != expected_source_games:
+        raise ValueError(
+            f"the merged corpus holds {len(ordered_games)} source games, "
+            f"expected {expected_source_games}"
+        )
     merged = {
         name: np.concatenate([plan[name] for plan in plans])
         for name in ("source_game", "source_member", "length")
