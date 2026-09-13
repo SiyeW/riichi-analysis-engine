@@ -51,7 +51,7 @@ def build_arguments() -> argparse.Namespace:
         "--game-offset",
         type=int,
         default=0,
-        help="number this stage's games after the games of the stages before it",
+        help="add this value to the game numbers already present in the archive names",
     )
     parser.add_argument(
         "--first-forbidden-game",
@@ -171,7 +171,9 @@ def main() -> None:
         "packSamples": arguments.pack_samples,
         "samples": int(plan["length"].sum()),
         "chunks": len(plan["length"]),
-        "sourceGames": int(plan["source_game"].max()) + 1,
+        "sourceGames": len(set(plan["source_game"].tolist())),
+        "firstSourceGame": int(plan["source_game"].min()),
+        "lastSourceGame": int(plan["source_game"].max()),
         "packs": entries,
     }
     write_manifest(arguments.output / "manifest.json", manifest)

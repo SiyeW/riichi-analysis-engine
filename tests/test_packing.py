@@ -12,8 +12,10 @@ from test_storage import sample_arrays
 
 from riichi_analysis_engine.packing import (
     MANIFEST_FORMAT,
+    PackSlot,
     audit_packs,
     build_pack,
+    load_slot,
     nonadjacent_order,
     pack_slots,
     plan_corpus,
@@ -78,7 +80,7 @@ def pack_corpus(stage: Path, output: Path, plan: dict[str, np.ndarray]) -> dict[
         "seed": 314159,
         "samples": int(plan["length"].sum()),
         "chunks": len(plan["length"]),
-        "sourceGames": int(plan["source_game"].max()) + 1,
+        "sourceGames": len(np.unique(plan["source_game"])),
         "packs": entries,
     }
 
@@ -97,6 +99,23 @@ def test_plan_visits_every_chunk_exactly_once(scratch: Path) -> None:
     assert sorted(plan["source_game"].tolist()) == sorted(
         game for game in range(8) for _ in range(6)
     )
+
+
+def test_plan_keeps_archive_identity_when_an_earlier_game_is_missing(scratch: Path) -> None:
+    stage = stage_corpus(scratch, games=4, chunks=2, samples=8)
+    (stage / "game-000001.zip").unlink()
+    games = staged_games(stage)
+
+    plan = plan_corpus(games, 314159)
+
+    assert sorted(np.unique(plan["source_game"]).tolist()) == [0, 2, 3]
+    # File positions stay compact even though source identities do not.  In
+    # particular, source game 2 is read from the second remaining archive.
+    assert set(plan["source_path"][plan["source_game"] == 2].tolist()) == {1}
+    packed = load_slot(games, plan, PackSlot(0, 0, len(plan["length"])))
+    source_two_events = packed["event_index"][packed["source_game"] == 2]
+    assert int(source_two_events.min()) >= 2000
+    assert int(source_two_events.max()) < 3000
 
 
 def test_plan_round_trips_through_disk(scratch: Path) -> None:
@@ -305,7 +324,9 @@ def pack_segment(
         "gameOffset": game_offset,
         "samples": int(plan["length"].sum()),
         "chunks": len(plan["length"]),
-        "sourceGames": int(plan["source_game"].max()) + 1,
+        "sourceGames": len(np.unique(plan["source_game"])),
+        "firstSourceGame": int(plan["source_game"].min()),
+        "lastSourceGame": int(plan["source_game"].max()),
         "packs": entries,
     }
     write_manifest(output / "manifest.json", manifest)
@@ -332,7 +353,11 @@ def test_a_corpus_built_in_segments_merges_into_one_order(scratch: Path) -> None
 
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     assert [entry["pack"] for entry in manifest["packs"]] == [
-        f"pack-{index:05d}.npz" for index in range(len(manifest["packs"]))
+        *[f"a/pack-{index:05d}.npz" for index in range(len(first["packs"]))],
+        *[
+            f"b/pack-{index:05d}.npz"
+            for index in range(len(manifest["packs"]) - len(first["packs"]))
+        ],
     ]
     stream = np.concatenate(
         [
@@ -344,13 +369,60 @@ def test_a_corpus_built_in_segments_merges_into_one_order(scratch: Path) -> None
     assert not np.any(np.diff(stream) == 0)
 
 
-def test_merge_rejects_a_segment_that_restarts_the_numbering(scratch: Path) -> None:
+def make_legacy_segment(output: Path) -> None:
+    """Rewrite one fixture's metadata in the format used by the lab packs."""
+
+    plan_path = output / "plan.npz"
+    plan = read_plan(plan_path)
+    plan.pop("source_path")
+    with plan_path.open("wb") as handle:
+        np.savez_compressed(
+            handle,
+            format=np.asarray("riichi-analysis-global-plan-v1"),
+            **plan,
+        )
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["format"] = "riichi-analysis-global-manifest-v1"
+    manifest["sourceGames"] = int(manifest["gameOffset"]) + int(manifest["sourceGames"])
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_merge_accepts_existing_v1_segments(scratch: Path) -> None:
+    root = scratch / "packs"
+    pack_segment(stage_corpus(scratch, games=4), root / "a")
+    pack_segment(stage_corpus(scratch / "second", games=4), root / "b", game_offset=4)
+    make_legacy_segment(root / "a")
+    make_legacy_segment(root / "b")
+
+    report = merge_packs.merge(root, ["a", "b"])
+
+    assert report["verified"] is True
+    assert report["sourceGames"] == 8
+
+
+def test_merge_rejects_a_segment_that_repeats_source_games(scratch: Path) -> None:
     root = scratch / "packs"
     pack_segment(stage_corpus(scratch, games=8), root / "a", game_offset=0)
     pack_segment(stage_corpus(scratch / "second", games=8), root / "b", game_offset=0)
 
-    with pytest.raises(ValueError, match="starts at game 0"):
+    with pytest.raises(ValueError, match="repeats source game 0"):
         merge_packs.merge(root, ["a", "b"])
+
+
+def test_merge_refuses_a_gap_without_moving_segment_packs(scratch: Path) -> None:
+    root = scratch / "packs"
+    stage = stage_corpus(scratch, games=4)
+    (stage / "game-000001.zip").unlink()
+    segment = root / "a"
+    pack_segment(stage, segment)
+    original_packs = sorted(path.name for path in segment.glob("pack-*.npz"))
+
+    with pytest.raises(ValueError, match="missing source game 1"):
+        merge_packs.merge(root, ["a"])
+
+    assert sorted(path.name for path in segment.glob("pack-*.npz")) == original_packs
+    assert not (root / "manifest.json").exists()
 
 
 def test_audit_rejects_a_dropped_pack(scratch: Path) -> None:

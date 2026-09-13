@@ -12,17 +12,16 @@ from typing import Any
 
 import numpy as np
 
-from .kyoku_outcome import outcome_class_index
-
 from .constants import (
     PLAYERS,
-    RED_TILES,
     RED_TILE_TO_INDEX,
+    RED_TILES,
     TILE37_TO_ACTION,
     deaka,
     relative_players,
     tile34_index,
 )
+from .kyoku_outcome import outcome_class_index
 from .prediction_values import SCORE_VALUE_SET
 from .yaku import has_ron_yaku, is_complete_hand
 
@@ -227,7 +226,7 @@ def hand_score(event: dict[str, Any], state: FullState, *, first_winner: bool) -
     # the payment, so one ron can be paid by two players. See
     # regression-fixture, where a daisangen was completed from
     # player 0's discard and won on player 3's.
-    value = int(deltas[deltas > 0].sum())
+    value = int(deltas[int(event["actor"])])
     if first_winner:
         # Only the first winner collects the riichi sticks and the honba.
         value -= state.honba * 300 + state.kyotaku * 1000

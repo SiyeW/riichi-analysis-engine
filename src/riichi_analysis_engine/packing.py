@@ -21,6 +21,7 @@ from __future__ import annotations
 import heapq
 import io
 import json
+import re
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -36,8 +37,12 @@ from .storage import (
     write_packed_shard,
 )
 
-PLAN_FORMAT = "riichi-analysis-global-plan-v1"
-MANIFEST_FORMAT = "riichi-analysis-global-manifest-v1"
+PLAN_FORMAT = "riichi-analysis-global-plan-v2"
+MANIFEST_FORMAT = "riichi-analysis-global-manifest-v2"
+LEGACY_PLAN_FORMATS = frozenset({"riichi-analysis-global-plan-v1"})
+LEGACY_MANIFEST_FORMATS = frozenset({"riichi-analysis-global-manifest-v1"})
+SUPPORTED_MANIFEST_FORMATS = frozenset({MANIFEST_FORMAT, *LEGACY_MANIFEST_FORMATS})
+_STAGED_GAME_NAME = re.compile(r"game-(\d+)\.zip")
 
 
 @dataclass(frozen=True)
@@ -52,10 +57,22 @@ class PackSlot:
 def staged_games(stage: Path) -> list[Path]:
     """Return the staged game archives in a stable order."""
 
-    paths = sorted(stage.glob("game-*.zip"))
+    paths = sorted(stage.glob("game-*.zip"), key=staged_game_number)
     if not paths:
         raise FileNotFoundError(f"no staged games under {stage}")
+    identifiers = [staged_game_number(path) for path in paths]
+    if len(identifiers) != len(set(identifiers)):
+        raise ValueError(f"duplicate staged-game number under {stage}")
     return paths
+
+
+def staged_game_number(path: Path) -> int:
+    """Read the stable source-game number from one staged archive name."""
+
+    match = _STAGED_GAME_NAME.fullmatch(path.name)
+    if match is None:
+        raise ValueError(f"invalid staged-game archive name: {path.name}")
+    return int(match.group(1))
 
 
 def plan_corpus(
@@ -63,27 +80,32 @@ def plan_corpus(
 ) -> dict[str, np.ndarray]:
     """Enumerate every staged chunk and apply one seeded permutation.
 
-    A game offset numbers the games of this stage after the games of every stage
-    packed before it, so a corpus built in pieces still carries one set of
-    source-game ids and the merged plan can be audited as a whole.
+    The number in each ``game-N.zip`` name is the stable source identity.  An
+    optional offset is only an explicit translation for a stage whose archive
+    names start at zero; missing archives must never renumber the games after
+    them.
     """
 
     games: list[int] = []
     members: list[int] = []
     lengths: list[int] = []
-    for game_index, path in enumerate(game_paths):
+    path_indices: list[int] = []
+    for path_index, path in enumerate(game_paths):
+        source_game = staged_game_number(path) + game_offset
         chunk_lengths = [int(value) for value in read_chunk_archive_meta(path)["chunkLengths"]]
-        games.extend([game_index + game_offset] * len(chunk_lengths))
+        games.extend([source_game] * len(chunk_lengths))
+        path_indices.extend([path_index] * len(chunk_lengths))
         members.extend(range(len(chunk_lengths)))
         lengths.extend(chunk_lengths)
     if not lengths:
         raise ValueError("staged games contain no chunks")
     order = np.random.default_rng(seed).permutation(len(lengths))
     return {
-        # The stage's own first game id, so a loader holding this stage's files
-        # can turn a global id back into an index into its own list.
         "game_offset": np.asarray(game_offset, dtype=np.uint32),
         "source_game": np.asarray(games, dtype=np.uint32)[order],
+        # File lookup is independent of source identity.  This is what keeps a
+        # recoverable conversion failure from shifting every later game.
+        "source_path": np.asarray(path_indices, dtype=np.uint32)[order],
         "source_member": np.asarray(members, dtype=np.uint16)[order],
         "length": np.asarray(lengths, dtype=np.uint16)[order],
     }
@@ -100,7 +122,8 @@ def write_plan(path: Path, plan: dict[str, np.ndarray]) -> None:
 def read_plan(path: Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as source:
         arrays = {name: source[name] for name in source.files}
-    if arrays.pop("format").item() != PLAN_FORMAT:
+    format_name = arrays.pop("format").item()
+    if format_name != PLAN_FORMAT and format_name not in LEGACY_PLAN_FORMATS:
         raise ValueError(f"unsupported plan format in {path}")
     return arrays
 
@@ -281,20 +304,24 @@ def load_slot(
 ) -> dict[str, np.ndarray]:
     """Read every chunk a slot needs, opening each staged game at most once."""
 
-    offset = int(plan["game_offset"]) if "game_offset" in plan else 0
-    # The plan numbers games globally so a corpus built in pieces keeps one set
-    # of ids; only the file lookup needs this stage's own numbering.
     games = plan["source_game"][slot.start : slot.stop]
+    if "source_path" in plan:
+        path_indices = plan["source_path"][slot.start : slot.stop]
+    else:
+        # Compatibility with plans written before file identity was separated
+        # from source identity.  Those plans numbered paths consecutively.
+        offset = int(plan["game_offset"]) if "game_offset" in plan else 0
+        path_indices = games - offset
     members = plan["source_member"][slot.start : slot.stop]
     lengths = plan["length"][slot.start : slot.stop]
 
     positions_by_game: dict[int, list[int]] = defaultdict(list)
-    for position, game in enumerate((games - offset).tolist()):
-        positions_by_game[game].append(position)
+    for position, path_index in enumerate(path_indices.tolist()):
+        positions_by_game[path_index].append(position)
 
     payloads: list[bytes | None] = [None] * len(games)
-    for game, positions in sorted(positions_by_game.items()):
-        with zipfile.ZipFile(game_paths[game], "r") as archive:
+    for path_index, positions in sorted(positions_by_game.items()):
+        with zipfile.ZipFile(game_paths[path_index], "r") as archive:
             for position in positions:
                 member = int(members[position])
                 payloads[position] = archive.read(f"chunk_{member:05d}.npz")
@@ -361,6 +388,7 @@ def audit_packs(
 
     expected_samples = int(plan["length"].sum())
     game_count = int(plan["source_game"].max()) + 1
+    unique_game_count = len(np.unique(plan["source_game"]))
     plan_samples = np.bincount(
         np.repeat(plan["source_game"], plan["length"]), minlength=game_count
     )
@@ -399,7 +427,7 @@ def audit_packs(
         "verified": True,
         "samples": total,
         "packs": len(entries),
-        "sourceGames": game_count,
+        "sourceGames": unique_game_count,
         "plannedChunks": len(plan["length"]),
         "adjacentSameGamePairs": 0,
     }
