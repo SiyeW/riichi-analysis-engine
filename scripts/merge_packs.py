@@ -6,9 +6,9 @@ converted and packed in segments, and each segment's staged games are deleted as
 soon as that segment is packed.
 
 Training still needs one order over one corpus, so this command joins the
-segments back together: the packs move into the pack directory under one running
-index, the plans concatenate (their source-game ids were numbered globally when
-they were written), and the audit runs on the merged result.
+segments through one manifest and one concatenated plan.  The packs stay in
+their segment directories: validating every input before writing the merged
+metadata makes a failed merge non-destructive and keeps restarts cheap.
 
     python scripts/merge_packs.py --root data/processed/v4/packs-train-2025
 """
@@ -22,7 +22,9 @@ from pathlib import Path
 import numpy as np
 
 from riichi_analysis_engine.packing import (
+    LEGACY_MANIFEST_FORMATS,
     MANIFEST_FORMAT,
+    SUPPORTED_MANIFEST_FORMATS,
     audit_packs,
     read_plan,
     write_manifest,
@@ -51,12 +53,13 @@ def segment_names(root: Path) -> list[str]:
 def merge(root: Path, names: list[str]) -> dict[str, object]:
     entries: list[dict[str, object]] = []
     plans: list[dict[str, np.ndarray]] = []
-    games = 0
+    seen_games: set[int] = set()
     shared: dict[str, object] = {}
     for name in names:
         segment = root / name
         manifest = json.loads((segment / "manifest.json").read_text(encoding="utf-8"))
-        if manifest.get("format") != MANIFEST_FORMAT:
+        manifest_format = manifest.get("format")
+        if manifest_format not in SUPPORTED_MANIFEST_FORMATS:
             raise ValueError(f"{segment} declares an unsupported manifest format")
         for key in ("seed", "packSamples"):
             if key in shared and manifest.get(key) != shared[key]:
@@ -66,27 +69,37 @@ def merge(root: Path, names: list[str]) -> dict[str, object]:
         plan = read_plan(segment / "plan.npz")
         identifiers = np.unique(plan["source_game"])
         offset = int(manifest.get("gameOffset", 0))
-        if offset != games:
-            raise ValueError(f"segment {name} starts at game {offset}, expected {games}")
-        if int(identifiers.min()) != games or int(identifiers.max()) != games + len(identifiers) - 1:
-            raise ValueError(f"segment {name} does not number its games consecutively")
-        if len(identifiers) != int(manifest["sourceGames"]) - offset:
+        declared_games = int(manifest["sourceGames"])
+        if manifest_format in LEGACY_MANIFEST_FORMATS:
+            # Version 1 stored the exclusive upper bound rather than the count.
+            declared_games -= offset
+        if len(identifiers) != declared_games:
             raise ValueError(f"segment {name} holds {len(identifiers)} games, its manifest says more")
+        overlap = seen_games.intersection(int(value) for value in identifiers)
+        if overlap:
+            raise ValueError(f"segment {name} repeats source game {min(overlap)}")
+        seen_games.update(int(value) for value in identifiers)
 
         for entry in manifest["packs"]:
             source = segment / str(entry["pack"])
-            destination = root / f"pack-{len(entries):05d}.npz"
-            source.replace(destination)
-            entries.append({**entry, "pack": destination.name})
+            if not source.is_file():
+                raise FileNotFoundError(source)
+            entries.append({**entry, "pack": source.relative_to(root).as_posix()})
         plans.append(plan)
-        games += len(identifiers)
 
     if not entries:
         raise ValueError("no packed segments were found")
+    ordered_games = sorted(seen_games)
+    expected_games = list(range(len(ordered_games)))
+    if ordered_games != expected_games:
+        missing = next(
+            (game for game, actual in enumerate(ordered_games) if game != actual),
+            len(ordered_games),
+        )
+        raise ValueError(f"the merged corpus is missing source game {missing}")
     merged = {
         name: np.concatenate([plan[name] for plan in plans])
-        for name in sorted(plans[0])
-        if name != "game_offset"
+        for name in ("source_game", "source_member", "length")
     }
     # The merged corpus starts at its first game, whatever the first segment
     # was numbered from.
@@ -100,7 +113,7 @@ def merge(root: Path, names: list[str]) -> dict[str, object]:
         "packSamples": shared.get("packSamples"),
         "samples": int(merged["length"].sum()),
         "chunks": len(merged["length"]),
-        "sourceGames": games,
+        "sourceGames": len(seen_games),
         "segments": names,
         "packs": entries,
     }

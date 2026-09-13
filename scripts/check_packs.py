@@ -138,7 +138,7 @@ def main() -> None:
     stream = game_stream(arguments.packs, manifest)
     if len(stream) != int(manifest["samples"]):
         raise SystemExit(f"packs hold {len(stream)} samples, the manifest says {manifest['samples']}")
-    if int(stream.max()) + 1 != int(manifest["sourceGames"]):
+    if len(np.unique(stream)) != int(manifest["sourceGames"]):
         raise SystemExit("the packs hold a different number of source games than the manifest says")
 
     report: dict[str, object] = {
