@@ -425,6 +425,18 @@ def test_merge_refuses_a_gap_without_moving_segment_packs(scratch: Path) -> None
     assert not (root / "manifest.json").exists()
 
 
+def test_merge_checks_the_expected_corpus_size_before_writing(scratch: Path) -> None:
+    root = scratch / "packs"
+    segment = root / "a"
+    pack_segment(stage_corpus(scratch, games=4), segment)
+
+    with pytest.raises(ValueError, match="holds 4 source games, expected 5"):
+        merge_packs.merge(root, ["a"], expected_source_games=5)
+
+    assert list(segment.glob("pack-*.npz"))
+    assert not (root / "manifest.json").exists()
+
+
 def test_audit_rejects_a_dropped_pack(scratch: Path) -> None:
     stage = stage_corpus(scratch)
     output = scratch / "packs"
