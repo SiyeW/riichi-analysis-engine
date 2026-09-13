@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -130,12 +131,23 @@ def write_packed_shard(path: str | Path, packed: dict[str, np.ndarray]) -> None:
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary = _temporary_sibling(destination)
     payload = dict(packed)
     payload.setdefault("storage_format", np.asarray(STORAGE_FORMAT))
-    with temporary.open("wb") as handle:
-        np.savez_compressed(handle, **payload)
-    os.replace(temporary, destination)
+    try:
+        with temporary.open("wb") as handle:
+            np.savez_compressed(handle, **payload)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _temporary_sibling(destination: Path) -> Path:
+    """Return a collision-free temporary name beside an atomic destination."""
+
+    return destination.with_name(
+        f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
 
 
 def read_packed_shard(path: str | Path) -> dict[str, np.ndarray]:
@@ -261,34 +273,37 @@ def save_chunk_archive(
     total = _sample_count(packed)
     destinations = Path(path)
     destinations.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destinations.with_suffix(destinations.suffix + ".tmp")
+    temporary = _temporary_sibling(destinations)
     lengths: list[int] = []
-    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
-        for member_index, start in enumerate(range(0, total, chunk_samples)):
-            stop = min(total, start + chunk_samples)
-            chunk = {"storage_format": packed["storage_format"]}
-            for name, value in packed.items():
-                if name not in {"storage_format", "obs_offsets", "obs_values"}:
-                    chunk[name] = value[start:stop]
-            # The sparse values are not one per sample, so they are cut by the
-            # offset window rather than by the sample range. A chunk keeps one
-            # more offset than it has samples so its own value runs stay
-            # addressable after the rebase.
-            offsets = packed["obs_offsets"][start : stop + 1]
-            chunk["obs_offsets"] = offsets - offsets[0]
-            chunk["obs_values"] = packed["obs_values"][int(offsets[0]) : int(offsets[-1])]
-            buffer = io.BytesIO()
-            np.savez_compressed(buffer, **chunk)
-            archive.writestr(f"chunk_{member_index:05d}.npz", buffer.getvalue())
-            lengths.append(stop - start)
-        meta: dict[str, object] = {
-            "format": STAGED_GAME_FORMAT,
-            "samples": total,
-            "chunkSamples": chunk_samples,
-            "chunkLengths": lengths,
-        }
-        archive.writestr("meta.json", json.dumps(meta, separators=(",", ":")))
-    os.replace(temporary, destinations)
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
+            for member_index, start in enumerate(range(0, total, chunk_samples)):
+                stop = min(total, start + chunk_samples)
+                chunk = {"storage_format": packed["storage_format"]}
+                for name, value in packed.items():
+                    if name not in {"storage_format", "obs_offsets", "obs_values"}:
+                        chunk[name] = value[start:stop]
+                # The sparse values are not one per sample, so they are cut by the
+                # offset window rather than by the sample range. A chunk keeps one
+                # more offset than it has samples so its own value runs stay
+                # addressable after the rebase.
+                offsets = packed["obs_offsets"][start : stop + 1]
+                chunk["obs_offsets"] = offsets - offsets[0]
+                chunk["obs_values"] = packed["obs_values"][int(offsets[0]) : int(offsets[-1])]
+                buffer = io.BytesIO()
+                np.savez_compressed(buffer, **chunk)
+                archive.writestr(f"chunk_{member_index:05d}.npz", buffer.getvalue())
+                lengths.append(stop - start)
+            meta: dict[str, object] = {
+                "format": STAGED_GAME_FORMAT,
+                "samples": total,
+                "chunkSamples": chunk_samples,
+                "chunkLengths": lengths,
+            }
+            archive.writestr("meta.json", json.dumps(meta, separators=(",", ":")))
+        os.replace(temporary, destinations)
+    finally:
+        temporary.unlink(missing_ok=True)
     return meta
 
 

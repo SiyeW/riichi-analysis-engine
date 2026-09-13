@@ -1,6 +1,7 @@
 import io
 import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -166,6 +167,18 @@ def test_chunk_archive_round_trip(scratch: Path) -> None:
     np.testing.assert_allclose(restored["obs"], arrays["obs"], rtol=0, atol=5e-4)
     for name in ("action_mask", "policy", "perspective", "event_index", "kyoku_index"):
         np.testing.assert_array_equal(restored[name], arrays[name])
+
+
+def test_concurrent_archive_writers_do_not_share_a_temporary_file(scratch: Path) -> None:
+    arrays = sample_arrays(20, kyoku=3)
+    path = scratch / "game-000000.zip"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: save_chunk_archive(path, arrays, 16), range(2)))
+
+    assert [result["samples"] for result in results] == [20, 20]
+    assert read_chunk_archive_meta(path)["chunkLengths"] == [16, 4]
+    assert not list(scratch.glob("*.tmp"))
 
 
 def test_each_chunk_holds_the_values_its_own_offsets_address(scratch: Path) -> None:
