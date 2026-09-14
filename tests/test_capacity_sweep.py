@@ -68,7 +68,7 @@ def test_train_command_keeps_all_comparison_controls(tmp_path: Path) -> None:
             "train": tmp_path / "train",
             "validation": tmp_path / "validation",
             "batch_size": 32,
-            "checkpoint_every": 1000,
+            "checkpoint_every_samples": 1_000_000,
             "device": "cuda",
             "seed": 20252026,
         },
@@ -80,5 +80,6 @@ def test_train_command_keeps_all_comparison_controls(tmp_path: Path) -> None:
     assert command[command.index("--max-steps") + 1] == "5000"
     assert command[command.index("--batch-size") + 1] == "32"
     assert command[command.index("--seed") + 1] == "20252026"
+    assert command[command.index("--checkpoint-every-samples") + 1] == "1000000"
     assert command[command.index("--analysis-channels") + 1] == "48"
     assert "--epochs" not in command

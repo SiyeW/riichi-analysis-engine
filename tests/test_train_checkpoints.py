@@ -1,12 +1,16 @@
 import json
+import random
 from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from riichi_analysis_engine.train import (
     _label_entropy,
+    capture_random_state,
     prune_numbered_checkpoints,
+    restore_random_state,
     resolve_resume_path,
     write_dashboard,
     write_pointer,
@@ -29,7 +33,7 @@ def test_label_entropy_of_a_uniform_distribution_is_log_of_the_classes() -> None
     assert _label_entropy(np.asarray([4, 0, 0, 0])) == 0.0
 
 
-def test_dashboard_drops_values_that_repeat_or_do_not_apply() -> None:
+def test_dashboard_keeps_distinct_metrics_with_the_same_value() -> None:
     writer = RecordingWriter()
     write_dashboard(
         writer,
@@ -44,12 +48,37 @@ def test_dashboard_drops_values_that_repeat_or_do_not_apply() -> None:
     )
 
     tags = [tag for tag, _, _ in writer.scalars]
-    assert tags == ["Validation/policy", "Metrics/policyAccuracy", "Selection/core_score"]
+    assert tags == [
+        "Validation/policy",
+        "Validation/shanten",
+        "Metrics/policyAccuracy",
+        "Selection/core_score",
+    ]
     assert all(step == 100 for _, _, step in writer.scalars)
 
 
 def test_a_run_without_tensorboard_still_validates() -> None:
     write_dashboard(None, {"policy": 1.0}, step=1)
+
+
+def test_random_state_round_trips_all_cpu_generators(tmp_path: Path) -> None:
+    random.seed(17)
+    np.random.seed(23)
+    torch.manual_seed(29)
+    state_path = tmp_path / "random-state.pt"
+    torch.save(capture_random_state(), state_path)
+    state = torch.load(state_path, map_location="cpu", weights_only=True)
+    expected = (random.random(), np.random.random(), torch.rand(3))
+
+    random.random()
+    np.random.random()
+    torch.rand(3)
+    restore_random_state(state)
+
+    actual = (random.random(), np.random.random(), torch.rand(3))
+    assert actual[0] == expected[0]
+    assert actual[1] == expected[1]
+    assert torch.equal(actual[2], expected[2])
 
 
 def test_pointer_only_moves_forward(tmp_path: Path) -> None:

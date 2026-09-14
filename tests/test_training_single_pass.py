@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import shutil
 import uuid
@@ -45,7 +46,7 @@ def run_training(
         str(max_samples),
         "--max-validation-samples",
         "8",
-        "--checkpoint-every",
+        "--checkpoint-every-samples",
         "0",
         "--device",
         "cpu",
@@ -117,3 +118,27 @@ def test_training_resumes_forward_and_completes_one_pass(
 
     with pytest.raises(RuntimeError, match="already completed"):
         run_training(monkeypatch, packs, run, max_samples=0, resume=complete)
+
+
+def test_training_checkpoint_is_durable_before_validation(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packs = pack_directory(scratch, training_targets=True)
+    run = scratch / "run"
+
+    def interrupt_validation(*_args: object, **_kwargs: object) -> dict[str, float]:
+        pointer = json.loads((run / "latest_checkpoint.json").read_text(encoding="utf-8"))
+        assert pointer["samplesSeen"] == 16
+        assert pointer["validationComplete"] is False
+        checkpoint = torch.load(pointer["path"], map_location="cpu", weights_only=True)
+        assert checkpoint["trainingCursor"]["nextSample"] == 16
+        assert checkpoint["validation"] is None
+        raise train.TrainingInterrupted
+
+    monkeypatch.setattr(train, "validate", interrupt_validation)
+    with pytest.raises(SystemExit) as stopped:
+        run_training(monkeypatch, packs, run, max_samples=16)
+
+    assert stopped.value.code == 130
+    pointer = json.loads((run / "latest_checkpoint.json").read_text(encoding="utf-8"))
+    assert pointer["validationComplete"] is False

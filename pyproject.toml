@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 train = [
+  "tensorboard>=2.19,<3",
   "tqdm>=4.67,<5",
 ]
 build = [

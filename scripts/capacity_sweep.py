@@ -145,8 +145,8 @@ def make_train_command(
         str(args.batch_size),
         "--max-steps",
         str(max_steps),
-        "--checkpoint-every",
-        str(args.checkpoint_every),
+        "--checkpoint-every-samples",
+        str(args.checkpoint_every_samples),
         "--device",
         args.device,
         "--seed",
@@ -249,7 +249,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-steps", type=int, default=5000)
-    parser.add_argument("--checkpoint-every", type=int, default=1000)
+    parser.add_argument("--checkpoint-every-samples", type=int, default=1_000_000)
     parser.add_argument("--seed", type=int, default=20252026)
     parser.add_argument(
         "--point",
