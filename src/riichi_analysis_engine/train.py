@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
 import os
 import platform
+import random
 import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +25,10 @@ from .kyoku_outcome import OUTCOME_DEAL_IN_INDICATORS, OUTCOME_WINNER_INDICATORS
 from .losses import LOSS_TERMS, LearnedUncertaintyBalancer, multitask_loss, score_class_indices
 from .model import RiichiAnalysisModel, count_parameters
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
+
+
+class TrainingInterrupted(Exception):
+    """Stop at a boundary whose state can be resumed without replaying data."""
 
 
 def source_metadata() -> dict[str, object]:
@@ -167,6 +174,7 @@ def validate(
     device: torch.device,
     *,
     progress_every: int = 100,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, float]:
     model.eval()
     totals: dict[str, float] = {"total": 0.0, **{name: 0.0 for name in LOSS_TERMS}}
@@ -187,6 +195,8 @@ def validate(
         metric_counts[name] = metric_counts.get(name, 0) + values.numel()
 
     for batch in loader:
+        if should_stop is not None and should_stop():
+            raise TrainingInterrupted
         batch = move_batch(batch, device)
         outputs = model(batch["obs"].float())
         total, losses, _active, weights = multitask_loss(outputs, batch, balancer)
@@ -196,11 +206,11 @@ def validate(
         for name, value in weights.items():
             balance_totals[name] += float(value)
         policy_valid = batch["policy"] >= 0
-        policy_labels += np.bincount(
-            batch["policy"][policy_valid].numpy(), minlength=46
+        policy_labels += (
+            torch.bincount(batch["policy"][policy_valid], minlength=46).cpu().numpy()
         )
-        shanten_labels += np.bincount(
-            batch["shanten"].reshape(-1).numpy(), minlength=7
+        shanten_labels += (
+            torch.bincount(batch["shanten"].reshape(-1), minlength=7).cpu().numpy()
         )
         policy_logits = outputs["policy"].masked_fill(~batch["action_mask"], -torch.inf)
         add_metric(
@@ -292,6 +302,8 @@ def validate(
         batches += 1
         if progress_every > 0 and batches % progress_every == 0:
             print(json.dumps({"phase": "validation-progress", "batches": batches}))
+    if should_stop is not None and should_stop():
+        raise TrainingInterrupted
     result = {name: value / max(1, batches) for name, value in totals.items()}
     nulls = {
         "policy": _label_entropy(policy_labels),
@@ -426,15 +438,10 @@ def open_dashboard(run: Path) -> object | None:
 
 
 def write_dashboard(writer: object | None, metrics: dict[str, float], step: int) -> None:
-    """Write the validation dashboard, dropping metrics that carry no signal.
-
-    A metric that never moves, or that repeats a value another tag already has,
-    is noise on a dashboard that has to stay readable over days.
-    """
+    """Write every finite validation metric under a stable TensorBoard tag."""
 
     if writer is None:
         return
-    seen: dict[float, str] = {}
     for name, value in metrics.items():
         if name == "total" or name.startswith("metric/"):
             tag = "Metrics/" + name.removeprefix("metric/")
@@ -444,10 +451,52 @@ def write_dashboard(writer: object | None, metrics: dict[str, float], step: int)
             tag = "Validation/" + name
         if not isinstance(value, float) or value != value:
             continue
-        if value in seen:
-            continue
-        seen[value] = tag
         writer.add_scalar(tag, value, step)
+
+
+def close_dashboard(writer: object | None) -> None:
+    if writer is None:
+        return
+    writer.flush()
+    writer.close()
+
+
+def capture_random_state() -> dict[str, object]:
+    numpy_state = np.random.get_state()
+    return {
+        "python": random.getstate(),
+        "numpy": {
+            "name": numpy_state[0],
+            "keys": torch.from_numpy(numpy_state[1].copy()),
+            "position": numpy_state[2],
+            "hasGauss": numpy_state[3],
+            "cachedGaussian": numpy_state[4],
+        },
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def restore_random_state(state: object) -> None:
+    if not isinstance(state, dict):
+        raise RuntimeError("resume checkpoint has no random-number state")
+    numpy_state = state.get("numpy")
+    if not isinstance(numpy_state, dict) or not isinstance(numpy_state.get("keys"), torch.Tensor):
+        raise RuntimeError("resume checkpoint has incompatible NumPy random state")
+    random.setstate(state["python"])
+    np.random.set_state(
+        (
+            str(numpy_state["name"]),
+            numpy_state["keys"].cpu().numpy().astype(np.uint32, copy=False),
+            int(numpy_state["position"]),
+            int(numpy_state["hasGauss"]),
+            float(numpy_state["cachedGaussian"]),
+        )
+    )
+    torch.set_rng_state(state["torch"])
+    cuda_state = state.get("cuda")
+    if torch.cuda.is_available() and isinstance(cuda_state, list) and cuda_state:
+        torch.cuda.set_rng_state_all(cuda_state)
 
 
 def save_checkpoint(
@@ -489,6 +538,7 @@ def save_checkpoint(
                 "terms": list(balancer.names),
                 "state": balancer.state_dict(),
             },
+            "randomState": capture_random_state(),
             "parameters": parameters,
             "predictionValues": {
                 "dora": list(DORA_VALUES),
@@ -524,7 +574,7 @@ def main() -> None:
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-validation-samples", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=0)
-    parser.add_argument("--checkpoint-every", type=int, default=2000)
+    parser.add_argument("--checkpoint-every-samples", type=int, default=1_000_000)
     parser.add_argument(
         "--warmup-steps",
         type=int,
@@ -538,15 +588,20 @@ def main() -> None:
         default=0.0,
         help="rate the warmup reaches; defaults to the plateau rate",
     )
-    parser.add_argument("--keep-checkpoints", type=int, default=5)
-    parser.add_argument("--best-metric", default="Selection/core_score")
+    parser.add_argument("--keep-checkpoints", type=int, default=3)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int, default=314159)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     if args.max_steps < 0:
         raise ValueError("max steps must be non-negative")
+    if args.checkpoint_every_samples < 0:
+        raise ValueError("checkpoint interval must be non-negative")
+    if args.keep_checkpoints < 0:
+        raise ValueError("checkpoint retention must be non-negative")
 
+    random.seed(args.seed)
+    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -610,6 +665,7 @@ def main() -> None:
         balancer.load_state_dict(balance["state"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         scaler.load_state_dict(checkpoint["scaler"])
+        restore_random_state(checkpoint.get("randomState"))
         samples_seen, step = resume_training_cursor(checkpoint, datasets, args.batch_size)
         if step_budget_reached(step, args.max_steps):
             raise RuntimeError("resume budget is already exhausted; increase --max-steps")
@@ -673,6 +729,7 @@ def main() -> None:
     )
     log_path = args.run / "metrics.jsonl"
     writer = open_dashboard(args.run)
+    atexit.register(close_dashboard, writer)
 
     interrupt_requested = False
 
@@ -711,8 +768,15 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    best_score = None
     stop_reason: str | None = None
+    last_log_time = started
+    last_log_samples = samples_seen
+    checkpoint_interval = args.checkpoint_every_samples
+    next_checkpoint_sample = (
+        ((samples_seen // checkpoint_interval) + 1) * checkpoint_interval
+        if checkpoint_interval > 0
+        else 0
+    )
     model.train()
     for batch in train_loader:
         if interrupt_requested:
@@ -764,11 +828,15 @@ def main() -> None:
         step += 1
         samples_seen += len(batch["policy"])
         if step == 1 or step % 100 == 0:
+            now = time.perf_counter()
+            interval_seconds = max(now - last_log_time, 1e-9)
+            interval_samples = samples_seen - last_log_samples
             record = {
                 "phase": "train",
                 "step": step,
                 "samples": samples_seen,
-                "elapsedSeconds": time.perf_counter() - started,
+                "elapsedSeconds": now - started,
+                "samplesPerSecond": interval_samples / interval_seconds,
                 "total": float(total.detach()),
                 **{name: float(value.detach()) for name, value in losses.items()},
                 **{
@@ -788,15 +856,30 @@ def main() -> None:
                     writer.add_scalar(f"Loss/train_{name}_batch", float(value.detach()), step)
                 for name, value in weights.items():
                     writer.add_scalar(f"LossBalance/{name}", float(value), step)
+                    if _active[name]:
+                        writer.add_scalar(
+                            f"LossWeighted/{name}",
+                            float((value * losses[name]).detach()),
+                            step,
+                        )
                 writer.add_scalar("Gradient/norm", gradient_norm, step)
                 writer.add_scalar("Gradient/max", gradient_max, step)
                 writer.add_scalar("LR", optimizer.param_groups[0]["lr"], step)
-        if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
+                writer.add_scalar("Progress/samples", samples_seen, step)
+                writer.add_scalar("Progress/samples_per_second", record["samplesPerSecond"], step)
+                if device.type == "cuda":
+                    writer.add_scalar("CUDA/allocated_mib", record["peakAllocatedMiB"], step)
+                    writer.add_scalar("CUDA/reserved_mib", record["peakReservedMiB"], step)
+                    writer.add_scalar("AMP/scale", scaler.get_scale(), step)
+            last_log_time = now
+            last_log_samples = samples_seen
+        if checkpoint_interval > 0 and samples_seen >= next_checkpoint_sample:
             rolling = args.run / f"ckpt-{step:09d}.pt"
             save_run_checkpoint(rolling)
             write_pointer(args.run, rolling, step=step, samplesSeen=samples_seen)
             prune_numbered_checkpoints(args.run, args.keep_checkpoints)
-            save_run_checkpoint(args.run / "checkpoint-latest.pt")
+            while next_checkpoint_sample <= samples_seen:
+                next_checkpoint_sample += checkpoint_interval
         if step_budget_reached(step, args.max_steps):
             stop_reason = "max-steps"
             break
@@ -813,6 +896,8 @@ def main() -> None:
             samplesSeen=samples_seen,
         )
         print(json.dumps({"phase": "interrupted", "step": step}), flush=True)
+        close_dashboard(writer)
+        atexit.unregister(close_dashboard)
         raise SystemExit(130)
 
     if stop_reason is None:
@@ -827,7 +912,33 @@ def main() -> None:
         )
     pass_complete = samples_seen == train_manifest.samples
 
-    metrics = validate(model, balancer, validation_loader, device)
+    checkpoint_name = "checkpoint-complete.pt" if pass_complete else f"checkpoint-step-{step}.pt"
+    final_checkpoint = args.run / checkpoint_name
+    # The training boundary is durable before validation starts. A validation
+    # error or interruption must never discard the newest trained samples.
+    save_run_checkpoint(final_checkpoint, pass_complete=pass_complete)
+    write_pointer(
+        args.run,
+        final_checkpoint,
+        step=step,
+        samplesSeen=samples_seen,
+        passComplete=pass_complete,
+        validationComplete=False,
+    )
+
+    try:
+        metrics = validate(
+            model,
+            balancer,
+            validation_loader,
+            device,
+            should_stop=lambda: interrupt_requested,
+        )
+    except TrainingInterrupted:
+        print(json.dumps({"phase": "validation-interrupted", "step": step}), flush=True)
+        close_dashboard(writer)
+        atexit.unregister(close_dashboard)
+        raise SystemExit(130)
     record = {
         "phase": "validation",
         "step": step,
@@ -848,7 +959,8 @@ def main() -> None:
             for rank, (value, action) in enumerate(
                 zip(top.values.tolist(), top.indices.tolist(), strict=True), start=1
             ):
-                writer.add_scalar(f"Fixture/policy_top{rank}_action{action}", value, step)
+                writer.add_scalar(f"Fixture/policy_top{rank}_probability", value, step)
+                writer.add_scalar(f"Fixture/policy_top{rank}_action", action, step)
             # Sample zero, first opponent: the head predicts one shanten
             # per opponent, so the probe keeps to a fixed slice of it.
             for shanten, probability in enumerate(
@@ -856,25 +968,6 @@ def main() -> None:
             ):
                 writer.add_scalar(f"Fixture/shanten_p{shanten}", probability, step)
             writer.add_scalar("Fixture/max_policy", float(policy.max()), step)
-    score = metrics.get(args.best_metric)
-    if score is not None and (best_score is None or float(score) < best_score):
-        best_score = float(score)
-        save_run_checkpoint(
-            args.run / "best-core.pth",
-            validation=metrics,
-            pass_complete=pass_complete,
-        )
-        write_pointer(
-            args.run,
-            args.run / "best-core.pth",
-            step=step,
-            samplesSeen=samples_seen,
-            bestMetric=args.best_metric,
-            bestScore=best_score,
-        )
-        print(json.dumps({"phase": "best", args.best_metric: best_score, "step": step}))
-    checkpoint_name = "checkpoint-complete.pt" if pass_complete else f"checkpoint-step-{step}.pt"
-    final_checkpoint = args.run / checkpoint_name
     save_run_checkpoint(
         final_checkpoint,
         validation=metrics,
@@ -886,7 +979,10 @@ def main() -> None:
         step=step,
         samplesSeen=samples_seen,
         passComplete=pass_complete,
+        validationComplete=True,
     )
+    close_dashboard(writer)
+    atexit.unregister(close_dashboard)
 
 
 if __name__ == "__main__":
