@@ -7,10 +7,14 @@ from riichi_analysis_engine.losses import (
     LOSS_TERMS,
     LearnedUncertaintyBalancer,
     _masked_mean,
+    masked_score_logits,
+    opponent_dealer_mask,
     score_class_indices,
     multitask_loss,
 )
 from riichi_analysis_engine.model import RiichiAnalysisModel
+from riichi_analysis_engine.observation_layout import JIKAZE_CHANNEL, WIND_TILE_START
+from riichi_analysis_engine.prediction_values import SCORE_VALUES, score_class_mask
 
 
 def test_masked_mean_does_not_multiply_non_finite_unselected_values() -> None:
@@ -35,6 +39,32 @@ def test_score_class_indices_use_actual_settlement_values() -> None:
 def test_score_class_indices_reject_invalid_values() -> None:
     with pytest.raises(ValueError, match="700"):
         score_class_indices(torch.tensor([700]))
+
+
+def test_dealer_status_is_derived_from_existing_observation() -> None:
+    observation = torch.zeros(4, OBS_CHANNELS, TILE_TYPES)
+    for wind in range(4):
+        observation[wind, JIKAZE_CHANNEL, WIND_TILE_START + wind] = 1
+
+    assert opponent_dealer_mask(observation).tolist() == [
+        [False, False, False],
+        [False, False, True],
+        [False, True, False],
+        [True, False, False],
+    ]
+
+
+def test_score_logits_mask_impossible_dealer_classes() -> None:
+    observation = torch.zeros(2, OBS_CHANNELS, TILE_TYPES)
+    observation[0, JIKAZE_CHANNEL, WIND_TILE_START] = 1
+    observation[1, JIKAZE_CHANNEL, WIND_TILE_START + 3] = 1
+    outputs = {"score_distribution": torch.zeros(2, 3, len(SCORE_VALUES))}
+
+    logits = masked_score_logits(outputs, observation)
+
+    assert torch.isfinite(logits[0, 0]).tolist() == list(score_class_mask(dealer=False))
+    assert torch.isfinite(logits[1, 0]).tolist() == list(score_class_mask(dealer=True))
+    assert torch.isfinite(logits[1, 1]).tolist() == list(score_class_mask(dealer=False))
 
 
 def test_uncertainty_balancer_learns_only_from_active_terms() -> None:

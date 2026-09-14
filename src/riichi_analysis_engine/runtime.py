@@ -27,7 +27,7 @@ from .constants import (
 from .kyoku_outcome import OUTCOME_CLASSES, outcome_marginals
 from .model import RiichiAnalysisModel
 from .observations import add_all_player_ranks
-from .prediction_values import DORA_VALUES, SCORE_VALUES
+from .prediction_values import DORA_VALUES, SCORE_VALUES, score_class_mask
 from .rule_certainties import (
     PublicRuleState,
     apply_opponent_rule_certainties,
@@ -237,6 +237,7 @@ class AnalysisRuntime:
             "riichi-analysis-model-v4": 4,
             "riichi-analysis-model-v5": 5,
             "riichi-analysis-model-v6": 6,
+            "riichi-analysis-model-v7": 7,
         }
         if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
@@ -251,21 +252,25 @@ class AnalysisRuntime:
                 "predictionValues"
             ) != expected_values:
                 raise RuntimeError("weight file uses different prediction values")
-        if self.format_version == 6:
+        if self.format_version in {6, 7}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict):
-                raise RuntimeError("v6 weight file has no architecture metadata")
+                raise RuntimeError("weight file has no architecture metadata")
             try:
                 model_architecture = ModelArchitecture.from_dict(architecture.get("model"))
             except ValueError as error:
-                raise RuntimeError(f"v6 weight file has invalid architecture metadata: {error}") from error
-            self.model = RiichiAnalysisModel(architecture=model_architecture)
+                raise RuntimeError(f"weight file has invalid architecture metadata: {error}") from error
+            self.model = RiichiAnalysisModel(
+                format_version=self.format_version, architecture=model_architecture
+            )
         else:
             self.model = RiichiAnalysisModel(format_version=self.format_version)
         self.model.load_state_dict(payload["model"], strict=True)
         self.model.to(self.device).eval()
         self.player_state_type = _load_player_state()
-        observation_channels = OBS_CHANNELS if self.format_version == 6 else MORTAL_OBS_CHANNELS
+        observation_channels = (
+            OBS_CHANNELS if self.format_version in {6, 7} else MORTAL_OBS_CHANNELS
+        )
         with torch.inference_mode():
             self.model(torch.zeros(1, observation_channels, 34, device=self.device))
 
@@ -275,6 +280,8 @@ class AnalysisRuntime:
         if self.format_version == 1:
             return ["expected-value"]
         if protocol_minor >= 2:
+            if output_id == "opponent-score" and self.format_version >= 7:
+                return ["distribution"]
             return ["distribution", "point-estimate"]
         if output_id == "opponent-score":
             return ["distribution", "expected-value"]
@@ -290,7 +297,7 @@ class AnalysisRuntime:
         self, state: Any, score_state: PublicScoreState, *, at_kan_select: bool
     ) -> tuple[np.ndarray, np.ndarray]:
         observation, mask = state.encode_obs(4, at_kan_select)
-        if self.format_version == 6:
+        if self.format_version in {6, 7}:
             observation = add_all_player_ranks(observation, score_state.relative(state.player_id))
         return np.asarray(observation, dtype=np.float32), np.asarray(mask, dtype=bool)
 
@@ -326,6 +333,12 @@ class AnalysisRuntime:
         rule_state = PublicRuleState.from_events(events)
         order = [(controlled_seat + offset) % 4 for offset in range(4)]
         opponents = relative_players(controlled_seat)
+        start_kyoku = next(
+            (event for event in reversed(events) if event.get("type") == "start_kyoku"), None
+        )
+        if start_kyoku is None:
+            raise ValueError("history has no start_kyoku event")
+        dealer_seat = int(start_kyoku["oya"])
         results: dict[str, dict[str, Any]] = {}
 
         shanten = outputs["shanten"].softmax(-1).numpy()
@@ -444,8 +457,15 @@ class AnalysisRuntime:
         else:
             dora_distribution = outputs["dora_distribution"].softmax(-1).numpy()
             dora_point = F.softplus(outputs["dora_point"]).numpy()
-            score_distribution = outputs["score_distribution"].softmax(-1).numpy()
-            score_point = (F.softplus(outputs["score_point"]) * 1000.0).numpy()
+            score_logits = outputs["score_distribution"].clone()
+            for index, seat in enumerate(opponents):
+                valid = torch.as_tensor(
+                    score_class_mask(dealer=seat == dealer_seat),
+                    dtype=torch.bool,
+                    device=score_logits.device,
+                )
+                score_logits[index].masked_fill_(~valid, -torch.inf)
+            score_distribution = score_logits.softmax(-1).numpy()
             if protocol_minor >= 2:
                 dora_predictions = [
                     {
@@ -454,13 +474,20 @@ class AnalysisRuntime:
                     }
                     for index, probabilities in enumerate(dora_distribution)
                 ]
-                score_predictions = [
-                    {
-                        "distribution": _valued_distribution(probabilities, SCORE_VALUES),
-                        "pointEstimate": _finite(score_point[index]),
-                    }
-                    for index, probabilities in enumerate(score_distribution)
-                ]
+                if self.format_version >= 7:
+                    score_predictions = [
+                        {"distribution": _valued_distribution(probabilities, SCORE_VALUES)}
+                        for probabilities in score_distribution
+                    ]
+                else:
+                    score_point = (F.softplus(outputs["score_point"]) * 1000.0).numpy()
+                    score_predictions = [
+                        {
+                            "distribution": _valued_distribution(probabilities, SCORE_VALUES),
+                            "pointEstimate": _finite(score_point[index]),
+                        }
+                        for index, probabilities in enumerate(score_distribution)
+                    ]
             else:
                 dora_predictions = [
                     {"expectedValue": _finite(value)} for value in dora_point

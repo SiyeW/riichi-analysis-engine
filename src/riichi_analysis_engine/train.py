@@ -22,13 +22,32 @@ from torch.utils.data import DataLoader
 from .architecture import ModelArchitecture
 from .dataset import PackDataset
 from .kyoku_outcome import OUTCOME_DEAL_IN_INDICATORS, OUTCOME_WINNER_INDICATORS
-from .losses import LOSS_TERMS, LearnedUncertaintyBalancer, multitask_loss, score_class_indices
+from .losses import (
+    LOSS_TERMS,
+    LearnedUncertaintyBalancer,
+    masked_score_logits,
+    multitask_loss,
+    score_class_indices,
+)
 from .model import RiichiAnalysisModel, count_parameters
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
 
 
 class TrainingInterrupted(Exception):
     """Stop at a boundary whose state can be resumed without replaying data."""
+
+
+def gradient_total_norm(parameters: list[torch.nn.Parameter]) -> float:
+    """Measure the global L2 norm without modifying any gradient."""
+
+    squared = [
+        parameter.grad.detach().float().norm(2).square()
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not squared:
+        return 0.0
+    return float(torch.stack(squared).sum().sqrt())
 
 
 def source_metadata() -> dict[str, object]:
@@ -261,14 +280,16 @@ def validate(
             )
             add_metric(
                 "scoreDistributionAccuracy",
-                outputs["score_distribution"][winner_mask].argmax(-1)
+                masked_score_logits(outputs, batch["obs"])[winner_mask].argmax(-1)
                 == score_class_indices(batch["score"].long()[winner_mask]),
             )
-        add_metric(
-            "scoreMaePoints",
-            (F.softplus(outputs["score_point"]) * 1000.0 - batch["score"].float()).abs(),
-            winner_mask,
-        )
+            score_probabilities = masked_score_logits(outputs, batch["obs"]).softmax(-1)
+            score_values = score_probabilities.new_tensor(SCORE_VALUES)
+            add_metric(
+                "scoreMaePoints",
+                ((score_probabilities * score_values).sum(-1) - batch["score"].float()).abs(),
+                winner_mask,
+            )
         outcome_probability = outputs["outcome"].softmax(-1)
         winner_indicators = outcome_probability.new_tensor(OUTCOME_WINNER_INDICATORS)
         deal_in_indicators = outcome_probability.new_tensor(OUTCOME_DEAL_IN_INDICATORS)
@@ -520,7 +541,7 @@ def save_checkpoint(
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "format": "riichi-analysis-model-v6",
+            "format": "riichi-analysis-model-v7",
             "step": step,
             "samplesSeen": samples_seen,
             "trainingCursor": {
@@ -562,15 +583,15 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--analysis-channels", type=int, default=192)
-    parser.add_argument("--analysis-blocks", type=int, default=36)
-    parser.add_argument("--analysis-latent-width", type=int, default=768)
-    parser.add_argument("--state-width", type=int, default=768)
-    parser.add_argument("--future-width", type=int, default=640)
-    parser.add_argument("--policy-context-channels", type=int, default=96)
-    parser.add_argument("--policy-context-blocks", type=int, default=4)
-    parser.add_argument("--policy-context-width", type=int, default=256)
-    parser.add_argument("--policy-width", type=int, default=640)
+    parser.add_argument("--analysis-channels", type=int, default=288)
+    parser.add_argument("--analysis-blocks", type=int, default=54)
+    parser.add_argument("--analysis-latent-width", type=int, default=1152)
+    parser.add_argument("--state-width", type=int, default=1024)
+    parser.add_argument("--future-width", type=int, default=1024)
+    parser.add_argument("--policy-context-channels", type=int, default=144)
+    parser.add_argument("--policy-context-blocks", type=int, default=6)
+    parser.add_argument("--policy-context-width", type=int, default=384)
+    parser.add_argument("--policy-width", type=int, default=1024)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-validation-samples", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=0)
@@ -649,7 +670,7 @@ def main() -> None:
         resume_path = resolve_resume_path(args.resume)
         print(json.dumps({"resumedFrom": str(resume_path)}))
         checkpoint = torch.load(resume_path, map_location="cpu", weights_only=True)
-        if checkpoint.get("format") != "riichi-analysis-model-v6":
+        if checkpoint.get("format") != "riichi-analysis-model-v7":
             raise RuntimeError("resume checkpoint has an unsupported format")
         if checkpoint.get("modelArchitecture") != architecture.to_dict():
             raise RuntimeError("resume checkpoint uses a different model architecture")
@@ -815,9 +836,7 @@ def main() -> None:
             print(json.dumps({"phase": "oom", "step": step}))
             raise
         scaler.unscale_(optimizer)
-        gradient_norm = float(
-            torch.nn.utils.clip_grad_norm_([*model.parameters(), *balancer.parameters()], 5.0)
-        )
+        gradient_norm = gradient_total_norm(list(model.parameters()))
         gradient_max = max(
             float(parameter.grad.abs().max())
             for parameter in model.parameters()
@@ -838,6 +857,8 @@ def main() -> None:
                 "elapsedSeconds": now - started,
                 "samplesPerSecond": interval_samples / interval_seconds,
                 "total": float(total.detach()),
+                "gradientNorm": gradient_norm,
+                "gradientMax": gradient_max,
                 **{name: float(value.detach()) for name, value in losses.items()},
                 **{
                     f"lossWeight/{name}": float(value.detach())

@@ -44,7 +44,9 @@ def test_v6_export_preserves_model_architecture(tmp_path, monkeypatch) -> None:
     torch.save(
         {
             "format": "riichi-analysis-model-v6",
-            "model": RiichiAnalysisModel(architecture=architecture).state_dict(),
+            "model": RiichiAnalysisModel(
+                format_version=6, architecture=architecture
+            ).state_dict(),
             "modelArchitecture": architecture.to_dict(),
             "predictionValues": {"dora": list(DORA_VALUES), "score": list(SCORE_VALUES)},
             "environment": {},

@@ -18,6 +18,13 @@ ANALYSIS_CHANNELS = MORTAL_ANALYSIS_CHANNELS + RANK_FEATURE_CHANNELS
 POLICY_CONTEXT_START = ANALYSIS_CHANNELS
 POLICY_CONTEXT_CHANNELS = MORTAL_OBS_CHANNELS - MORTAL_ANALYSIS_CHANNELS
 
+# Observation v4 stores the controlled player's seat wind on this plane, at
+# tile positions E/S/W/N.  From that wind the dealer's relative position is
+# exact, so training can mask impossible dealer/non-dealer settlement classes
+# without changing the converted dataset.
+JIKAZE_CHANNEL = 26
+WIND_TILE_START = 27
+
 if ANALYSIS_CHANNELS <= 0 or POLICY_CONTEXT_CHANNELS <= 0:
     raise RuntimeError("observation v4 split is invalid")
 if ANALYSIS_CHANNELS + POLICY_CONTEXT_CHANNELS != OBS_CHANNELS:

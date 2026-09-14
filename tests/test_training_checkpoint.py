@@ -12,7 +12,7 @@ from riichi_analysis_engine.train import (
 )
 
 
-def test_v6_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> None:
+def test_v7_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> None:
     architecture = ModelArchitecture(
         analysis_channels=16,
         analysis_blocks=1,
@@ -53,7 +53,7 @@ def test_v6_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> 
     )
 
     payload = torch.load(destination, map_location="cpu", weights_only=True)
-    assert payload["format"] == "riichi-analysis-model-v6"
+    assert payload["format"] == "riichi-analysis-model-v7"
     assert payload["modelArchitecture"] == architecture.to_dict()
     assert payload["lossBalancer"]["terms"] == list(LOSS_TERMS)
     assert payload["trainingCursor"] == {
