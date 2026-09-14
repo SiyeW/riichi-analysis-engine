@@ -84,6 +84,28 @@ def main() -> None:
     else:
         model = RiichiAnalysisModel(format_version=format_version)
     model.load_state_dict(checkpoint["model"], strict=True)
+    training = {
+        "step": int(checkpoint.get("step", 0)),
+        "samplesSeen": int(checkpoint.get("samplesSeen", 0)),
+        "trainingData": args.training_data,
+        "validationData": args.validation_data,
+        "datasets": public_dataset_metadata(checkpoint),
+        "environment": checkpoint.get("environment"),
+        "validation": checkpoint.get("validation"),
+        "sourceRevision": training_source_revision(checkpoint),
+    }
+    cursor = checkpoint.get("trainingCursor")
+    if isinstance(cursor, dict):
+        training["pass"] = {
+            "type": cursor.get("type"),
+            "nextSample": cursor.get("nextSample"),
+            "complete": cursor.get("complete"),
+        }
+    elif "epoch" in checkpoint:
+        # Historical checkpoints remain exportable, but only new checkpoints
+        # with an explicit cursor may be resumed for training.
+        training["epoch"] = int(checkpoint["epoch"])
+
     payload = {
         "format": model_format,
         "model": model.state_dict(),
@@ -101,16 +123,7 @@ def main() -> None:
                 }
             ),
         },
-        "training": {
-            "epoch": int(checkpoint.get("epoch", 0)),
-            "step": int(checkpoint.get("step", 0)),
-            "trainingData": args.training_data,
-            "validationData": args.validation_data,
-            "datasets": public_dataset_metadata(checkpoint),
-            "environment": checkpoint.get("environment"),
-            "validation": checkpoint.get("validation"),
-            "sourceRevision": training_source_revision(checkpoint),
-        },
+        "training": training,
     }
     if format_version >= 2:
         prediction_values = {

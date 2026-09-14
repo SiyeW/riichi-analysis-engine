@@ -141,8 +141,6 @@ def make_train_command(
         str(args.validation),
         "--run",
         str(run_directory),
-        "--epochs",
-        "1",
         "--batch-size",
         str(args.batch_size),
         "--max-steps",

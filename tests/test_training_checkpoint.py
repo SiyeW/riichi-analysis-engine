@@ -1,9 +1,15 @@
+import pytest
 import torch
 
 from riichi_analysis_engine.architecture import ModelArchitecture
 from riichi_analysis_engine.losses import LOSS_TERMS, LearnedUncertaintyBalancer
 from riichi_analysis_engine.model import RiichiAnalysisModel
-from riichi_analysis_engine.train import save_checkpoint, step_budget_reached
+from riichi_analysis_engine.train import (
+    resume_training_cursor,
+    save_checkpoint,
+    single_pass_window,
+    step_budget_reached,
+)
 
 
 def test_v6_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> None:
@@ -36,10 +42,10 @@ def test_v6_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> 
         scaler,
         balancer,
         architecture,
-        epoch=1,
-        batch_in_epoch=0,
         step=10,
         samples_seen=20,
+        batch_size=2,
+        pass_complete=False,
         parameters={},
         datasets={},
         environment={},
@@ -50,9 +56,68 @@ def test_v6_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> 
     assert payload["format"] == "riichi-analysis-model-v6"
     assert payload["modelArchitecture"] == architecture.to_dict()
     assert payload["lossBalancer"]["terms"] == list(LOSS_TERMS)
+    assert payload["trainingCursor"] == {
+        "type": "single-pass-v1",
+        "nextSample": 20,
+        "batchesConsumed": 10,
+        "batchSize": 2,
+        "complete": False,
+    }
+    assert "epoch" not in payload
+    assert "batchInEpoch" not in payload
 
 
 def test_step_budget_is_off_until_a_positive_limit_is_reached() -> None:
     assert not step_budget_reached(10, 0)
     assert not step_budget_reached(9, 10)
     assert step_budget_reached(10, 10)
+
+
+def test_single_pass_budget_is_an_absolute_limit_after_resume() -> None:
+    assert single_pass_window(100, 0, 20) == (20, 20)
+    assert single_pass_window(100, 13, 20) == (20, 7)
+    assert single_pass_window(100, 13, 0) == (100, 87)
+
+    with pytest.raises(RuntimeError, match="increase --max-train-samples"):
+        single_pass_window(100, 20, 20)
+
+
+def test_resume_cursor_requires_the_same_manifests_and_exact_counters() -> None:
+    datasets = {
+        "train": {"manifestSha256": "train-a"},
+        "validation": {"manifestSha256": "validation-a"},
+    }
+    checkpoint = {
+        "step": 2,
+        "samplesSeen": 13,
+        "datasets": datasets,
+        "trainingCursor": {
+            "type": "single-pass-v1",
+            "nextSample": 13,
+            "batchesConsumed": 2,
+            "batchSize": 8,
+            "complete": False,
+        },
+    }
+
+    assert resume_training_cursor(checkpoint, datasets, 8) == (13, 2)
+
+    changed = {**datasets, "train": {"manifestSha256": "train-b"}}
+    with pytest.raises(RuntimeError, match="different train manifest"):
+        resume_training_cursor(checkpoint, changed, 8)
+
+    checkpoint["trainingCursor"]["complete"] = True
+    with pytest.raises(RuntimeError, match="already completed"):
+        resume_training_cursor(checkpoint, datasets, 8)
+
+
+def test_legacy_epoch_checkpoint_cannot_silently_resume() -> None:
+    with pytest.raises(RuntimeError, match="predates the single-pass cursor"):
+        resume_training_cursor(
+            {"epoch": 0, "batchInEpoch": 10, "step": 10, "samplesSeen": 80},
+            {
+                "train": {"manifestSha256": "train"},
+                "validation": {"manifestSha256": "validation"},
+            },
+            8,
+        )
