@@ -1,6 +1,16 @@
 import pytest
+import torch
 
-from riichi_analysis_engine.train import learning_rate_at
+from riichi_analysis_engine.train import gradient_total_norm, learning_rate_at
+
+
+def test_gradient_norm_measurement_does_not_modify_gradients() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(2))
+    parameter.grad = torch.tensor([3.0, 4.0])
+    before = parameter.grad.clone()
+
+    assert gradient_total_norm([parameter]) == pytest.approx(5.0)
+    assert torch.equal(parameter.grad, before)
 
 
 def test_the_default_shape_keeps_the_plateau_rate_constant() -> None:

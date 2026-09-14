@@ -10,12 +10,12 @@ The default configuration is below. Each weight file records the architecture it
 
 | Component | Default structure | Parameters |
 | --- | --- | ---: |
-| State encoder | 192 channels, 36 pre-activation residual blocks, channel attention, 768-dimensional output | 9,529,040 |
-| State predictions | 768-dimensional adapter | 1,228,862 |
-| Future predictions | 640-dimensional adapter | 666,512 |
-| Policy context | 96 channels, 4 pre-activation residual blocks, 256-dimensional output | 556,856 |
-| Action policy | 640-dimensional adapter, 46 internal actions | 685,486 |
-| Total |  | 12,666,756 |
+| State encoder | 288 channels, 54 pre-activation residual blocks, channel attention, 1,152-dimensional output | 29,560,748 |
+| State predictions | 1,024-dimensional adapter | 2,031,422 |
+| Future predictions | 1,024-dimensional adapter | 1,456,397 |
+| Policy context | 144 channels, 6 pre-activation residual blocks, 384-dimensional output | 1,260,086 |
+| Action policy | 1,024-dimensional adapter, 46 internal actions | 1,621,038 |
+| Total |  | 35,929,691 |
 
 State predictions cover opponent shanten, furiten or no yaku, per-tile deal-in risk, concealed tile counts, and wall tile counts. Future predictions cover dora, hand value, kyoku outcome, kyoku score changes, final placement, and final scores. The policy learns recommendation strengths from recorded play.
 
@@ -25,7 +25,7 @@ Each supervised objective is balanced with a learned uncertainty weight during t
 
 - Opponent shanten, furiten or no yaku, and per-tile deal-in labels are calculated from complete hidden state at each event.
 - Concealed hands and the unrevealed wall use `0..4` classification labels. The three red fives use separate `0..1` labels.
-- Dora and hand-value losses are applied only when the corresponding player eventually wins the kyoku. Both use a discrete distribution and an independent scalar target. Dora classes are `0..6` and `7+`; hand value uses 59 settlement values, including 7,700 points for a non-dealer four-han, 30-fu ron, sanbaiman, double yakuman, and stacked yakuman.
+- Dora and hand-value losses are applied only when the corresponding player eventually wins the kyoku. Dora uses `0..6` and `7+` classes together with a separate point estimate. Hand value uses 59 settlement values and excludes values that are impossible for the winner's dealer status. This includes 7,700 points for a non-dealer four-han, 30-fu ron, sanbaiman, double yakuman, and stacked yakuman.
 - Kyoku outcomes cover draw, four tsumo results, and 28 ron results including double and triple ron. Win and deal-in probabilities for all four players are derived from these 33 outcomes.
 - Final placement is learned as a joint distribution over all 24 placement permutations.
 - Policy labels use Mortal v4's 46 internal actions and legal-action masks. The engine composes conditional internal actions into complete legal protocol candidates before returning them.

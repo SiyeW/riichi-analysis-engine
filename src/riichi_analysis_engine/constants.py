@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 OBS_VERSION = 4
-# Mortal v4 supplies the base observation. v6 adds explicit ranks for all four
+# Mortal v4 supplies the base observation. Model formats v6 and later add ranks for all four
 # players so prediction heads do not have to infer them repeatedly from scores.
 MORTAL_OBS_CHANNELS = 1012
 RANK_FEATURE_CHANNELS = 4 * 4

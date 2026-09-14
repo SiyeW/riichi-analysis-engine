@@ -74,6 +74,21 @@ def test_v2_representations_follow_the_negotiated_protocol() -> None:
     ]
 
 
+def test_v7_does_not_advertise_a_redundant_score_point_estimate() -> None:
+    runtime = AnalysisRuntime.__new__(AnalysisRuntime)
+    runtime.format_version = 7
+
+    assert runtime.representations("opponent-score", 2) == ["distribution"]
+    assert runtime.representations("opponent-score", 1) == [
+        "distribution",
+        "expected-value",
+    ]
+    assert runtime.representations("opponent-dora-count", 2) == [
+        "distribution",
+        "point-estimate",
+    ]
+
+
 def _ankan(candidate_id: str, tile: str) -> dict:
     return {
         "candidateId": candidate_id,
@@ -187,7 +202,9 @@ def test_v6_runtime_reconstructs_weight_architecture(tmp_path, monkeypatch) -> N
     torch.save(
         {
             "format": "riichi-analysis-model-v6",
-            "model": RiichiAnalysisModel(architecture=architecture).state_dict(),
+            "model": RiichiAnalysisModel(
+                format_version=6, architecture=architecture
+            ).state_dict(),
             "architecture": {
                 "model": architecture.to_dict(),
                 "predictionValues": {

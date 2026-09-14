@@ -15,15 +15,15 @@ class ModelArchitecture:
     """
 
     observation_version: int = 4
-    analysis_channels: int = 192
-    analysis_blocks: int = 36
-    analysis_latent_width: int = 768
-    state_width: int = 768
-    future_width: int = 640
-    policy_context_channels: int = 96
-    policy_context_blocks: int = 4
-    policy_context_width: int = 256
-    policy_width: int = 640
+    analysis_channels: int = 288
+    analysis_blocks: int = 54
+    analysis_latent_width: int = 1152
+    state_width: int = 1024
+    future_width: int = 1024
+    policy_context_channels: int = 144
+    policy_context_blocks: int = 6
+    policy_context_width: int = 384
+    policy_width: int = 1024
 
     def __post_init__(self) -> None:
         if self.observation_version != 4:

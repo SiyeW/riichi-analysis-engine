@@ -6,7 +6,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .prediction_values import DORA_TAIL_START, SCORE_VALUES
+from .observation_layout import JIKAZE_CHANNEL, WIND_TILE_START
+from .prediction_values import DORA_TAIL_START, SCORE_VALUES, score_class_mask
 
 
 # A term represents one independently supervised prediction, not a manually
@@ -24,7 +25,6 @@ LOSS_TERMS = (
     "dora_distribution",
     "dora_point",
     "score_distribution",
-    "score_point",
     "outcome",
     "kyoku_delta",
     "placement",
@@ -47,6 +47,32 @@ def score_class_indices(values: Tensor) -> Tensor:
         invalid = values[(indices >= len(SCORE_VALUES)) | (vocabulary[bounded] != values)]
         raise ValueError(f"score labels contain unsupported values: {invalid.unique().tolist()}")
     return bounded
+
+
+def opponent_dealer_mask(observation: Tensor) -> Tensor:
+    """Return which of the three relative opponents is the current dealer."""
+
+    winds = observation[:, JIKAZE_CHANNEL, WIND_TILE_START : WIND_TILE_START + 4]
+    wind_index = winds.argmax(-1)
+    if (winds.amax(-1) <= 0).any():
+        raise ValueError("observation does not encode the controlled player's seat wind")
+    result = torch.zeros((len(observation), 3), dtype=torch.bool, device=observation.device)
+    has_opponent_dealer = wind_index > 0
+    rows = torch.arange(len(observation), device=observation.device)[has_opponent_dealer]
+    result[rows, 3 - wind_index[has_opponent_dealer]] = True
+    return result
+
+
+def masked_score_logits(outputs: Mapping[str, Tensor], observation: Tensor) -> Tensor:
+    dealer = opponent_dealer_mask(observation)
+    non_dealer_classes = torch.as_tensor(
+        score_class_mask(dealer=False), dtype=torch.bool, device=observation.device
+    )
+    dealer_classes = torch.as_tensor(
+        score_class_mask(dealer=True), dtype=torch.bool, device=observation.device
+    )
+    valid = torch.where(dealer.unsqueeze(-1), dealer_classes, non_dealer_classes)
+    return outputs["score_distribution"].masked_fill(~valid, -torch.inf)
 
 
 def multitask_losses(
@@ -118,17 +144,19 @@ def multitask_losses(
             F.softplus(outputs["dora_point"])[winner_mask], dora_labels.float()
         )
         score_labels = batch["score"].long()[winner_mask]
+        score_indices = score_class_indices(score_labels)
+        score_logits = masked_score_logits(outputs, batch["obs"])
+        if not torch.isfinite(score_logits[winner_mask]).gather(
+            -1, score_indices.unsqueeze(-1)
+        ).all():
+            raise ValueError("score label is impossible for the winner's dealer status")
         losses["score_distribution"] = F.cross_entropy(
-            outputs["score_distribution"][winner_mask], score_class_indices(score_labels)
-        )
-        losses["score_point"] = F.mse_loss(
-            F.softplus(outputs["score_point"])[winner_mask], score_labels.float() / 1000.0
+            score_logits[winner_mask], score_indices
         )
         for name in (
             "dora_distribution",
             "dora_point",
             "score_distribution",
-            "score_point",
         ):
             active[name] = True
     else:
@@ -137,7 +165,6 @@ def multitask_losses(
             "dora_distribution",
             "dora_point",
             "score_distribution",
-            "score_point",
         ):
             losses[name] = zero
             active[name] = False

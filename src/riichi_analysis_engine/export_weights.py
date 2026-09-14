@@ -73,14 +73,15 @@ def main() -> None:
         "riichi-analysis-model-v4": 4,
         "riichi-analysis-model-v5": 5,
         "riichi-analysis-model-v6": 6,
+        "riichi-analysis-model-v7": 7,
     }
     if model_format not in formats:
         raise RuntimeError("checkpoint has an unsupported format")
     format_version = formats[model_format]
     architecture: ModelArchitecture | None = None
-    if format_version == 6:
+    if format_version in {6, 7}:
         architecture = ModelArchitecture.from_dict(checkpoint.get("modelArchitecture"))
-        model = RiichiAnalysisModel(architecture=architecture)
+        model = RiichiAnalysisModel(format_version=format_version, architecture=architecture)
     else:
         model = RiichiAnalysisModel(format_version=format_version)
     model.load_state_dict(checkpoint["model"], strict=True)

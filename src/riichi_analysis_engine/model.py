@@ -170,6 +170,11 @@ class HeadDimensionsV5(HeadDimensionsV4):
 
 
 @dataclass(frozen=True)
+class HeadDimensionsV7(HeadDimensionsV5):
+    score_point: int = 0
+
+
+@dataclass(frozen=True)
 class HeadDimensionsV1:
     shanten: int = 3 * 7
     furiten_no_yaku: int = 3
@@ -212,8 +217,8 @@ class HeadDimensionsV1:
 class RiichiAnalysisModel(nn.Module):
     """Shared state analysis with a separate decision-only feature path.
 
-    Formats v1--v5 preserve the old full-observation architecture solely for
-    loading already exported artifacts.  New training uses v6, where policy
+    Formats v1--v6 preserve old architectures solely for loading already
+    exported artifacts. New training uses v7, where policy
     phase/action features and single-player EV tables no longer consume the
     shared prediction encoder's capacity.
     """
@@ -225,14 +230,14 @@ class RiichiAnalysisModel(nn.Module):
         blocks: int | None = None,
         state_width: int | None = None,
         future_width: int | None = None,
-        format_version: int = 6,
+        format_version: int = 7,
         architecture: ModelArchitecture | None = None,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2, 3, 4, 5, 6}:
+        if format_version not in {1, 2, 3, 4, 5, 6, 7}:
             raise ValueError(f"unsupported model format version: {format_version}")
-        if architecture is not None and format_version != 6:
-            raise ValueError("only model format v6 accepts explicit architecture metadata")
+        if architecture is not None and format_version not in {6, 7}:
+            raise ValueError("only model formats v6 and v7 accept architecture metadata")
         self.format_version = format_version
         self.architecture: ModelArchitecture | None = None
         self.dimensions = (
@@ -240,13 +245,15 @@ class RiichiAnalysisModel(nn.Module):
             if format_version == 1
             else HeadDimensionsV2()
             if format_version == 2
+            else HeadDimensionsV7()
+            if format_version == 7
             else HeadDimensionsV5()
             if format_version in {5, 6}
             else HeadDimensionsV4()
             if format_version == 4
             else HeadDimensions()
         )
-        if format_version == 6:
+        if format_version in {6, 7}:
             configured = architecture or ModelArchitecture()
             overrides: dict[str, int] = {}
             if channels is not None:
@@ -299,7 +306,7 @@ class RiichiAnalysisModel(nn.Module):
             nn.Mish(inplace=True),
         )
         self.future_head = nn.Linear(future_width, self.dimensions.future_total)
-        if format_version != 6:
+        if format_version not in {6, 7}:
             self.policy_head = nn.Linear(latent_width, ACTION_SPACE)
 
         nn.init.zeros_(self.state_head.bias)
@@ -311,7 +318,7 @@ class RiichiAnalysisModel(nn.Module):
         return value.split(dimensions, dim=-1)
 
     def forward(self, observation: Tensor) -> dict[str, Tensor]:
-        if self.format_version == 6:
+        if self.format_version in {6, 7}:
             if observation.shape[1:] != (OBS_CHANNELS, TILE_TYPES):
                 raise ValueError(f"wrong observation shape: {tuple(observation.shape)}")
             latent = self.encoder(observation[:, :ANALYSIS_CHANNELS])
@@ -383,6 +390,41 @@ class RiichiAnalysisModel(nn.Module):
             return outputs
 
         assert isinstance(d, HeadDimensions)
+        if self.format_version == 7:
+            assert isinstance(d, HeadDimensionsV7)
+            (
+                dora_distribution,
+                dora_point,
+                score_distribution,
+                outcome,
+                delta,
+                placement,
+                match_score,
+            ) = self._split(
+                future,
+                (
+                    d.dora_distribution,
+                    d.dora_point,
+                    d.score_distribution,
+                    d.outcome,
+                    d.kyoku_delta,
+                    d.placement,
+                    d.match_score,
+                ),
+            )
+            outputs.update(
+                {
+                    "dora_distribution": dora_distribution.view(batch, 3, len(DORA_VALUES)),
+                    "dora_point": dora_point.view(batch, 3),
+                    "score_distribution": score_distribution.view(batch, 3, len(SCORE_VALUES)),
+                    "outcome": outcome.view(batch, OUTCOME_COUNT),
+                    "kyoku_delta": delta.view(batch, 4),
+                    "placement": placement.view(batch, 24),
+                    "match_score": match_score.view(batch, 4),
+                }
+            )
+            return outputs
+
         if self.format_version in {5, 6}:
             assert isinstance(d, HeadDimensionsV5)
             (
@@ -520,7 +562,7 @@ def count_parameters(model: nn.Module) -> dict[str, int]:
         "state": nn.ModuleList([model.state_adapter, model.state_head]),
         "future": nn.ModuleList([model.future_adapter, model.future_head]),
     }
-    if model.format_version == 6:
+    if model.format_version in {6, 7}:
         groups["policy_context"] = model.policy_context
         groups["policy"] = nn.ModuleList([model.policy_adapter, model.policy_head])
     else:

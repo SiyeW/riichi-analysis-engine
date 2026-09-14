@@ -30,7 +30,7 @@ def test_output_shapes() -> None:
     assert outputs["dora_distribution"].shape == (2, 3, 8)
     assert outputs["dora_point"].shape == (2, 3)
     assert outputs["score_distribution"].shape == (2, 3, 59)
-    assert outputs["score_point"].shape == (2, 3)
+    assert "score_point" not in outputs
     assert "outcome_any_win" not in outputs
     assert "outcome_winner" not in outputs
     assert "deal_in_player" not in outputs
@@ -42,12 +42,12 @@ def test_output_shapes() -> None:
 def test_default_parameter_budget() -> None:
     model = RiichiAnalysisModel()
     assert count_parameters(model) == {
-        "encoder": 9_529_040,
-        "state": 1_228_862,
-        "future": 666_512,
-        "policy_context": 556_856,
-        "policy": 685_486,
-        "total": 12_666_756,
+        "encoder": 29_560_748,
+        "state": 2_031_422,
+        "future": 1_456_397,
+        "policy_context": 1_260_086,
+        "policy": 1_621_038,
+        "total": 35_929_691,
     }
 
 
@@ -90,7 +90,7 @@ def test_v6_architecture_round_trips_and_keeps_prediction_heads_state_only() -> 
     )
     assert ModelArchitecture.from_dict(architecture.to_dict()) == architecture
     torch.manual_seed(7)
-    model = RiichiAnalysisModel(architecture=architecture).eval()
+    model = RiichiAnalysisModel(format_version=6, architecture=architecture).eval()
     first = torch.randn(1, OBS_CHANNELS, 34)
     second = first.clone()
     second[:, POLICY_CONTEXT_START:] = torch.randn_like(second[:, POLICY_CONTEXT_START:])
