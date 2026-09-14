@@ -855,7 +855,7 @@ def main() -> None:
                 for name, value in losses.items():
                     writer.add_scalar(f"Loss/train_{name}_batch", float(value.detach()), step)
                 for name, value in weights.items():
-                    writer.add_scalar(f"LossBalance/{name}", float(value), step)
+                    writer.add_scalar(f"LossBalance/{name}", float(value.detach()), step)
                     if _active[name]:
                         writer.add_scalar(
                             f"LossWeighted/{name}",
