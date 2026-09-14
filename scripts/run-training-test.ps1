@@ -102,19 +102,20 @@ try {
         --batch-size $BatchSize
     if ($LASTEXITCODE -ne 0) { throw "Training packs failed verification." }
 
-    # One epoch is one pass over the mixed corpus; the step budget ends the run.
+    # Training consumes the mixed corpus once; the step budget may stop that
+    # pass early but can never rewind it.
     & $python -m riichi_analysis_engine.train `
         --train $packsTrain `
         --validation $packsValidation `
         --run $run `
-        --epochs 1 `
         --batch-size $BatchSize `
         --max-steps $MaxSteps `
         --device cuda
     if ($LASTEXITCODE -ne 0) { throw "Training failed." }
 
+    $latestCheckpoint = (Get-Content (Join-Path $run "latest_checkpoint.json") -Raw | ConvertFrom-Json).path
     & $python -m riichi_analysis_engine.export_weights `
-        (Join-Path $run "checkpoint-step-$MaxSteps.pt") `
+        $latestCheckpoint `
         $weights
     if ($LASTEXITCODE -ne 0) { throw "Weight export failed." }
 

@@ -37,7 +37,13 @@ def scratch() -> Path:
 
 
 def pack_directory(
-    root: Path, *, games: int = 4, chunks: int = 4, samples: int = 8, pack_samples: int = 32
+    root: Path,
+    *,
+    games: int = 4,
+    chunks: int = 4,
+    samples: int = 8,
+    pack_samples: int = 32,
+    training_targets: bool = False,
 ) -> Path:
     """Stage a corpus, pack it, and return the pack directory."""
 
@@ -49,6 +55,29 @@ def pack_directory(
         # A target-shaped array whose values identify one sample out of the
         # whole corpus, the way the real targets are shaped.
         arrays["sample_tag"] = np.arange(count, dtype=np.int32) + game * 1000
+        if training_targets:
+            arrays.update(
+                {
+                    "policy": np.zeros(count, dtype=np.int8),
+                    "shanten": np.zeros((count, 3), dtype=np.int8),
+                    "furiten_no_yaku": np.zeros((count, 3), dtype=np.float32),
+                    "deal_in_tile": np.zeros((count, 3, 34), dtype=np.float32),
+                    "concealed_count": np.zeros((count, 3, 34), dtype=np.int8),
+                    "concealed_red_count": np.zeros((count, 3, 3), dtype=np.int8),
+                    "wall_count": np.zeros((count, 34), dtype=np.int8),
+                    "wall_red_count": np.zeros((count, 3), dtype=np.int8),
+                    "dora": np.zeros((count, 3), dtype=np.int8),
+                    "score": np.zeros((count, 3), dtype=np.int32),
+                    "winner_mask": np.zeros((count, 3), dtype=bool),
+                    "outcome": np.zeros(count, dtype=np.int8),
+                    "draw": np.ones(count, dtype=np.float32),
+                    "win": np.zeros((count, 4), dtype=np.float32),
+                    "deal_in_player": np.zeros((count, 4), dtype=np.float32),
+                    "kyoku_delta": np.zeros((count, 4), dtype=np.float32),
+                    "placement": np.zeros(count, dtype=np.int8),
+                    "match_score": np.zeros((count, 4), dtype=np.float32),
+                }
+            )
         save_chunk_archive(stage / f"game-{game:06d}.zip", arrays, samples)
 
     output = root / "packs"
@@ -134,7 +163,7 @@ def test_max_samples_does_not_emit_an_empty_batch(scratch: Path) -> None:
     assert all(len(batch["policy"]) for batch in batches)
 
 
-def test_skipping_batches_matches_the_tail_of_the_pass(
+def test_starting_from_a_sample_matches_the_tail_of_the_pass(
     scratch: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = pack_directory(scratch)
@@ -151,11 +180,39 @@ def test_skipping_batches_matches_the_tail_of_the_pass(
         return original(path)
 
     monkeypatch.setattr(dataset, "read_packed_shard", recording)
-    skipped = collect(PackDataset(root, batch_size=8, skip_batches=8))
+    skipped = collect(PackDataset(root, batch_size=8, start_sample=64))
 
     assert opened == ["pack-00002.npz", "pack-00003.npz"]
     np.testing.assert_array_equal(
-        np.concatenate([batch["sample_tag"] for batch in skipped]), reference[8 * 8 :]
+        np.concatenate([batch["sample_tag"] for batch in skipped]), reference[64:]
+    )
+
+
+def test_sample_cursor_is_exact_after_a_short_budget_batch(scratch: Path) -> None:
+    root = pack_directory(scratch)
+    full = np.concatenate(
+        [batch["sample_tag"] for batch in collect(PackDataset(root, batch_size=8))]
+    )
+
+    prefix = collect(PackDataset(root, batch_size=8, max_samples=13))
+    suffix = collect(PackDataset(root, batch_size=8, start_sample=13))
+
+    assert [len(batch["policy"]) for batch in prefix] == [8, 5]
+    np.testing.assert_array_equal(
+        np.concatenate([batch["sample_tag"] for batch in prefix + suffix]), full
+    )
+
+
+def test_sample_budget_stops_inside_a_batch_carried_between_packs(scratch: Path) -> None:
+    root = pack_directory(scratch, pack_samples=10)
+    full = np.concatenate(
+        [batch["sample_tag"] for batch in collect(PackDataset(root, batch_size=8))]
+    )
+    prefix = collect(PackDataset(root, batch_size=8, max_samples=13))
+
+    assert [len(batch["policy"]) for batch in prefix] == [8, 5]
+    np.testing.assert_array_equal(
+        np.concatenate([batch["sample_tag"] for batch in prefix]), full[:13]
     )
 
 

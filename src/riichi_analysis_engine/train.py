@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -73,7 +74,8 @@ def dataset_metadata(root: Path) -> dict[str, object]:
     manifest_path = root / "manifest.json"
     if not manifest_path.exists():
         return {"path": str(root.resolve())}
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
     audit = manifest.get("audit")
     return {
         "path": str(root.resolve()),
@@ -84,6 +86,7 @@ def dataset_metadata(root: Path) -> dict[str, object]:
         "chunks": manifest.get("chunks"),
         "sourceGames": manifest.get("sourceGames"),
         "verified": audit.get("verified") if isinstance(audit, dict) else None,
+        "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
     }
 
 
@@ -93,6 +96,67 @@ def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str
 
 def step_budget_reached(step: int, max_steps: int) -> bool:
     return max_steps > 0 and step >= max_steps
+
+
+def single_pass_window(
+    corpus_samples: int,
+    next_sample: int,
+    max_train_samples: int,
+) -> tuple[int, int]:
+    """Return the absolute pass limit and unread sample count for this run."""
+
+    if corpus_samples <= 0:
+        raise ValueError("training corpus must contain samples")
+    if max_train_samples < 0:
+        raise ValueError("maximum training samples must be non-negative")
+    if not 0 <= next_sample <= corpus_samples:
+        raise RuntimeError("resume cursor lies outside the training corpus")
+    limit = corpus_samples if max_train_samples == 0 else min(corpus_samples, max_train_samples)
+    if next_sample >= limit:
+        raise RuntimeError(
+            "resume cursor has reached the sample limit; increase --max-train-samples"
+        )
+    return limit, limit - next_sample
+
+
+def resume_training_cursor(
+    checkpoint: dict[str, object],
+    datasets: dict[str, dict[str, object]],
+    batch_size: int,
+) -> tuple[int, int]:
+    """Validate and return the next unread sample and completed update count."""
+
+    cursor = checkpoint.get("trainingCursor")
+    if not isinstance(cursor, dict) or cursor.get("type") != "single-pass-v1":
+        raise RuntimeError(
+            "resume checkpoint predates the single-pass cursor and cannot be resumed safely"
+        )
+    if cursor.get("complete") is not False:
+        raise RuntimeError("resume checkpoint has already completed its training pass")
+    if int(cursor.get("batchSize", -1)) != batch_size:
+        raise RuntimeError("resume checkpoint uses a different training batch size")
+
+    saved_datasets = checkpoint.get("datasets")
+    if not isinstance(saved_datasets, dict):
+        raise RuntimeError("resume checkpoint has no dataset identity")
+    for split in ("train", "validation"):
+        saved = saved_datasets.get(split)
+        current = datasets.get(split)
+        if not isinstance(saved, dict) or not isinstance(current, dict):
+            raise RuntimeError(f"resume checkpoint has no {split} dataset identity")
+        saved_digest = saved.get("manifestSha256")
+        if not saved_digest or saved_digest != current.get("manifestSha256"):
+            raise RuntimeError(f"resume checkpoint uses a different {split} manifest")
+
+    next_sample = int(cursor.get("nextSample", -1))
+    completed_steps = int(checkpoint.get("step", -1))
+    if next_sample < 0 or completed_steps < 0:
+        raise RuntimeError("resume checkpoint has an invalid single-pass cursor")
+    if int(checkpoint.get("samplesSeen", -1)) != next_sample:
+        raise RuntimeError("resume checkpoint has inconsistent sample counters")
+    if int(cursor.get("batchesConsumed", -1)) != completed_steps:
+        raise RuntimeError("resume checkpoint has inconsistent batch counters")
+    return next_sample, completed_steps
 
 
 @torch.no_grad()
@@ -394,10 +458,10 @@ def save_checkpoint(
     balancer: LearnedUncertaintyBalancer,
     architecture: ModelArchitecture,
     *,
-    epoch: int,
-    batch_in_epoch: int,
     step: int,
     samples_seen: int,
+    batch_size: int,
+    pass_complete: bool,
     parameters: dict[str, int],
     datasets: dict[str, dict[str, object]],
     environment: dict[str, object],
@@ -408,10 +472,15 @@ def save_checkpoint(
     torch.save(
         {
             "format": "riichi-analysis-model-v6",
-            "epoch": epoch,
-            "batchInEpoch": batch_in_epoch,
             "step": step,
             "samplesSeen": samples_seen,
+            "trainingCursor": {
+                "type": "single-pass-v1",
+                "nextSample": samples_seen,
+                "batchesConsumed": step,
+                "batchSize": batch_size,
+                "complete": pass_complete,
+            },
             "model": model.state_dict(),
             "modelArchitecture": architecture.to_dict(),
             "optimizer": optimizer.state_dict(),
@@ -439,7 +508,6 @@ def main() -> None:
     parser.add_argument("--train", type=Path, required=True)
     parser.add_argument("--validation", type=Path, required=True)
     parser.add_argument("--run", type=Path, required=True)
-    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
@@ -456,7 +524,6 @@ def main() -> None:
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-validation-samples", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=0)
-    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--checkpoint-every", type=int, default=2000)
     parser.add_argument(
         "--warmup-steps",
@@ -516,11 +583,13 @@ def main() -> None:
         ]
     )
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
-    start_epoch = 0
-    resume_batch = 0
     step = 0
     samples_seen = 0
-    live: dict[str, object] = {"step": 0, "samplesSeen": 0, "epoch": 0, "batch": 0}
+    datasets = {
+        "train": dataset_metadata(args.train),
+        "validation": dataset_metadata(args.validation),
+    }
+    environment = environment_metadata(device)
     if args.resume is not None:
         resume_path = resolve_resume_path(args.resume)
         print(json.dumps({"resumedFrom": str(resume_path)}))
@@ -541,15 +610,19 @@ def main() -> None:
         balancer.load_state_dict(balance["state"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         scaler.load_state_dict(checkpoint["scaler"])
-        start_epoch = int(checkpoint.get("epoch", 0))
-        resume_batch = int(checkpoint.get("batchInEpoch", 0))
-        step = int(checkpoint.get("step", 0))
-        samples_seen = int(checkpoint.get("samplesSeen", 0))
+        samples_seen, step = resume_training_cursor(checkpoint, datasets, args.batch_size)
+        if step_budget_reached(step, args.max_steps):
+            raise RuntimeError("resume budget is already exhausted; increase --max-steps")
     # The order comes from the training manifest: one pass over globally mixed
     # packs, with no shuffling left for the loader to do.
+    train_manifest = PackDataset(args.train, batch_size=args.batch_size)
+    sample_limit, unread_samples = single_pass_window(
+        train_manifest.samples, samples_seen, args.max_train_samples
+    )
     train_data = PackDataset(
         args.train,
-        max_samples=args.max_train_samples,
+        start_sample=samples_seen,
+        max_samples=unread_samples,
         batch_size=args.batch_size,
     )
     validation_data = PackDataset(
@@ -560,13 +633,13 @@ def main() -> None:
     train_loader = DataLoader(
         train_data,
         batch_size=None,
-        num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=device.type == "cuda",
     )
     validation_loader = DataLoader(
         validation_data,
         batch_size=None,
-        num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=device.type == "cuda",
     )
     try:
@@ -575,11 +648,6 @@ def main() -> None:
         fixture = None
 
     args.run.mkdir(parents=True, exist_ok=True)
-    datasets = {
-        "train": dataset_metadata(args.train),
-        "validation": dataset_metadata(args.validation),
-    }
-    environment = environment_metadata(device)
     config = {
         **vars(args),
         "train": str(args.train.resolve()),
@@ -591,8 +659,11 @@ def main() -> None:
         "datasets": datasets,
         "trainingOrder": {
             "type": "globally-mixed-packs-v1",
+            "pass": "single-pass-v1",
             "trainSeed": datasets["train"].get("seed"),
             "verified": datasets["train"].get("verified"),
+            "startSample": samples_seen,
+            "sampleLimit": sample_limit,
         },
         "environment": environment,
     }
@@ -603,257 +674,219 @@ def main() -> None:
     log_path = args.run / "metrics.jsonl"
     writer = open_dashboard(args.run)
 
-    def save_interrupted(*_arguments: object) -> None:
-        """Ctrl-C leaves a checkpoint behind instead of losing the run."""
+    interrupt_requested = False
 
+    def request_interrupt(*_arguments: object) -> None:
+        """Request a checkpoint at the next safe boundary between batches."""
+
+        nonlocal interrupt_requested
+        interrupt_requested = True
+
+    def save_run_checkpoint(
+        path: Path,
+        *,
+        validation: dict[str, float] | None = None,
+        pass_complete: bool = False,
+    ) -> None:
         save_checkpoint(
-            args.run / "interrupted.pth",
+            path,
             model,
             optimizer,
             scaler,
             balancer,
             architecture,
-            epoch=int(live["epoch"]),
-            batch_in_epoch=int(live["batch"]),
-            step=int(live["step"]),
-            samples_seen=int(live["samplesSeen"]),
+            step=step,
+            samples_seen=samples_seen,
+            batch_size=args.batch_size,
+            pass_complete=pass_complete,
             parameters=parameters,
             datasets=datasets,
             environment=environment,
-            validation=None,
+            validation=validation,
         )
-        print(json.dumps({"phase": "interrupted", "step": int(live["step"])}), flush=True)
-        raise SystemExit(130)
 
-    signal.signal(signal.SIGINT, save_interrupted)
+    signal.signal(signal.SIGINT, request_interrupt)
     started = time.perf_counter()
     print(json.dumps({"device": str(device), "parameters": parameters}, indent=2))
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
     best_score = None
-    stopped_at_budget = False
-    for epoch in range(start_epoch, args.epochs):
-        model.train()
-        # A resumed epoch starts where the checkpoint stopped; the loader skips
-        # the packs it already trained on instead of reading and discarding
-        # them. Later epochs read the whole corpus again.
-        resumed = epoch == start_epoch and resume_batch > 0
-        train_data.skip_batches = resume_batch if resumed else 0
-        for batch_in_epoch, batch in enumerate(
-            train_loader, start=resume_batch if resumed else 1
-        ):
-            batch = move_batch(batch, device)
-            peak = args.peak_learning_rate or args.learning_rate
-            optimizer.param_groups[0]["lr"] = learning_rate_at(
-                step, args.warmup_steps, args.cooldown_steps, peak, args.learning_rate
-            )
-            optimizer.param_groups[1]["lr"] = learning_rate_at(
-                step,
-                args.warmup_steps,
-                args.cooldown_steps,
-                args.loss_balance_learning_rate,
-                args.loss_balance_learning_rate,
-            )
-            samples_seen += len(batch["policy"])
-            optimizer.zero_grad(set_to_none=True)
-            try:
-                with torch.autocast(
-                    device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None
-                ):
-                    outputs = model(batch["obs"].float())
-                    total, losses, _active, weights = multitask_loss(outputs, batch, balancer)
-                scaler.scale(total).backward()
-            except torch.cuda.OutOfMemoryError:
-                # A long run should leave something to resume from when the GPU
-                # runs out, not just a traceback.
-                save_checkpoint(
-                    args.run / "oom-interrupted.pt",
-                    model,
-                    optimizer,
-                    scaler,
-                    balancer,
-                    architecture,
-                    epoch=epoch,
-                    batch_in_epoch=batch_in_epoch,
-                    step=step,
-                    samples_seen=samples_seen,
-                    parameters=parameters,
-                    datasets=datasets,
-                    environment=environment,
-                    validation=None,
-                )
-                print(json.dumps({"phase": "oom", "step": step}))
-                raise
-            scaler.unscale_(optimizer)
-            gradient_norm = float(
-                torch.nn.utils.clip_grad_norm_(
-                    [*model.parameters(), *balancer.parameters()], 5.0
-                )
-            )
-            gradient_max = max(
-                float(parameter.grad.abs().max())
-                for parameter in model.parameters()
-                if parameter.grad is not None
-            )
-            scaler.step(optimizer)
-            scaler.update()
-            step += 1
-            if step == 1 or step % 100 == 0:
-                record = {
-                    "phase": "train",
-                    "epoch": epoch,
-                    "step": step,
-                    "samples": samples_seen,
-                    "elapsedSeconds": time.perf_counter() - started,
-                    "total": float(total.detach()),
-                    **{name: float(value.detach()) for name, value in losses.items()},
-                    **{
-                        f"lossWeight/{name}": float(value.detach())
-                        for name, value in weights.items()
-                    },
-                }
-                if device.type == "cuda":
-                    record["peakAllocatedMiB"] = torch.cuda.max_memory_allocated(device) / 2**20
-                    record["peakReservedMiB"] = torch.cuda.max_memory_reserved(device) / 2**20
-                with log_path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                print(json.dumps(record, ensure_ascii=False))
-                if writer is not None:
-                    writer.add_scalar("Loss/train_batch", float(total.detach()), step)
-                    for name, value in losses.items():
-                        writer.add_scalar(f"Loss/train_{name}_batch", float(value.detach()), step)
-                    for name, value in weights.items():
-                        writer.add_scalar(f"LossBalance/{name}", float(value), step)
-                    writer.add_scalar("Gradient/norm", gradient_norm, step)
-                    writer.add_scalar("Gradient/max", gradient_max, step)
-                    writer.add_scalar(
-                        "LR", optimizer.param_groups[0]["lr"], step
-                    )
-            live.update(step=step, samplesSeen=samples_seen, epoch=epoch, batch=batch_in_epoch)
-            if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
-                rolling = args.run / f"ckpt-{step:09d}.pt"
-                save_checkpoint(
-                    rolling,
-                    model,
-                    optimizer,
-                    scaler,
-                    balancer,
-                    architecture,
-                    epoch=epoch,
-                    batch_in_epoch=batch_in_epoch,
-                    step=step,
-                    samples_seen=samples_seen,
-                    parameters=parameters,
-                    datasets=datasets,
-                    environment=environment,
-                    validation=None,
-                )
-                write_pointer(args.run, rolling, step=step, samplesSeen=samples_seen)
-                prune_numbered_checkpoints(args.run, args.keep_checkpoints)
-                save_checkpoint(
-                    args.run / "checkpoint-latest.pt",
-                    model,
-                    optimizer,
-                    scaler,
-                    balancer,
-                    architecture,
-                    epoch=epoch,
-                    batch_in_epoch=batch_in_epoch,
-                    step=step,
-                    samples_seen=samples_seen,
-                    parameters=parameters,
-                    datasets=datasets,
-                    environment=environment,
-                    validation=None,
-                )
-            if step_budget_reached(step, args.max_steps):
-                stopped_at_budget = True
-                break
-
-        metrics = validate(model, balancer, validation_loader, device)
-        record = {
-            "phase": "validation",
-            "epoch": epoch,
-            "step": step,
-            "stopReason": "max-steps" if stopped_at_budget else None,
-            **metrics,
-        }
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        print(json.dumps(record, ensure_ascii=False))
-        write_dashboard(writer, metrics, step)
-        if writer is not None and fixture is not None:
-            # One fixed input, probed every validation: a metric can look steady
-            # while the behaviour behind it drifts.
-            with torch.no_grad():
-                probe = model(fixture["obs"].float().to(device))
-                policy = probe["policy"][0].softmax(-1)
-                top = policy.topk(3)
-                for rank, (value, action) in enumerate(
-                    zip(top.values.tolist(), top.indices.tolist(), strict=True), start=1
-                ):
-                    writer.add_scalar(f"Fixture/policy_top{rank}_action{action}", value, step)
-                # Sample zero, first opponent: the head predicts one shanten
-                # per opponent, so the probe keeps to a fixed slice of it.
-                for shanten, probability in enumerate(
-                    probe["shanten"][0, 0].softmax(-1).tolist()
-                ):
-                    writer.add_scalar(f"Fixture/shanten_p{shanten}", probability, step)
-                writer.add_scalar(
-                    "Fixture/max_policy", float(policy.max()), step
-                )
-        score = metrics.get(args.best_metric)
-        if score is not None and (best_score is None or float(score) < best_score):
-            best_score = float(score)
-            save_checkpoint(
-                args.run / "best-core.pth",
-                model,
-                optimizer,
-                scaler,
-                balancer,
-                architecture,
-                epoch=epoch,
-                batch_in_epoch=batch_in_epoch,
-                step=step,
-                samples_seen=samples_seen,
-                parameters=parameters,
-                datasets=datasets,
-                environment=environment,
-                validation=metrics,
-            )
+    stop_reason: str | None = None
+    model.train()
+    for batch in train_loader:
+        if interrupt_requested:
+            stop_reason = "interrupted"
+            break
+        batch = move_batch(batch, device)
+        peak = args.peak_learning_rate or args.learning_rate
+        optimizer.param_groups[0]["lr"] = learning_rate_at(
+            step, args.warmup_steps, args.cooldown_steps, peak, args.learning_rate
+        )
+        optimizer.param_groups[1]["lr"] = learning_rate_at(
+            step,
+            args.warmup_steps,
+            args.cooldown_steps,
+            args.loss_balance_learning_rate,
+            args.loss_balance_learning_rate,
+        )
+        optimizer.zero_grad(set_to_none=True)
+        try:
+            with torch.autocast(
+                device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None
+            ):
+                outputs = model(batch["obs"].float())
+                total, losses, _active, weights = multitask_loss(outputs, batch, balancer)
+            scaler.scale(total).backward()
+        except torch.cuda.OutOfMemoryError:
+            # The failed batch has not advanced the single-pass cursor, so a
+            # resumed run will read it again rather than silently dropping it.
+            save_run_checkpoint(args.run / "oom-interrupted.pt")
             write_pointer(
                 args.run,
-                args.run / "best-core.pth",
+                args.run / "oom-interrupted.pt",
                 step=step,
                 samplesSeen=samples_seen,
-                bestMetric=args.best_metric,
-                bestScore=best_score,
             )
-            print(json.dumps({"phase": "best", args.best_metric: best_score, "step": step}))
-        checkpoint_name = (
-            f"checkpoint-step-{step}.pt"
-            if stopped_at_budget
-            else f"checkpoint-epoch-{epoch + 1}.pt"
+            print(json.dumps({"phase": "oom", "step": step}))
+            raise
+        scaler.unscale_(optimizer)
+        gradient_norm = float(
+            torch.nn.utils.clip_grad_norm_([*model.parameters(), *balancer.parameters()], 5.0)
         )
-        save_checkpoint(
-            args.run / checkpoint_name,
-            model,
-            optimizer,
-            scaler,
-            balancer,
-            architecture,
-            epoch=epoch if stopped_at_budget else epoch + 1,
-            batch_in_epoch=batch_in_epoch if stopped_at_budget else 0,
-            step=step,
-            samples_seen=samples_seen,
-            parameters=parameters,
-            datasets=datasets,
-            environment=environment,
-            validation=metrics,
+        gradient_max = max(
+            float(parameter.grad.abs().max())
+            for parameter in model.parameters()
+            if parameter.grad is not None
         )
-        if stopped_at_budget:
+        scaler.step(optimizer)
+        scaler.update()
+        step += 1
+        samples_seen += len(batch["policy"])
+        if step == 1 or step % 100 == 0:
+            record = {
+                "phase": "train",
+                "step": step,
+                "samples": samples_seen,
+                "elapsedSeconds": time.perf_counter() - started,
+                "total": float(total.detach()),
+                **{name: float(value.detach()) for name, value in losses.items()},
+                **{
+                    f"lossWeight/{name}": float(value.detach())
+                    for name, value in weights.items()
+                },
+            }
+            if device.type == "cuda":
+                record["peakAllocatedMiB"] = torch.cuda.max_memory_allocated(device) / 2**20
+                record["peakReservedMiB"] = torch.cuda.max_memory_reserved(device) / 2**20
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            print(json.dumps(record, ensure_ascii=False))
+            if writer is not None:
+                writer.add_scalar("Loss/train_batch", float(total.detach()), step)
+                for name, value in losses.items():
+                    writer.add_scalar(f"Loss/train_{name}_batch", float(value.detach()), step)
+                for name, value in weights.items():
+                    writer.add_scalar(f"LossBalance/{name}", float(value), step)
+                writer.add_scalar("Gradient/norm", gradient_norm, step)
+                writer.add_scalar("Gradient/max", gradient_max, step)
+                writer.add_scalar("LR", optimizer.param_groups[0]["lr"], step)
+        if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
+            rolling = args.run / f"ckpt-{step:09d}.pt"
+            save_run_checkpoint(rolling)
+            write_pointer(args.run, rolling, step=step, samplesSeen=samples_seen)
+            prune_numbered_checkpoints(args.run, args.keep_checkpoints)
+            save_run_checkpoint(args.run / "checkpoint-latest.pt")
+        if step_budget_reached(step, args.max_steps):
+            stop_reason = "max-steps"
             break
+        if interrupt_requested:
+            stop_reason = "interrupted"
+            break
+
+    if stop_reason == "interrupted":
+        save_run_checkpoint(args.run / "interrupted.pth")
+        write_pointer(
+            args.run,
+            args.run / "interrupted.pth",
+            step=step,
+            samplesSeen=samples_seen,
+        )
+        print(json.dumps({"phase": "interrupted", "step": step}), flush=True)
+        raise SystemExit(130)
+
+    if stop_reason is None:
+        if samples_seen != sample_limit:
+            raise RuntimeError(
+                f"training stream ended at sample {samples_seen}, expected {sample_limit}"
+            )
+        stop_reason = (
+            "corpus-exhausted"
+            if sample_limit == train_manifest.samples
+            else "max-train-samples"
+        )
+    pass_complete = samples_seen == train_manifest.samples
+
+    metrics = validate(model, balancer, validation_loader, device)
+    record = {
+        "phase": "validation",
+        "step": step,
+        "stopReason": stop_reason,
+        **metrics,
+    }
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    print(json.dumps(record, ensure_ascii=False))
+    write_dashboard(writer, metrics, step)
+    if writer is not None and fixture is not None:
+        # One fixed input, probed every validation: a metric can look steady
+        # while the behaviour behind it drifts.
+        with torch.no_grad():
+            probe = model(fixture["obs"].float().to(device))
+            policy = probe["policy"][0].softmax(-1)
+            top = policy.topk(3)
+            for rank, (value, action) in enumerate(
+                zip(top.values.tolist(), top.indices.tolist(), strict=True), start=1
+            ):
+                writer.add_scalar(f"Fixture/policy_top{rank}_action{action}", value, step)
+            # Sample zero, first opponent: the head predicts one shanten
+            # per opponent, so the probe keeps to a fixed slice of it.
+            for shanten, probability in enumerate(
+                probe["shanten"][0, 0].softmax(-1).tolist()
+            ):
+                writer.add_scalar(f"Fixture/shanten_p{shanten}", probability, step)
+            writer.add_scalar("Fixture/max_policy", float(policy.max()), step)
+    score = metrics.get(args.best_metric)
+    if score is not None and (best_score is None or float(score) < best_score):
+        best_score = float(score)
+        save_run_checkpoint(
+            args.run / "best-core.pth",
+            validation=metrics,
+            pass_complete=pass_complete,
+        )
+        write_pointer(
+            args.run,
+            args.run / "best-core.pth",
+            step=step,
+            samplesSeen=samples_seen,
+            bestMetric=args.best_metric,
+            bestScore=best_score,
+        )
+        print(json.dumps({"phase": "best", args.best_metric: best_score, "step": step}))
+    checkpoint_name = "checkpoint-complete.pt" if pass_complete else f"checkpoint-step-{step}.pt"
+    final_checkpoint = args.run / checkpoint_name
+    save_run_checkpoint(
+        final_checkpoint,
+        validation=metrics,
+        pass_complete=pass_complete,
+    )
+    write_pointer(
+        args.run,
+        final_checkpoint,
+        step=step,
+        samplesSeen=samples_seen,
+        passComplete=pass_complete,
+    )
 
 
 if __name__ == "__main__":

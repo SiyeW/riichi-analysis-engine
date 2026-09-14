@@ -38,4 +38,4 @@
 
 ## 运行测试训练
 
-建立 Python 3.11 训练环境后，运行 `scripts/run-training-test.ps1`。指定 2025 年牌谱目录、2026 年压缩包和 Mortal Python 模块目录后，脚本会重新转换两个数据集、训练一轮并导出推理权重。
+建立 Python 3.11 训练环境后，运行 `scripts/run-training-test.ps1`。指定 2025 年牌谱目录、2026 年压缩包和 Mortal Python 模块目录后，脚本会重新转换两个数据集，按全局混洗后的顺序单趟训练并导出推理权重。

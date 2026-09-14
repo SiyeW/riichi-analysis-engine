@@ -38,4 +38,4 @@ At least one deterministic perspective is retained for every public event. When 
 
 ## Running the test training job
 
-Create the Python 3.11 training environment, then run `scripts/run-training-test.ps1`. Supply the 2025 log directory, the 2026 archive, and Mortal's Python module directory. The script reconverts both datasets, trains one epoch, and exports inference weights.
+Create the Python 3.11 training environment, then run `scripts/run-training-test.ps1`. Supply the 2025 log directory, the 2026 archive, and Mortal's Python module directory. The script reconverts both datasets, makes one pass over the globally shuffled training data, and exports inference weights.

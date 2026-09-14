@@ -81,3 +81,4 @@ def test_train_command_keeps_all_comparison_controls(tmp_path: Path) -> None:
     assert command[command.index("--batch-size") + 1] == "32"
     assert command[command.index("--seed") + 1] == "20252026"
     assert command[command.index("--analysis-channels") + 1] == "48"
+    assert "--epochs" not in command

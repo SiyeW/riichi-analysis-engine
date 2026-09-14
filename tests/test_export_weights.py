@@ -48,6 +48,15 @@ def test_v6_export_preserves_model_architecture(tmp_path, monkeypatch) -> None:
             "modelArchitecture": architecture.to_dict(),
             "predictionValues": {"dora": list(DORA_VALUES), "score": list(SCORE_VALUES)},
             "environment": {},
+            "step": 10,
+            "samplesSeen": 320,
+            "trainingCursor": {
+                "type": "single-pass-v1",
+                "nextSample": 320,
+                "batchesConsumed": 10,
+                "batchSize": 32,
+                "complete": False,
+            },
         },
         source,
     )
@@ -58,3 +67,11 @@ def test_v6_export_preserves_model_architecture(tmp_path, monkeypatch) -> None:
     exported = torch.load(destination, map_location="cpu", weights_only=True)
     assert exported["format"] == "riichi-analysis-model-v6"
     assert exported["architecture"]["model"] == architecture.to_dict()
+    assert exported["training"]["step"] == 10
+    assert exported["training"]["samplesSeen"] == 320
+    assert exported["training"]["pass"] == {
+        "type": "single-pass-v1",
+        "nextSample": 320,
+        "complete": False,
+    }
+    assert "epoch" not in exported["training"]

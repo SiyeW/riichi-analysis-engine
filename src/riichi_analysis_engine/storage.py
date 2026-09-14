@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -137,7 +138,7 @@ def write_packed_shard(path: str | Path, packed: dict[str, np.ndarray]) -> None:
     try:
         with temporary.open("wb") as handle:
             np.savez_compressed(handle, **payload)
-        os.replace(temporary, destination)
+        _replace_atomically(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -148,6 +149,19 @@ def _temporary_sibling(destination: Path) -> Path:
     return destination.with_name(
         f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
+
+
+def _replace_atomically(source: Path, destination: Path, attempts: int = 8) -> None:
+    """Replace a file despite brief Windows sharing violations at the destination."""
+
+    for attempt in range(attempts):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt + 1 == attempts:
+                raise
+            time.sleep(0.01 * (attempt + 1))
 
 
 def read_packed_shard(path: str | Path) -> dict[str, np.ndarray]:
@@ -301,7 +315,7 @@ def save_chunk_archive(
                 "chunkLengths": lengths,
             }
             archive.writestr("meta.json", json.dumps(meta, separators=(",", ":")))
-        os.replace(temporary, destinations)
+        _replace_atomically(temporary, destinations)
     finally:
         temporary.unlink(missing_ok=True)
     return meta
