@@ -9,6 +9,7 @@ from test_storage import sample_arrays
 from riichi_analysis_engine import dataset
 from riichi_analysis_engine.dataset import METADATA_FIELDS, PackDataset, read_manifest
 from riichi_analysis_engine.packing import (
+    LEGACY_MANIFEST_FORMATS,
     MANIFEST_FORMAT,
     build_pack,
     pack_slots,
@@ -124,6 +125,18 @@ def test_a_full_pass_yields_every_sample_once(scratch: Path) -> None:
     seen = np.concatenate([batch["sample_tag"] for batch in batches])
     assert sorted(seen.tolist()) == sorted(stored_tags(root).tolist())
     assert len(seen) == read_manifest(root)["samples"] == 128
+
+
+def test_legacy_pack_manifest_remains_readable(scratch: Path) -> None:
+    root = pack_directory(scratch)
+    manifest_path = root / "manifest.json"
+    manifest = read_manifest(root)
+    manifest["format"] = next(iter(LEGACY_MANIFEST_FORMATS))
+    write_manifest(manifest_path, manifest)
+
+    batches = collect(PackDataset(root, batch_size=8))
+
+    assert sum(len(batch["policy"]) for batch in batches) == 128
 
 
 def test_batches_are_whole_and_only_the_last_one_may_be_short(scratch: Path) -> None:
