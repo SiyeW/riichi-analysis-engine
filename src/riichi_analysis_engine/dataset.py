@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-from .packing import MANIFEST_FORMAT
+from .packing import SUPPORTED_MANIFEST_FORMATS
 from .storage import read_packed_shard, slice_packed, unpack_shard_arrays
 
 # Provenance the packer records alongside every sample. It stays out of the
@@ -39,7 +39,7 @@ def read_manifest(root: str | Path) -> dict[str, object]:
     if not path.exists():
         raise FileNotFoundError(f"{root} holds no manifest.json, so it is not a pack directory")
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("format") != MANIFEST_FORMAT:
+    if manifest.get("format") not in SUPPORTED_MANIFEST_FORMATS:
         raise ValueError(f"{path} declares an unsupported manifest format")
     packs = manifest.get("packs")
     if not isinstance(packs, list) or not packs:
