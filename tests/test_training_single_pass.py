@@ -142,3 +142,53 @@ def test_training_checkpoint_is_durable_before_validation(
     assert stopped.value.code == 130
     pointer = json.loads((run / "latest_checkpoint.json").read_text(encoding="utf-8"))
     assert pointer["validationComplete"] is False
+
+
+def test_interrupt_saves_the_next_unread_sample_and_can_resume(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packs = pack_directory(scratch, training_targets=True)
+    run = scratch / "run"
+    installed_handler: dict[str, object] = {}
+    original_loss = train.multitask_loss
+    interrupted = False
+
+    def capture_handler(_signal: int, handler: object) -> object:
+        installed_handler["handler"] = handler
+        return handler
+
+    def interrupt_after_first_loss(*args: object, **kwargs: object):
+        nonlocal interrupted
+        result = original_loss(*args, **kwargs)
+        if not interrupted:
+            interrupted = True
+            handler = installed_handler["handler"]
+            assert callable(handler)
+            handler()
+        return result
+
+    monkeypatch.setattr(train.signal, "signal", capture_handler)
+    monkeypatch.setattr(train, "multitask_loss", interrupt_after_first_loss)
+    with pytest.raises(SystemExit) as stopped:
+        run_training(monkeypatch, packs, run, max_samples=32)
+
+    assert stopped.value.code == 130
+    interrupted_checkpoint = train.resolve_resume_path(run)
+    assert interrupted_checkpoint.name == "interrupted.pth"
+    assert load_cursor(interrupted_checkpoint) == {
+        "type": "single-pass-v1",
+        "nextSample": 8,
+        "batchesConsumed": 1,
+        "batchSize": 8,
+        "complete": False,
+    }
+
+    monkeypatch.setattr(train, "multitask_loss", original_loss)
+    resumed = run_training(
+        monkeypatch,
+        packs,
+        run,
+        max_samples=32,
+        resume=interrupted_checkpoint,
+    )
+    assert load_cursor(resumed)["nextSample"] == 32
