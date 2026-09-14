@@ -71,6 +71,9 @@ def source_metadata() -> dict[str, object]:
         )
         return {"sourceRevision": revision, "sourceDirty": dirty}
     except (FileNotFoundError, subprocess.CalledProcessError):
+        revision = os.environ.get("RIICHI_ANALYSIS_SOURCE_REVISION", "").strip().lower()
+        if len(revision) == 40 and all(character in "0123456789abcdef" for character in revision):
+            return {"sourceRevision": revision, "sourceDirty": False}
         return {"sourceRevision": None, "sourceDirty": None}
 
 

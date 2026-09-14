@@ -1,5 +1,6 @@
 import json
 import random
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,7 @@ from riichi_analysis_engine.train import (
     prune_numbered_checkpoints,
     restore_random_state,
     resolve_resume_path,
+    source_metadata,
     write_dashboard,
     write_pointer,
 )
@@ -25,6 +27,33 @@ class RecordingWriter:
 
     def add_scalar(self, tag: str, value: float, step: int) -> None:
         self.scalars.append((tag, value, step))
+
+
+def test_source_metadata_uses_recorded_revision_for_a_clean_source_archive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revision = "f" * 40
+    monkeypatch.setenv("RIICHI_ANALYSIS_SOURCE_REVISION", revision)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.CalledProcessError(128, "git")),
+    )
+
+    assert source_metadata() == {"sourceRevision": revision, "sourceDirty": False}
+
+
+def test_source_metadata_rejects_an_invalid_recorded_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RIICHI_ANALYSIS_SOURCE_REVISION", "not-a-commit")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.CalledProcessError(128, "git")),
+    )
+
+    assert source_metadata() == {"sourceRevision": None, "sourceDirty": None}
 
 
 def test_label_entropy_of_a_uniform_distribution_is_log_of_the_classes() -> None:
