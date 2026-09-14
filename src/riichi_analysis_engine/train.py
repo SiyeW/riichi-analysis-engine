@@ -873,7 +873,19 @@ def main() -> None:
                     writer.add_scalar("AMP/scale", scaler.get_scale(), step)
             last_log_time = now
             last_log_samples = samples_seen
-        if checkpoint_interval > 0 and samples_seen >= next_checkpoint_sample:
+        # A terminal boundary gets its named checkpoint immediately below.
+        # Do not write the same model twice merely because it also lands on a
+        # rolling cadence boundary.
+        terminal_boundary = (
+            samples_seen >= sample_limit
+            or step_budget_reached(step, args.max_steps)
+            or interrupt_requested
+        )
+        if (
+            checkpoint_interval > 0
+            and samples_seen >= next_checkpoint_sample
+            and not terminal_boundary
+        ):
             rolling = args.run / f"ckpt-{step:09d}.pt"
             save_run_checkpoint(rolling)
             write_pointer(args.run, rolling, step=step, samplesSeen=samples_seen)

@@ -213,3 +213,23 @@ def test_rolling_checkpoints_follow_sample_thresholds_not_step_numbers(
     assert rolling == ["ckpt-000000002.pt", "ckpt-000000003.pt"]
     assert load_cursor(run / rolling[0])["nextSample"] == 16
     assert load_cursor(run / rolling[1])["nextSample"] == 24
+
+
+def test_terminal_sample_boundary_is_not_saved_twice(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packs = pack_directory(scratch, training_targets=True)
+    run = scratch / "run"
+
+    final_checkpoint = run_training(
+        monkeypatch,
+        packs,
+        run,
+        max_samples=32,
+        checkpoint_every_samples=16,
+    )
+
+    assert final_checkpoint.name == "checkpoint-step-4.pt"
+    assert sorted(path.name for path in run.glob("ckpt-*.pt")) == [
+        "ckpt-000000002.pt"
+    ]
