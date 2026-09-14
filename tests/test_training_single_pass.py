@@ -31,6 +31,7 @@ def run_training(
     *,
     max_samples: int,
     resume: Path | None = None,
+    checkpoint_every_samples: int = 0,
 ) -> Path:
     arguments = [
         "riichi-analysis-train",
@@ -47,7 +48,7 @@ def run_training(
         "--max-validation-samples",
         "8",
         "--checkpoint-every-samples",
-        "0",
+        str(checkpoint_every_samples),
         "--device",
         "cpu",
         "--analysis-channels",
@@ -192,3 +193,23 @@ def test_interrupt_saves_the_next_unread_sample_and_can_resume(
         resume=interrupted_checkpoint,
     )
     assert load_cursor(resumed)["nextSample"] == 32
+
+
+def test_rolling_checkpoints_follow_sample_thresholds_not_step_numbers(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packs = pack_directory(scratch, training_targets=True)
+    run = scratch / "run"
+
+    run_training(
+        monkeypatch,
+        packs,
+        run,
+        max_samples=29,
+        checkpoint_every_samples=10,
+    )
+
+    rolling = sorted(path.name for path in run.glob("ckpt-*.pt"))
+    assert rolling == ["ckpt-000000002.pt", "ckpt-000000003.pt"]
+    assert load_cursor(run / rolling[0])["nextSample"] == 16
+    assert load_cursor(run / rolling[1])["nextSample"] == 24
