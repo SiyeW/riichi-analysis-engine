@@ -43,6 +43,7 @@ from .structured_outputs import (
     fixed_total_values,
     zero_sum_accounts,
 )
+from .training_schema import validate_v8_training_batch
 
 
 class TrainingInterrupted(Exception):
@@ -992,6 +993,19 @@ def main() -> None:
         fixture = next(iter(validation_loader))
     except StopIteration:
         fixture = None
+    if args.model_format == 8:
+        try:
+            train_fixture = next(iter(train_loader))
+        except StopIteration as error:
+            raise RuntimeError("training data contains no samples") from error
+        training_contract = {
+            "train": validate_v8_training_batch(train_fixture),
+            "validation": (
+                validate_v8_training_batch(fixture) if fixture is not None else None
+            ),
+        }
+    else:
+        training_contract = None
 
     args.run.mkdir(parents=True, exist_ok=True)
     config = {
@@ -1012,6 +1026,7 @@ def main() -> None:
             "sampleLimit": sample_limit,
         },
         "environment": environment,
+        "trainingContract": training_contract,
     }
     (args.run / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2, default=str) + "\n",

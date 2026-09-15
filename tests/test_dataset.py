@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from test_storage import sample_arrays
 
+from riichi_analysis_engine.constants import TILE_TYPES
 from riichi_analysis_engine import dataset
 from riichi_analysis_engine.dataset import (
     METADATA_FIELDS,
@@ -25,6 +26,11 @@ from riichi_analysis_engine.packing import (
     write_manifest,
 )
 from riichi_analysis_engine.storage import save_chunk_archive
+from riichi_analysis_engine.observation_layout import (
+    JIKAZE_CHANNEL,
+    MORTAL_ANALYSIS_CHANNELS,
+    WIND_TILE_START,
+)
 
 
 @pytest.fixture()
@@ -65,6 +71,17 @@ def pack_directory(
         # whole corpus, the way the real targets are shaped.
         arrays["sample_tag"] = np.arange(count, dtype=np.int32) + game * 1000
         if training_targets:
+            # A real v8 observation contains one controlled-player seat wind
+            # and one current-rank plane for each of four players.  The
+            # generic storage fixture deliberately omits semantics, so add the
+            # minimum coherent observation contract for training tests here.
+            arrays["obs"][:, JIKAZE_CHANNEL, WIND_TILE_START : WIND_TILE_START + 4] = 0
+            arrays["obs"][:, JIKAZE_CHANNEL, WIND_TILE_START] = 1
+            arrays["obs"][:, MORTAL_ANALYSIS_CHANNELS : MORTAL_ANALYSIS_CHANNELS + 16] = 0
+            for player in range(4):
+                arrays["obs"][
+                    :, MORTAL_ANALYSIS_CHANNELS + player * 4 + player, :TILE_TYPES
+                ] = 1
             arrays.update(
                 {
                     "policy": np.zeros(count, dtype=np.int8),
