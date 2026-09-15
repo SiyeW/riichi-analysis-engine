@@ -72,3 +72,21 @@ def test_protocol_marginals_conserve_tiles_and_keep_red_inside_fives() -> None:
     assert torch.all(
         red[..., 1] <= expected_total[:, :, list(FIVE_TILE_INDICES)] + 1e-6
     )
+
+
+def test_protocol_marginals_support_a_real_training_batch() -> None:
+    """The marginal decoder must index batch, source, and tile independently."""
+
+    _physical, inventory, capacities = physical_hidden_counts(*_example())
+    inventory = inventory.repeat(32, 1)
+    capacities = capacities.repeat(32, 1)
+    probabilities = balanced_source_probabilities(
+        torch.randn(32, 4, 37), inventory, capacities, iterations=16
+    )
+
+    total, red = count_marginals(probabilities, inventory)
+
+    assert total.shape == (32, 4, 34, 5)
+    assert red.shape == (32, 4, 3, 2)
+    assert torch.allclose(total.sum(-1), torch.ones_like(total[..., 0]), atol=1e-6)
+    assert torch.allclose(red.sum(-1), torch.ones_like(red[..., 0]), atol=1e-6)

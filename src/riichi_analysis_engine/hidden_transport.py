@@ -146,7 +146,11 @@ def _binomial_marginals(copy_count: Tensor, probability: Tensor) -> Tensor:
             continue
         p = probability[selected]
         for count in range(copies + 1):
-            result[selected, count] = (
+            # Select the last probability axis first.  Indexing ``result``
+            # with the three-dimensional mask and ``count`` together happens
+            # to work for a singleton batch but treats the source axis as an
+            # indexed dimension once the batch has multiple samples.
+            result[..., count][selected] = (
                 math.comb(copies, count) * p.pow(count) * (1.0 - p).pow(copies - count)
             )
     return result
