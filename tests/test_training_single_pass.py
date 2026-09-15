@@ -37,6 +37,7 @@ def run_training(
     max_samples: int,
     resume: Path | None = None,
     checkpoint_every_samples: int = 0,
+    validate_only: bool = False,
 ) -> Path:
     arguments = [
         "riichi-analysis-train",
@@ -89,6 +90,8 @@ def run_training(
     ]
     if resume is not None:
         arguments.extend(["--resume", str(resume)])
+    if validate_only:
+        arguments.append("--validate-only")
     monkeypatch.setattr(sys, "argv", arguments)
     monkeypatch.setattr(train, "open_dashboard", lambda _run: None)
     train.main()
@@ -164,6 +167,49 @@ def test_training_checkpoint_is_durable_before_validation(
     assert stopped.value.code == 130
     pointer = json.loads((run / "latest_checkpoint.json").read_text(encoding="utf-8"))
     assert pointer["validationComplete"] is False
+
+
+def test_validation_can_resume_without_replaying_training_samples(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packs = pack_directory(scratch, training_targets=True)
+    interrupted_run = scratch / "interrupted"
+    validation_run = scratch / "validation"
+    original_validate = train.validate
+
+    def interrupt_validation(*_args: object, **_kwargs: object) -> dict[str, float]:
+        raise train.TrainingInterrupted
+
+    monkeypatch.setattr(train, "validate", interrupt_validation)
+    with pytest.raises(SystemExit) as stopped:
+        run_training(monkeypatch, packs, interrupted_run, max_samples=16)
+    assert stopped.value.code == 130
+
+    checkpoint = train.resolve_resume_path(interrupted_run)
+    cursor_before = load_cursor(checkpoint)
+    monkeypatch.setattr(train, "validate", original_validate)
+    validated = run_training(
+        monkeypatch,
+        packs,
+        validation_run,
+        max_samples=16,
+        resume=checkpoint,
+        validate_only=True,
+    )
+
+    assert load_cursor(validated) == cursor_before
+    pointer = json.loads(
+        (validation_run / "latest_checkpoint.json").read_text(encoding="utf-8")
+    )
+    assert pointer["validationComplete"] is True
+    records = [
+        json.loads(line)
+        for line in (validation_run / "metrics.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [record["phase"] for record in records] == ["validation"]
+    assert records[0]["stopReason"] == "validation-only"
 
 
 def test_interrupt_saves_the_next_unread_sample_and_can_resume(
