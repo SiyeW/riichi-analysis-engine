@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from riichi_analysis_engine.architecture import ModelArchitecture
-from riichi_analysis_engine.losses import LOSS_TERMS, LearnedUncertaintyBalancer
+from riichi_analysis_engine.architecture import StructuredModelArchitecture
+from riichi_analysis_engine.losses import LOSS_TERMS_V8, LearnedUncertaintyBalancer
 from riichi_analysis_engine.model import RiichiAnalysisModel
 from riichi_analysis_engine.train import (
     resume_training_cursor,
@@ -12,20 +12,26 @@ from riichi_analysis_engine.train import (
 )
 
 
-def test_v7_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> None:
-    architecture = ModelArchitecture(
-        analysis_channels=16,
-        analysis_blocks=1,
-        analysis_latent_width=32,
-        state_width=24,
-        future_width=20,
+def test_v8_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> None:
+    architecture = StructuredModelArchitecture(
+        shared_channels=16,
+        shared_blocks=1,
+        family_latent_width=32,
+        opponent_blocks=1,
+        hidden_blocks=1,
+        value_blocks=1,
+        kyoku_blocks=1,
+        match_blocks=1,
+        policy_blocks=1,
+        task_width=24,
+        tile_width=8,
         policy_context_channels=16,
         policy_context_blocks=1,
         policy_context_width=16,
         policy_width=24,
     )
-    model = RiichiAnalysisModel(architecture=architecture)
-    balancer = LearnedUncertaintyBalancer()
+    model = RiichiAnalysisModel(format_version=8, architecture=architecture)
+    balancer = LearnedUncertaintyBalancer(LOSS_TERMS_V8)
     optimizer = torch.optim.AdamW(
         [
             {"params": model.parameters()},
@@ -53,9 +59,9 @@ def test_v7_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> 
     )
 
     payload = torch.load(destination, map_location="cpu", weights_only=True)
-    assert payload["format"] == "riichi-analysis-model-v7"
+    assert payload["format"] == "riichi-analysis-model-v8"
     assert payload["modelArchitecture"] == architecture.to_dict()
-    assert payload["lossBalancer"]["terms"] == list(LOSS_TERMS)
+    assert payload["lossBalancer"]["terms"] == list(LOSS_TERMS_V8)
     assert payload["trainingCursor"] == {
         "type": "single-pass-v1",
         "nextSample": 20,

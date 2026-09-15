@@ -28,7 +28,14 @@ from .storage import read_packed_shard, slice_packed, unpack_shard_arrays
 # Provenance the packer records alongside every sample. It stays out of the
 # batches: the model sees observations and targets, nothing else.
 METADATA_FIELDS = frozenset(
-    {"perspective", "event_index", "source_game", "pack_index", "kyoku_index"}
+    {
+        "perspective",
+        "event_index",
+        "source_game",
+        "pack_index",
+        "kyoku_index",
+        "system_total",
+    }
 )
 
 
@@ -37,7 +44,9 @@ def read_manifest(root: str | Path) -> dict[str, object]:
 
     path = Path(root) / "manifest.json"
     if not path.exists():
-        raise FileNotFoundError(f"{root} holds no manifest.json, so it is not a pack directory")
+        raise FileNotFoundError(
+            f"{root} holds no manifest.json, so it is not a pack directory"
+        )
     manifest = json.loads(path.read_text(encoding="utf-8"))
     if manifest.get("format") not in SUPPORTED_MANIFEST_FORMATS:
         raise ValueError(f"{path} declares an unsupported manifest format")
@@ -45,6 +54,44 @@ def read_manifest(root: str | Path) -> dict[str, object]:
     if not isinstance(packs, list) or not packs:
         raise ValueError(f"{path} lists no packs")
     return manifest
+
+
+def _settle_legacy_terminal_scores(arrays: dict[str, np.ndarray]) -> None:
+    """Repair old packs whose terminal MJAI event left riichi sticks unassigned.
+
+    New conversion writes ``system_total`` explicitly. Historical Tenhou packs
+    predate that field and always use four 25,000-point accounts, so 100,000 is
+    their compatibility total. The correction is deterministic from the final
+    scores and the stored absolute perspective; it does not inspect a target
+    that would be unavailable at inference time.
+    """
+
+    scores = arrays.get("match_score")
+    if scores is None or scores.ndim != 2 or scores.shape[1] != 4:
+        return
+    totals = arrays.get("system_total")
+    if totals is None:
+        totals = np.full(len(scores), 100_000, dtype=np.int32)
+    totals = np.asarray(totals, dtype=np.int64).reshape(-1)
+    if len(totals) != len(scores):
+        raise ValueError("system-total labels do not match terminal-score labels")
+    sums = scores.astype(np.int64, copy=False).sum(axis=-1)
+    deficits = totals - sums
+    repair = (sums > 0) & (deficits > 0)
+    if (deficits[sums > 0] < 0).any() or (deficits[repair] % 1_000 != 0).any():
+        raise ValueError("terminal scores are inconsistent with the system total")
+    if not repair.any():
+        return
+    perspectives = arrays.get("perspective")
+    if perspectives is None or len(perspectives) != len(scores):
+        raise ValueError("terminal-score repair requires each sample's perspective")
+    for row in np.flatnonzero(repair):
+        maximum = int(scores[row].max())
+        tied = np.flatnonzero(scores[row] == maximum)
+        winner = min(
+            tied, key=lambda relative: (int(perspectives[row]) + int(relative)) % 4
+        )
+        scores[row, winner] += deficits[row]
 
 
 class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
@@ -77,7 +124,9 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
         self.packs = [self.root / str(entry["pack"]) for entry in self.entries]
         missing = [path for path in self.packs if not path.exists()]
         if missing:
-            raise FileNotFoundError(f"{missing[0]} is listed in the manifest but missing")
+            raise FileNotFoundError(
+                f"{missing[0]} is listed in the manifest but missing"
+            )
         self.samples = int(self.manifest["samples"])
         if self.start_sample > self.samples:
             raise ValueError("starting sample lies beyond the end of the corpus")
@@ -93,20 +142,29 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
     def _sample_count(packed: dict[str, np.ndarray]) -> int:
         return len(packed["obs_offsets"]) - 1
 
-    def _dense(self, packed: dict[str, np.ndarray], start: int, stop: int) -> dict[str, np.ndarray]:
+    def _dense(
+        self, packed: dict[str, np.ndarray], start: int, stop: int
+    ) -> dict[str, np.ndarray]:
         arrays = unpack_shard_arrays(slice_packed(packed, start, stop))
-        return {name: value for name, value in arrays.items() if name not in METADATA_FIELDS}
+        _settle_legacy_terminal_scores(arrays)
+        return {
+            name: value for name, value in arrays.items() if name not in METADATA_FIELDS
+        }
 
     @staticmethod
     def _merge(
         parts: list[dict[str, np.ndarray]],
     ) -> dict[str, np.ndarray]:
-        return {name: np.concatenate([part[name] for part in parts], axis=0) for name in parts[0]}
+        return {
+            name: np.concatenate([part[name] for part in parts], axis=0)
+            for name in parts[0]
+        }
 
     @staticmethod
     def _torch(arrays: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
         return {
-            name: torch.from_numpy(np.ascontiguousarray(value)) for name, value in arrays.items()
+            name: torch.from_numpy(np.ascontiguousarray(value))
+            for name, value in arrays.items()
         }
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
@@ -115,7 +173,9 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
             packs = self.selected_packs()
         else:
             if self.start_sample:
-                raise ValueError("starting from a sample cursor requires a single worker")
+                raise ValueError(
+                    "starting from a sample cursor requires a single worker"
+                )
             packs = self.selected_packs(worker.id, worker.num_workers)
         accepted = 0
         skip = self.start_sample
@@ -129,7 +189,9 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
                 continue
             packed = read_packed_shard(path)
             if self._sample_count(packed) != count:
-                raise ValueError(f"{path.name} holds a different sample count than the manifest")
+                raise ValueError(
+                    f"{path.name} holds a different sample count than the manifest"
+                )
             start = skip
             skip = 0
             if pending is not None:
@@ -144,7 +206,10 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
                             return
                         if remaining < self.batch_size:
                             yield self._torch(
-                                {name: value[:remaining] for name, value in pending.items()}
+                                {
+                                    name: value[:remaining]
+                                    for name, value in pending.items()
+                                }
                             )
                             return
                     accepted += len(next(iter(pending.values())))
@@ -157,7 +222,9 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
                     if remaining <= 0:
                         return
                     if remaining < self.batch_size:
-                        yield self._torch(self._dense(packed, offset, offset + remaining))
+                        yield self._torch(
+                            self._dense(packed, offset, offset + remaining)
+                        )
                         return
                 accepted += self.batch_size
                 yield self._torch(self._dense(packed, offset, offset + self.batch_size))

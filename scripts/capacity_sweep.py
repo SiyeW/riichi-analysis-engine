@@ -151,6 +151,8 @@ def make_train_command(
         args.device,
         "--seed",
         str(args.seed),
+        "--model-format",
+        "7",
         *point.train_arguments(),
     ]
     if max_validation_samples:

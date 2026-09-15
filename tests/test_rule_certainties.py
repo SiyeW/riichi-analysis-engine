@@ -58,6 +58,25 @@ def test_known_red_five_makes_every_other_red_location_impossible() -> None:
     assert state.wall_red_range("5mr") == (0, 0)
 
 
+def test_hidden_transport_constraints_balance_physical_tiles_and_sources() -> None:
+    hands = [
+        ["5mr", "1m", "2m", "3m", "4m", "6m", "7m", "8m", "9m", "1s", "2s", "3s", "4s"],
+        ["?"] * 13,
+        ["?"] * 13,
+        ["?"] * 13,
+    ]
+    state = PublicRuleState.from_events([start_kyoku(hands, marker="1p")])
+
+    inventory, capacities = state.hidden_transport_constraints(0)
+
+    assert inventory.shape == (37,)
+    assert capacities.tolist() == [13, 13, 13, 83]
+    assert inventory[0] == 3
+    assert inventory[4] == 3
+    assert inventory[34] == 0
+    assert int(inventory.sum()) == int(capacities.sum())
+
+
 def test_public_discards_reduce_count_ranges() -> None:
     hands = [["?"] * 13 for _ in range(4)]
     events = [

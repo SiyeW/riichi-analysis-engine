@@ -1,6 +1,9 @@
 import torch
 
-from riichi_analysis_engine.architecture import ModelArchitecture
+from riichi_analysis_engine.architecture import (
+    ModelArchitecture,
+    StructuredModelArchitecture,
+)
 from riichi_analysis_engine.constants import MORTAL_OBS_CHANNELS, OBS_CHANNELS
 from riichi_analysis_engine.model import RiichiAnalysisModel, count_parameters
 from riichi_analysis_engine.observation_layout import POLICY_CONTEXT_START
@@ -8,6 +11,7 @@ from riichi_analysis_engine.observation_layout import POLICY_CONTEXT_START
 
 def test_output_shapes() -> None:
     model = RiichiAnalysisModel(
+        format_version=7,
         architecture=ModelArchitecture(
             analysis_channels=32,
             analysis_blocks=2,
@@ -18,7 +22,7 @@ def test_output_shapes() -> None:
             policy_context_blocks=1,
             policy_context_width=32,
             policy_width=48,
-        )
+        ),
     )
     outputs = model(torch.zeros(2, OBS_CHANNELS, 34))
     assert outputs["shanten"].shape == (2, 3, 7)
@@ -42,12 +46,15 @@ def test_output_shapes() -> None:
 def test_default_parameter_budget() -> None:
     model = RiichiAnalysisModel()
     assert count_parameters(model) == {
-        "encoder": 29_560_748,
-        "state": 2_031_422,
-        "future": 1_456_397,
+        "shared": 12_762_080,
+        "opponent": 11_359_419,
+        "hidden": 4_516_400,
+        "value": 4_563_532,
+        "kyoku": 4_084_646,
+        "match": 3_274_108,
         "policy_context": 1_260_086,
-        "policy": 1_621_038,
-        "total": 35_929_691,
+        "policy": 11_754_190,
+        "total": 53_574_461,
     }
 
 
@@ -93,9 +100,45 @@ def test_v6_architecture_round_trips_and_keeps_prediction_heads_state_only() -> 
     model = RiichiAnalysisModel(format_version=6, architecture=architecture).eval()
     first = torch.randn(1, OBS_CHANNELS, 34)
     second = first.clone()
-    second[:, POLICY_CONTEXT_START:] = torch.randn_like(second[:, POLICY_CONTEXT_START:])
+    second[:, POLICY_CONTEXT_START:] = torch.randn_like(
+        second[:, POLICY_CONTEXT_START:]
+    )
     first_outputs = model(first)
     second_outputs = model(second)
     assert torch.equal(first_outputs["shanten"], second_outputs["shanten"])
     assert torch.equal(first_outputs["outcome"], second_outputs["outcome"])
     assert not torch.equal(first_outputs["policy"], second_outputs["policy"])
+
+
+def test_v8_family_towers_keep_tilewise_outputs_and_structured_accounts() -> None:
+    architecture = StructuredModelArchitecture(
+        shared_channels=16,
+        shared_blocks=1,
+        family_latent_width=32,
+        opponent_blocks=1,
+        hidden_blocks=1,
+        value_blocks=1,
+        kyoku_blocks=1,
+        match_blocks=1,
+        policy_blocks=1,
+        task_width=24,
+        tile_width=8,
+        policy_context_channels=8,
+        policy_context_blocks=1,
+        policy_context_width=16,
+        policy_width=32,
+    )
+    assert StructuredModelArchitecture.from_dict(architecture.to_dict()) == architecture
+    model = RiichiAnalysisModel(format_version=8, architecture=architecture)
+
+    outputs = model(torch.zeros(2, OBS_CHANNELS, 34))
+
+    assert outputs["shanten"].shape == (2, 3, 7)
+    assert outputs["deal_in_tile"].shape == (2, 3, 34)
+    assert outputs["hidden_source_affinity"].shape == (2, 4, 34)
+    assert outputs["hidden_red_source"].shape == (2, 3, 4)
+    assert outputs["dora_tail"].shape == (2, 3)
+    assert outputs["kyoku_accounts"].shape == (2, 5)
+    assert count_parameters(model)["total"] == sum(
+        parameter.numel() for parameter in model.parameters()
+    )

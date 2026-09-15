@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from .constants import RED_TILES, TILES_34, deaka
+from .constants import RED_TILES, TILES_34, deaka, relative_players
 
 
 def _seat(value: Any) -> int | None:
@@ -174,7 +174,9 @@ class PublicRuleState:
         elif kind in {"chi", "pon", "daiminkan", "ankan"} and actor is not None:
             consumed = event.get("consumed")
             tiles = consumed if isinstance(consumed, list) else []
-            self.concealed_sizes[actor] = max(0, self.concealed_sizes[actor] - len(tiles))
+            self.concealed_sizes[actor] = max(
+                0, self.concealed_sizes[actor] - len(tiles)
+            )
             for raw_tile in tiles:
                 tile = _tile(raw_tile)
                 if tile is not None:
@@ -289,6 +291,42 @@ class PublicRuleState:
             return 0, 1
         other_capacity = sum(self._unknown_hand_capacity(seat) for seat in range(4))
         return self._range(1, known_total, 0, self.wall_size, other_capacity)
+
+    def hidden_transport_constraints(
+        self, controlled_seat: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return 37 physical-tile inventories and four hidden-source capacities."""
+
+        if not 0 <= controlled_seat < 4:
+            raise ValueError("controlled seat must be in 0..3")
+        inventory = np.asarray(
+            [max(0, 4 - self._known_family_total(tile)) for tile in TILES_34],
+            dtype=np.int64,
+        )
+        red_inventory = np.asarray(
+            [max(0, 1 - self._known_red_total(tile)) for tile in RED_TILES],
+            dtype=np.int64,
+        )
+        for suit, tile_index in enumerate((4, 13, 22)):
+            inventory[tile_index] -= red_inventory[suit]
+        capacities = np.asarray(
+            [
+                *(
+                    self._unknown_hand_capacity(seat)
+                    for seat in relative_players(controlled_seat)
+                ),
+                self.wall_size,
+            ],
+            dtype=np.int64,
+        )
+        physical_inventory = np.concatenate((inventory, red_inventory))
+        if (physical_inventory < 0).any():
+            raise ValueError("public state contains inconsistent red-five information")
+        if int(physical_inventory.sum()) != int(capacities.sum()):
+            raise ValueError(
+                "public hidden-tile inventories and source capacities do not balance"
+            )
+        return physical_inventory, capacities
 
 
 def apply_opponent_rule_certainties(

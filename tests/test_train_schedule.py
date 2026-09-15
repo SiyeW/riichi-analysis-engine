@@ -1,7 +1,11 @@
 import pytest
 import torch
 
-from riichi_analysis_engine.train import gradient_total_norm, learning_rate_at
+from riichi_analysis_engine.train import (
+    gradient_total_norm,
+    learning_rate_at,
+    shared_gradient_geometry,
+)
 
 
 def test_gradient_norm_measurement_does_not_modify_gradients() -> None:
@@ -11,6 +15,28 @@ def test_gradient_norm_measurement_does_not_modify_gradients() -> None:
 
     assert gradient_total_norm([parameter]) == pytest.approx(5.0)
     assert torch.equal(parameter.grad, before)
+
+
+def test_shared_gradient_geometry_reports_orthogonal_and_opposed_tasks() -> None:
+    shared = torch.tensor([[2.0, 3.0]], requires_grad=True)
+    losses = {
+        "right": shared[:, 0].sum(),
+        "up": shared[:, 1].sum(),
+        "left": -shared[:, 0].sum(),
+        "inactive": shared.sum(),
+    }
+    metrics = shared_gradient_geometry(
+        losses,
+        {"right": True, "up": True, "left": True, "inactive": False},
+        shared,
+    )
+
+    assert metrics["sharedGradientNorm/right"] == pytest.approx(1.0)
+    assert metrics["sharedGradientCosine/right__up"] == pytest.approx(0.0)
+    assert metrics["sharedGradientCosine/right__left"] == pytest.approx(-1.0)
+    assert metrics["sharedGradientCosine/up__left"] == pytest.approx(0.0)
+    assert metrics["sharedGradientConflictFraction"] == pytest.approx(1 / 3)
+    assert not any("inactive" in name for name in metrics)
 
 
 def test_the_default_shape_keeps_the_plateau_rate_constant() -> None:

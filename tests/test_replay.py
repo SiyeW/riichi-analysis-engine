@@ -1,8 +1,16 @@
-import numpy as np
 from types import SimpleNamespace
 
+import numpy as np
+
 from riichi_analysis_engine.prediction_values import SCORE_VALUE_SET, SCORE_VALUES
-from riichi_analysis_engine.replay import FullState, action_label, hand_score, placement_label
+from riichi_analysis_engine.replay import (
+    FullState,
+    action_label,
+    annotate_game,
+    hand_score,
+    placement_label,
+    terminal_match_scores,
+)
 
 
 def test_wall_and_red_dora_tracking() -> None:
@@ -60,6 +68,44 @@ def test_only_first_winner_receives_honba_in_multiple_ron() -> None:
 def test_placement_ties_use_initial_seat_order() -> None:
     scores = np.asarray([30000, 30000, 20000, 20000])
     assert placement_label(scores, 0) == 0
+
+
+def test_terminal_riichi_sticks_are_awarded_to_first_place() -> None:
+    scores = np.asarray([17600, 10100, 44300, 27000])
+
+    assert terminal_match_scores(scores, 1).tolist() == [17600, 10100, 45300, 27000]
+    assert scores.tolist() == [17600, 10100, 44300, 27000]
+
+
+def test_terminal_riichi_stick_tie_uses_initial_seat_order() -> None:
+    scores = np.asarray([30000, 30000, 20000, 19000])
+
+    assert terminal_match_scores(scores, 1).tolist() == [31000, 30000, 20000, 19000]
+
+
+def test_annotate_game_settles_unclaimed_terminal_riichi_sticks() -> None:
+    events = [
+        {
+            "type": "start_kyoku",
+            "bakaze": "S",
+            "kyoku": 4,
+            "honba": 0,
+            "kyotaku": 0,
+            "oya": 3,
+            "dora_marker": "1m",
+            "scores": [18600, 11100, 45300, 25000],
+            "tehais": [[], [], [], []],
+        },
+        {"type": "reach_accepted", "actor": 1},
+        {"type": "ryukyoku", "deltas": [-1000, 3000, -1000, -1000]},
+        {"type": "end_kyoku"},
+        {"type": "end_game"},
+    ]
+
+    annotations = annotate_game(events)
+
+    assert annotations[0].final_kyoku_scores.tolist() == [17600, 13100, 44300, 24000]
+    assert annotations[0].final_match_scores.tolist() == [17600, 13100, 45300, 24000]
 
 
 def _empty_cans() -> SimpleNamespace:

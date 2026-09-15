@@ -11,7 +11,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import numpy as np
@@ -19,11 +19,18 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from .architecture import ModelArchitecture
+from .architecture import ModelArchitecture, StructuredModelArchitecture
 from .dataset import PackDataset
+from .hidden_transport import (
+    balanced_source_probabilities,
+    count_marginals,
+    physical_affinities,
+    physical_hidden_counts,
+)
 from .kyoku_outcome import OUTCOME_DEAL_IN_INDICATORS, OUTCOME_WINNER_INDICATORS
 from .losses import (
     LOSS_TERMS,
+    LOSS_TERMS_V8,
     LearnedUncertaintyBalancer,
     masked_score_logits,
     multitask_loss,
@@ -31,6 +38,11 @@ from .losses import (
 )
 from .model import RiichiAnalysisModel, count_parameters
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
+from .structured_outputs import (
+    conditional_deal_in_probabilities,
+    fixed_total_values,
+    zero_sum_accounts,
+)
 
 
 class TrainingInterrupted(Exception):
@@ -48,6 +60,56 @@ def gradient_total_norm(parameters: list[torch.nn.Parameter]) -> float:
     if not squared:
         return 0.0
     return float(torch.stack(squared).sum().sqrt())
+
+
+def shared_gradient_geometry(
+    losses: Mapping[str, torch.Tensor],
+    active: Mapping[str, bool],
+    shared: torch.Tensor,
+) -> dict[str, float]:
+    """Measure raw task-gradient norms and angles at the shared feature boundary.
+
+    This intentionally measures each unweighted task loss before the learned
+    loss balancer. It diagnoses representation conflict without materializing
+    one full shared-parameter gradient vector per task.
+    """
+
+    gradients: dict[str, torch.Tensor] = {}
+    metrics: dict[str, float] = {}
+    for name, loss in losses.items():
+        if not active.get(name, False) or not loss.requires_grad:
+            continue
+        gradient = torch.autograd.grad(
+            loss, shared, retain_graph=True, allow_unused=True
+        )[0]
+        if gradient is None:
+            continue
+        vector = gradient.detach().float().reshape(-1)
+        norm = vector.norm()
+        gradients[name] = vector
+        metrics[f"sharedGradientNorm/{name}"] = float(norm)
+
+    cosines: list[float] = []
+    names = list(gradients)
+    for left_index, left_name in enumerate(names):
+        left = gradients[left_name]
+        left_norm = left.norm()
+        for right_name in names[left_index + 1 :]:
+            right = gradients[right_name]
+            denominator = left_norm * right.norm()
+            cosine = (
+                float(torch.dot(left, right) / denominator)
+                if float(denominator) > 0.0
+                else 0.0
+            )
+            metrics[f"sharedGradientCosine/{left_name}__{right_name}"] = cosine
+            cosines.append(cosine)
+    if cosines:
+        metrics["sharedGradientMeanCosine"] = sum(cosines) / len(cosines)
+        metrics["sharedGradientConflictFraction"] = sum(
+            cosine < 0.0 for cosine in cosines
+        ) / len(cosines)
+    return metrics
 
 
 def source_metadata() -> dict[str, object]:
@@ -72,7 +134,9 @@ def source_metadata() -> dict[str, object]:
         return {"sourceRevision": revision, "sourceDirty": dirty}
     except (FileNotFoundError, subprocess.CalledProcessError):
         revision = os.environ.get("RIICHI_ANALYSIS_SOURCE_REVISION", "").strip().lower()
-        if len(revision) == 40 and all(character in "0123456789abcdef" for character in revision):
+        if len(revision) == 40 and all(
+            character in "0123456789abcdef" for character in revision
+        ):
             return {"sourceRevision": revision, "sourceDirty": False}
         return {"sourceRevision": None, "sourceDirty": None}
 
@@ -119,7 +183,9 @@ def dataset_metadata(root: Path) -> dict[str, object]:
     }
 
 
-def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+def move_batch(
+    batch: dict[str, torch.Tensor], device: torch.device
+) -> dict[str, torch.Tensor]:
     return {name: value.to(device, non_blocking=True) for name, value in batch.items()}
 
 
@@ -140,7 +206,11 @@ def single_pass_window(
         raise ValueError("maximum training samples must be non-negative")
     if not 0 <= next_sample <= corpus_samples:
         raise RuntimeError("resume cursor lies outside the training corpus")
-    limit = corpus_samples if max_train_samples == 0 else min(corpus_samples, max_train_samples)
+    limit = (
+        corpus_samples
+        if max_train_samples == 0
+        else min(corpus_samples, max_train_samples)
+    )
     if next_sample >= limit:
         raise RuntimeError(
             "resume cursor has reached the sample limit; increase --max-train-samples"
@@ -158,7 +228,8 @@ def resume_training_cursor(
     cursor = checkpoint.get("trainingCursor")
     if not isinstance(cursor, dict) or cursor.get("type") != "single-pass-v1":
         raise RuntimeError(
-            "resume checkpoint predates the single-pass cursor and cannot be resumed safely"
+            "resume checkpoint predates the single-pass cursor and cannot "
+            "be resumed safely"
         )
     if cursor.get("complete") is not False:
         raise RuntimeError("resume checkpoint has already completed its training pass")
@@ -199,17 +270,22 @@ def validate(
     should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, float]:
     model.eval()
-    totals: dict[str, float] = {"total": 0.0, **{name: 0.0 for name in LOSS_TERMS}}
+    loss_terms = balancer.names
+    totals: dict[str, float] = {"total": 0.0, **{name: 0.0 for name in loss_terms}}
     # Label marginals, kept to build the null baseline each loss is compared
     # against: what a model that only knows the label distribution would score.
     policy_labels = np.zeros(46, dtype=np.int64)
     shanten_labels = np.zeros(7, dtype=np.int64)
-    balance_totals: dict[str, float] = {name: 0.0 for name in LOSS_TERMS}
+    balance_totals: dict[str, float] = {name: 0.0 for name in loss_terms}
     batches = 0
     metric_sums: dict[str, float] = {}
     metric_counts: dict[str, int] = {}
+    deal_in_positive_histogram = np.zeros(1_000, dtype=np.int64)
+    deal_in_negative_histogram = np.zeros(1_000, dtype=np.int64)
 
-    def add_metric(name: str, values: torch.Tensor, mask: torch.Tensor | None = None) -> None:
+    def add_metric(
+        name: str, values: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> None:
         values = values.float()
         if mask is not None:
             values = values[mask]
@@ -245,33 +321,107 @@ def validate(
             outputs["shanten"].argmax(-1) == batch["shanten"],
         )
         add_metric(
+            "shantenNll",
+            F.cross_entropy(
+                outputs["shanten"].reshape(-1, 7),
+                batch["shanten"].reshape(-1).long(),
+                reduction="none",
+            ),
+        )
+        add_metric(
             "furitenBrier",
-            (outputs["furiten_no_yaku"].sigmoid() - batch["furiten_no_yaku"].float()).square(),
+            (
+                outputs["furiten_no_yaku"].sigmoid() - batch["furiten_no_yaku"].float()
+            ).square(),
             batch["shanten"] == 0,
+        )
+        structured = "hidden_source_affinity" in outputs
+        deal_in_probability = (
+            conditional_deal_in_probabilities(outputs)
+            if structured
+            else outputs["deal_in_tile"].sigmoid()
         )
         add_metric(
             "dealInTileBrier",
-            (outputs["deal_in_tile"].sigmoid() - batch["deal_in_tile"].float()).square(),
+            (deal_in_probability - batch["deal_in_tile"].float()).square(),
         )
-        add_metric(
-            "concealedCountAccuracy",
-            outputs["concealed_count"].argmax(-1) == batch["concealed_count"],
+        deal_in_target = batch["deal_in_tile"].bool()
+        add_metric("dealInPositiveMean", deal_in_probability, deal_in_target)
+        add_metric("dealInNegativeMean", deal_in_probability, ~deal_in_target)
+        deal_in_bins = (deal_in_probability.detach() * 1_000).long().clamp(0, 999)
+        deal_in_positive_histogram += (
+            torch.bincount(deal_in_bins[deal_in_target], minlength=1_000).cpu().numpy()
         )
-        add_metric(
-            "concealedRedCountAccuracy",
-            outputs["concealed_red_count"].argmax(-1) == batch["concealed_red_count"],
+        deal_in_negative_histogram += (
+            torch.bincount(deal_in_bins[~deal_in_target], minlength=1_000).cpu().numpy()
         )
-        add_metric(
-            "wallCountAccuracy",
-            outputs["wall_count"].argmax(-1) == batch["wall_count"],
-        )
-        add_metric(
-            "wallRedCountAccuracy",
-            outputs["wall_red_count"].argmax(-1) == batch["wall_red_count"],
-        )
+        if structured:
+            _physical_counts, inventory, capacities = physical_hidden_counts(
+                batch["concealed_count"],
+                batch["wall_count"],
+                batch["concealed_red_count"],
+                batch["wall_red_count"],
+            )
+            source_probability = balanced_source_probabilities(
+                physical_affinities(
+                    outputs["hidden_source_affinity"], outputs["hidden_red_source"]
+                ),
+                inventory,
+                capacities,
+            )
+            hidden_count, hidden_red = count_marginals(source_probability, inventory)
+            expected_physical = source_probability * inventory.unsqueeze(1)
+            add_metric(
+                "hiddenSourceConservationError",
+                (expected_physical.sum(-1) - capacities.float()).abs(),
+            )
+            add_metric(
+                "hiddenInventoryConservationError",
+                (expected_physical.sum(1) - inventory.float()).abs(),
+            )
+            add_metric(
+                "concealedCountAccuracy",
+                hidden_count[:, :3].argmax(-1) == batch["concealed_count"],
+            )
+            add_metric(
+                "concealedRedCountAccuracy",
+                hidden_red[:, :3].argmax(-1) == batch["concealed_red_count"],
+            )
+            add_metric(
+                "wallCountAccuracy",
+                hidden_count[:, 3].argmax(-1) == batch["wall_count"],
+            )
+            add_metric(
+                "wallRedCountAccuracy",
+                hidden_red[:, 3].argmax(-1) == batch["wall_red_count"],
+            )
+            dora_distribution = outputs["dora_distribution"].softmax(-1)
+            dora_values = torch.arange(7, device=device, dtype=dora_distribution.dtype)
+            dora_point = (dora_distribution[..., :7] * dora_values).sum(
+                -1
+            ) + dora_distribution[..., 7] * (7.0 + F.softplus(outputs["dora_tail"]))
+        else:
+            add_metric(
+                "concealedCountAccuracy",
+                outputs["concealed_count"].argmax(-1) == batch["concealed_count"],
+            )
+            add_metric(
+                "concealedRedCountAccuracy",
+                outputs["concealed_red_count"].argmax(-1)
+                == batch["concealed_red_count"],
+            )
+            add_metric(
+                "wallCountAccuracy",
+                outputs["wall_count"].argmax(-1) == batch["wall_count"],
+            )
+            add_metric(
+                "wallRedCountAccuracy",
+                outputs["wall_red_count"].argmax(-1) == batch["wall_red_count"],
+            )
+            dora_point = F.softplus(outputs["dora_point"])
         add_metric(
             "doraMae",
-            (F.softplus(outputs["dora_point"]) - batch["dora"].float()).abs(),
+            (dora_point - batch["dora"].float()).abs(),
             batch["winner_mask"].bool(),
         )
         winner_mask = batch["winner_mask"].bool()
@@ -290,7 +440,10 @@ def validate(
             score_values = score_probabilities.new_tensor(SCORE_VALUES)
             add_metric(
                 "scoreMaePoints",
-                ((score_probabilities * score_values).sum(-1) - batch["score"].float()).abs(),
+                (
+                    (score_probabilities * score_values).sum(-1)
+                    - batch["score"].float()
+                ).abs(),
                 winner_mask,
             )
         outcome_probability = outputs["outcome"].softmax(-1)
@@ -314,14 +467,28 @@ def validate(
             "outcomeAccuracy",
             outputs["outcome"].argmax(-1) == batch["outcome"],
         )
+        predicted_delta = (
+            zero_sum_accounts(outputs["kyoku_accounts"])[..., :4]
+            if structured
+            else outputs["kyoku_delta"]
+        )
         add_metric(
             "kyokuDeltaMaePoints",
-            (outputs["kyoku_delta"] * 10_000.0 - batch["kyoku_delta"].float()).abs(),
+            (predicted_delta * 10_000.0 - batch["kyoku_delta"].float()).abs(),
         )
-        add_metric("placementJointAccuracy", outputs["placement"].argmax(-1) == batch["placement"])
+        add_metric(
+            "placementJointAccuracy",
+            outputs["placement"].argmax(-1) == batch["placement"],
+        )
+        match_target = batch["match_score"].float() / 10_000.0
+        predicted_match = (
+            fixed_total_values(outputs["match_score"], match_target.sum(-1))
+            if structured
+            else outputs["match_score"]
+        )
         add_metric(
             "matchScoreMaePoints",
-            (outputs["match_score"] * 10_000.0 - batch["match_score"].float()).abs(),
+            (predicted_match * 10_000.0 - batch["match_score"].float()).abs(),
         )
         batches += 1
         if progress_every > 0 and batches % progress_every == 0:
@@ -344,9 +511,20 @@ def validate(
     result.update(
         {
             f"lossWeight/{name}": balance_totals[name] / max(1, batches)
-            for name in LOSS_TERMS
+            for name in loss_terms
         }
     )
+    positive_descending = deal_in_positive_histogram[::-1].cumsum()
+    negative_descending = deal_in_negative_histogram[::-1].cumsum()
+    total_positive = int(deal_in_positive_histogram.sum())
+    if total_positive:
+        precision = positive_descending / np.maximum(
+            1, positive_descending + negative_descending
+        )
+        recall_increment = deal_in_positive_histogram[::-1] / total_positive
+        result["metric/dealInAveragePrecisionApprox"] = float(
+            np.sum(precision * recall_increment)
+        )
     result.update(
         {
             f"metric/{name}": metric_sums[name] / max(1, metric_counts[name])
@@ -407,7 +585,9 @@ def write_pointer(run: Path, checkpoint: Path, **fields: object) -> None:
         **fields,
     }
     temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     os.replace(temporary, path)
 
 
@@ -461,7 +641,9 @@ def open_dashboard(run: Path) -> object | None:
     return SummaryWriter(log_dir=str(run / "tensorboard"))
 
 
-def write_dashboard(writer: object | None, metrics: dict[str, float], step: int) -> None:
+def write_dashboard(
+    writer: object | None, metrics: dict[str, float], step: int
+) -> None:
     """Write every finite validation metric under a stable TensorBoard tag."""
 
     if writer is None:
@@ -505,7 +687,9 @@ def restore_random_state(state: object) -> None:
     if not isinstance(state, dict):
         raise RuntimeError("resume checkpoint has no random-number state")
     numpy_state = state.get("numpy")
-    if not isinstance(numpy_state, dict) or not isinstance(numpy_state.get("keys"), torch.Tensor):
+    if not isinstance(numpy_state, dict) or not isinstance(
+        numpy_state.get("keys"), torch.Tensor
+    ):
         raise RuntimeError("resume checkpoint has incompatible NumPy random state")
     random.setstate(state["python"])
     np.random.set_state(
@@ -529,7 +713,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     balancer: LearnedUncertaintyBalancer,
-    architecture: ModelArchitecture,
+    architecture: ModelArchitecture | StructuredModelArchitecture,
     *,
     step: int,
     samples_seen: int,
@@ -544,7 +728,7 @@ def save_checkpoint(
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "format": "riichi-analysis-model-v7",
+            "format": f"riichi-analysis-model-v{model.format_version}",
             "step": step,
             "samplesSeen": samples_seen,
             "trainingCursor": {
@@ -586,19 +770,45 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--analysis-channels", type=int, default=288)
-    parser.add_argument("--analysis-blocks", type=int, default=54)
-    parser.add_argument("--analysis-latent-width", type=int, default=1152)
-    parser.add_argument("--state-width", type=int, default=1024)
-    parser.add_argument("--future-width", type=int, default=1024)
+    parser.add_argument("--model-format", type=int, choices=(7, 8), default=8)
+    parser.add_argument("--shared-channels", type=int, default=256)
+    parser.add_argument("--shared-blocks", type=int, default=30)
+    parser.add_argument("--family-latent-width", type=int, default=768)
+    parser.add_argument("--opponent-blocks", type=int, default=24)
+    parser.add_argument("--hidden-blocks", type=int, default=8)
+    parser.add_argument("--value-blocks", type=int, default=6)
+    parser.add_argument("--kyoku-blocks", type=int, default=6)
+    parser.add_argument("--match-blocks", type=int, default=4)
+    parser.add_argument("--policy-blocks", type=int, default=24)
+    parser.add_argument("--task-width", type=int, default=512)
+    parser.add_argument("--tile-width", type=int, default=128)
     parser.add_argument("--policy-context-channels", type=int, default=144)
     parser.add_argument("--policy-context-blocks", type=int, default=6)
     parser.add_argument("--policy-context-width", type=int, default=384)
     parser.add_argument("--policy-width", type=int, default=1024)
+    parser.add_argument(
+        "--analysis-channels", type=int, default=288, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--analysis-blocks", type=int, default=54, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--analysis-latent-width", type=int, default=1152, help=argparse.SUPPRESS
+    )
+    parser.add_argument("--state-width", type=int, default=1024, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--future-width", type=int, default=1024, help=argparse.SUPPRESS
+    )
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-validation-samples", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--checkpoint-every-samples", type=int, default=1_000_000)
+    parser.add_argument(
+        "--gradient-diagnostics-every",
+        type=int,
+        default=0,
+        help="measure v8 task-gradient geometry every N steps; zero disables it",
+    )
     parser.add_argument(
         "--warmup-steps",
         type=int,
@@ -616,6 +826,12 @@ def main() -> None:
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int, default=20252026)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--loss-term",
+        action="append",
+        default=[],
+        help="train only this loss term; repeat for a controlled ablation",
+    )
     args = parser.parse_args()
     if args.max_steps < 0:
         raise ValueError("max steps must be non-negative")
@@ -623,29 +839,71 @@ def main() -> None:
         raise ValueError("checkpoint interval must be non-negative")
     if args.keep_checkpoints < 0:
         raise ValueError("checkpoint retention must be non-negative")
+    if args.gradient_diagnostics_every < 0:
+        raise ValueError("gradient diagnostics interval must be non-negative")
+    if args.gradient_diagnostics_every and args.model_format != 8:
+        raise ValueError("shared-gradient diagnostics require model format 8")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu"
+    )
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.benchmark = True
     amp_dtype = torch.float16 if device.type == "cuda" else None
 
-    architecture = ModelArchitecture(
-        analysis_channels=args.analysis_channels,
-        analysis_blocks=args.analysis_blocks,
-        analysis_latent_width=args.analysis_latent_width,
-        state_width=args.state_width,
-        future_width=args.future_width,
-        policy_context_channels=args.policy_context_channels,
-        policy_context_blocks=args.policy_context_blocks,
-        policy_context_width=args.policy_context_width,
-        policy_width=args.policy_width,
-    )
-    model = RiichiAnalysisModel(architecture=architecture).to(device)
-    balancer = LearnedUncertaintyBalancer().to(device)
+    if args.model_format == 8:
+        architecture: ModelArchitecture | StructuredModelArchitecture = (
+            StructuredModelArchitecture(
+                shared_channels=args.shared_channels,
+                shared_blocks=args.shared_blocks,
+                family_latent_width=args.family_latent_width,
+                opponent_blocks=args.opponent_blocks,
+                hidden_blocks=args.hidden_blocks,
+                value_blocks=args.value_blocks,
+                kyoku_blocks=args.kyoku_blocks,
+                match_blocks=args.match_blocks,
+                policy_blocks=args.policy_blocks,
+                task_width=args.task_width,
+                tile_width=args.tile_width,
+                policy_context_channels=args.policy_context_channels,
+                policy_context_blocks=args.policy_context_blocks,
+                policy_context_width=args.policy_context_width,
+                policy_width=args.policy_width,
+            )
+        )
+        available_loss_terms = LOSS_TERMS_V8
+    else:
+        architecture = ModelArchitecture(
+            analysis_channels=args.analysis_channels,
+            analysis_blocks=args.analysis_blocks,
+            analysis_latent_width=args.analysis_latent_width,
+            state_width=args.state_width,
+            future_width=args.future_width,
+            policy_context_channels=args.policy_context_channels,
+            policy_context_blocks=args.policy_context_blocks,
+            policy_context_width=args.policy_context_width,
+            policy_width=args.policy_width,
+        )
+        available_loss_terms = LOSS_TERMS
+    if args.loss_term:
+        if len(set(args.loss_term)) != len(args.loss_term):
+            raise ValueError("loss terms must not be repeated")
+        unknown = sorted(set(args.loss_term) - set(available_loss_terms))
+        if unknown:
+            raise ValueError(
+                f"loss terms are unavailable for this model format: {unknown}"
+            )
+        loss_terms = tuple(args.loss_term)
+    else:
+        loss_terms = available_loss_terms
+    model = RiichiAnalysisModel(
+        format_version=args.model_format, architecture=architecture
+    ).to(device)
+    balancer = LearnedUncertaintyBalancer(loss_terms).to(device)
     parameters = count_parameters(model)
     optimizer = torch.optim.AdamW(
         [
@@ -673,7 +931,7 @@ def main() -> None:
         resume_path = resolve_resume_path(args.resume)
         print(json.dumps({"resumedFrom": str(resume_path)}))
         checkpoint = torch.load(resume_path, map_location="cpu", weights_only=True)
-        if checkpoint.get("format") != "riichi-analysis-model-v7":
+        if checkpoint.get("format") != f"riichi-analysis-model-v{args.model_format}":
             raise RuntimeError("resume checkpoint has an unsupported format")
         if checkpoint.get("modelArchitecture") != architecture.to_dict():
             raise RuntimeError("resume checkpoint uses a different model architecture")
@@ -684,15 +942,19 @@ def main() -> None:
             raise RuntimeError("resume checkpoint uses different prediction values")
         model.load_state_dict(checkpoint["model"], strict=True)
         balance = checkpoint.get("lossBalancer")
-        if not isinstance(balance, dict) or balance.get("terms") != list(LOSS_TERMS):
+        if not isinstance(balance, dict) or balance.get("terms") != list(loss_terms):
             raise RuntimeError("resume checkpoint has incompatible loss-balance state")
         balancer.load_state_dict(balance["state"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         scaler.load_state_dict(checkpoint["scaler"])
         restore_random_state(checkpoint.get("randomState"))
-        samples_seen, step = resume_training_cursor(checkpoint, datasets, args.batch_size)
+        samples_seen, step = resume_training_cursor(
+            checkpoint, datasets, args.batch_size
+        )
         if step_budget_reached(step, args.max_steps):
-            raise RuntimeError("resume budget is already exhausted; increase --max-steps")
+            raise RuntimeError(
+                "resume budget is already exhausted; increase --max-steps"
+            )
     # The order comes from the training manifest: one pass over globally mixed
     # packs, with no shuffling left for the loader to do.
     train_manifest = PackDataset(args.train, batch_size=args.batch_size)
@@ -819,12 +1081,24 @@ def main() -> None:
             args.loss_balance_learning_rate,
         )
         optimizer.zero_grad(set_to_none=True)
+        gradient_geometry: dict[str, float] = {}
+        diagnose_gradients = bool(
+            args.gradient_diagnostics_every
+            and (step + 1) % args.gradient_diagnostics_every == 0
+        )
         try:
             with torch.autocast(
                 device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None
             ):
-                outputs = model(batch["obs"].float())
-                total, losses, _active, weights = multitask_loss(outputs, batch, balancer)
+                if diagnose_gradients:
+                    outputs, shared = model.forward_with_shared(batch["obs"].float())
+                else:
+                    outputs = model(batch["obs"].float())
+                total, losses, active, weights = multitask_loss(
+                    outputs, batch, balancer
+                )
+            if diagnose_gradients:
+                gradient_geometry = shared_gradient_geometry(losses, active, shared)
             scaler.scale(total).backward()
         except torch.cuda.OutOfMemoryError:
             # The failed batch has not advanced the single-pass cursor, so a
@@ -849,7 +1123,7 @@ def main() -> None:
         scaler.update()
         step += 1
         samples_seen += len(batch["policy"])
-        if step == 1 or step % 100 == 0:
+        if step == 1 or step % 100 == 0 or gradient_geometry:
             now = time.perf_counter()
             interval_seconds = max(now - last_log_time, 1e-9)
             interval_samples = samples_seen - last_log_samples
@@ -867,20 +1141,29 @@ def main() -> None:
                     f"lossWeight/{name}": float(value.detach())
                     for name, value in weights.items()
                 },
+                **gradient_geometry,
             }
             if device.type == "cuda":
-                record["peakAllocatedMiB"] = torch.cuda.max_memory_allocated(device) / 2**20
-                record["peakReservedMiB"] = torch.cuda.max_memory_reserved(device) / 2**20
+                record["peakAllocatedMiB"] = (
+                    torch.cuda.max_memory_allocated(device) / 2**20
+                )
+                record["peakReservedMiB"] = (
+                    torch.cuda.max_memory_reserved(device) / 2**20
+                )
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             print(json.dumps(record, ensure_ascii=False))
             if writer is not None:
                 writer.add_scalar("Loss/train_batch", float(total.detach()), step)
                 for name, value in losses.items():
-                    writer.add_scalar(f"Loss/train_{name}_batch", float(value.detach()), step)
+                    writer.add_scalar(
+                        f"Loss/train_{name}_batch", float(value.detach()), step
+                    )
                 for name, value in weights.items():
-                    writer.add_scalar(f"LossBalance/{name}", float(value.detach()), step)
-                    if _active[name]:
+                    writer.add_scalar(
+                        f"LossBalance/{name}", float(value.detach()), step
+                    )
+                    if active[name]:
                         writer.add_scalar(
                             f"LossWeighted/{name}",
                             float((value * losses[name]).detach()),
@@ -888,12 +1171,20 @@ def main() -> None:
                         )
                 writer.add_scalar("Gradient/norm", gradient_norm, step)
                 writer.add_scalar("Gradient/max", gradient_max, step)
+                for name, value in gradient_geometry.items():
+                    writer.add_scalar(f"GradientShared/{name}", value, step)
                 writer.add_scalar("LR", optimizer.param_groups[0]["lr"], step)
                 writer.add_scalar("Progress/samples", samples_seen, step)
-                writer.add_scalar("Progress/samples_per_second", record["samplesPerSecond"], step)
+                writer.add_scalar(
+                    "Progress/samples_per_second", record["samplesPerSecond"], step
+                )
                 if device.type == "cuda":
-                    writer.add_scalar("CUDA/allocated_mib", record["peakAllocatedMiB"], step)
-                    writer.add_scalar("CUDA/reserved_mib", record["peakReservedMiB"], step)
+                    writer.add_scalar(
+                        "CUDA/allocated_mib", record["peakAllocatedMiB"], step
+                    )
+                    writer.add_scalar(
+                        "CUDA/reserved_mib", record["peakReservedMiB"], step
+                    )
                     writer.add_scalar("AMP/scale", scaler.get_scale(), step)
             last_log_time = now
             last_log_samples = samples_seen
@@ -939,7 +1230,8 @@ def main() -> None:
     if stop_reason is None:
         if samples_seen != sample_limit:
             raise RuntimeError(
-                f"training stream ended at sample {samples_seen}, expected {sample_limit}"
+                "training stream ended at sample "
+                f"{samples_seen}, expected {sample_limit}"
             )
         stop_reason = (
             "corpus-exhausted"
@@ -948,7 +1240,9 @@ def main() -> None:
         )
     pass_complete = samples_seen == train_manifest.samples
 
-    checkpoint_name = "checkpoint-complete.pt" if pass_complete else f"checkpoint-step-{step}.pt"
+    checkpoint_name = (
+        "checkpoint-complete.pt" if pass_complete else f"checkpoint-step-{step}.pt"
+    )
     final_checkpoint = args.run / checkpoint_name
     # The training boundary is durable before validation starts. A validation
     # error or interruption must never discard the newest trained samples.
@@ -974,7 +1268,7 @@ def main() -> None:
         print(json.dumps({"phase": "validation-interrupted", "step": step}), flush=True)
         close_dashboard(writer)
         atexit.unregister(close_dashboard)
-        raise SystemExit(130)
+        raise SystemExit(130) from None
     record = {
         "phase": "validation",
         "step": step,

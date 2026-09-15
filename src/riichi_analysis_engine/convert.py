@@ -23,8 +23,8 @@ from .replay import (
     read_events,
     rotated_future,
 )
-from .storage import read_chunk_archive_meta, save_chunk_archive
 from .score_state import relative_scores
+from .storage import read_chunk_archive_meta, save_chunk_archive
 
 
 def read_manifest(path: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
@@ -56,7 +56,8 @@ def _sample_targets(
         [full_state.concealed_counts(player) for player in absolute_opponents], axis=0
     )
     concealed_red = np.stack(
-        [full_state.concealed_red_counts(player) for player in absolute_opponents], axis=0
+        [full_state.concealed_red_counts(player) for player in absolute_opponents],
+        axis=0,
     )
     winner_mask = annotation.win[list(absolute_opponents)].astype(np.uint8, copy=False)
     return {
@@ -77,6 +78,7 @@ def _sample_targets(
         "kyoku_delta": future["kyoku_delta"],
         "placement": future["placement"],
         "match_score": future["match_score"],
+        "system_total": np.int32(full_state.scores.sum() + full_state.kyotaku * 1_000),
     }
 
 
@@ -101,7 +103,9 @@ def convert_game(
         policy: int,
         kan_select: bool,
     ) -> None:
-        observation, action_mask = states[perspective].encode_obs(OBS_VERSION, kan_select)
+        observation, action_mask = states[perspective].encode_obs(
+            OBS_VERSION, kan_select
+        )
         observation = add_all_player_ranks(
             observation, relative_scores(full_state.scores, perspective)
         )
@@ -241,7 +245,9 @@ def main() -> None:
     mortal_root = str(args.mortal_python_root.resolve())
     if mortal_root not in sys.path:
         sys.path.insert(0, mortal_root)
-    from libriichi.state import PlayerState
+    # Import before spawning workers so a broken private training runtime fails
+    # once, at the command boundary, instead of once per submitted game.
+    __import__("libriichi.state")
 
     metadata, records = read_manifest(args.manifest)
     start_game = args.start_game
@@ -287,7 +293,11 @@ def main() -> None:
                 concurrent.futures.as_completed(futures), start=1
             ):
                 collect(future.result())
-                if completed == 1 or completed % 25 == 0 or completed == len(indexed_records):
+                if (
+                    completed == 1
+                    or completed % 25 == 0
+                    or completed == len(indexed_records)
+                ):
                     report(completed)
     else:
         for completed, job in enumerate(jobs, start=1):

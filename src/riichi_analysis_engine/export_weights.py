@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from .architecture import ModelArchitecture
+from .architecture import ModelArchitecture, StructuredModelArchitecture
 from .model import RiichiAnalysisModel, count_parameters
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 
@@ -74,14 +74,20 @@ def main() -> None:
         "riichi-analysis-model-v5": 5,
         "riichi-analysis-model-v6": 6,
         "riichi-analysis-model-v7": 7,
+        "riichi-analysis-model-v8": 8,
     }
     if model_format not in formats:
         raise RuntimeError("checkpoint has an unsupported format")
     format_version = formats[model_format]
-    architecture: ModelArchitecture | None = None
-    if format_version in {6, 7}:
-        architecture = ModelArchitecture.from_dict(checkpoint.get("modelArchitecture"))
-        model = RiichiAnalysisModel(format_version=format_version, architecture=architecture)
+    architecture: ModelArchitecture | StructuredModelArchitecture | None = None
+    if format_version in {6, 7, 8}:
+        architecture_type = (
+            StructuredModelArchitecture if format_version == 8 else ModelArchitecture
+        )
+        architecture = architecture_type.from_dict(checkpoint.get("modelArchitecture"))
+        model = RiichiAnalysisModel(
+            format_version=format_version, architecture=architecture
+        )
     else:
         model = RiichiAnalysisModel(format_version=format_version)
     model.load_state_dict(checkpoint["model"], strict=True)

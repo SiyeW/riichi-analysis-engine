@@ -6,10 +6,14 @@ from functools import partial
 import torch
 from torch import Tensor, nn
 
+from .architecture import ModelArchitecture, StructuredModelArchitecture
 from .constants import ACTION_SPACE, MORTAL_OBS_CHANNELS, OBS_CHANNELS, TILE_TYPES
-from .architecture import ModelArchitecture
 from .kyoku_outcome import OUTCOME_COUNT
-from .observation_layout import ANALYSIS_CHANNELS, POLICY_CONTEXT_CHANNELS, POLICY_CONTEXT_START
+from .observation_layout import (
+    ANALYSIS_CHANNELS,
+    POLICY_CONTEXT_CHANNELS,
+    POLICY_CONTEXT_START,
+)
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 
 
@@ -82,6 +86,73 @@ class ResidualEncoder(nn.Module):
 
     def forward(self, observation: Tensor) -> Tensor:
         return self.net(observation)
+
+
+class SpatialTrunk(nn.Module):
+    """Shared low-level encoder that keeps the 34-tile axis intact."""
+
+    def __init__(self, input_channels: int, *, channels: int, blocks: int) -> None:
+        super().__init__()
+        self.input = nn.Conv1d(input_channels, channels, 3, padding=1, bias=False)
+        self.blocks = nn.Sequential(*(ResidualBlock(channels) for _ in range(blocks)))
+        self.output = nn.Sequential(
+            nn.BatchNorm1d(channels, momentum=0.01, eps=1e-3),
+            nn.Mish(inplace=True),
+        )
+
+    def forward(self, observation: Tensor) -> Tensor:
+        return self.output(self.blocks(self.input(observation)))
+
+
+class FamilyTower(nn.Module):
+    """Private residual reasoning for one related family of predictions."""
+
+    def __init__(self, channels: int, *, blocks: int, latent_width: int) -> None:
+        super().__init__()
+        self.blocks = nn.Sequential(*(ResidualBlock(channels) for _ in range(blocks)))
+        self.summary = nn.Sequential(
+            nn.BatchNorm1d(channels, momentum=0.01, eps=1e-3),
+            nn.Mish(inplace=True),
+            nn.Conv1d(channels, 32, 3, padding=1),
+            nn.Mish(inplace=True),
+            nn.Flatten(),
+            nn.Linear(32 * TILE_TYPES, latent_width),
+            nn.Mish(inplace=True),
+        )
+
+    def forward(self, shared: Tensor) -> tuple[Tensor, Tensor]:
+        spatial = self.blocks(shared)
+        return spatial, self.summary(spatial)
+
+
+class DensePredictionHead(nn.Module):
+    def __init__(self, input_width: int, hidden_width: int, output_width: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_width, hidden_width),
+            nn.Mish(inplace=True),
+            nn.Linear(hidden_width, output_width),
+        )
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, latent: Tensor) -> Tensor:
+        return self.net(latent)
+
+
+class TilePredictionHead(nn.Module):
+    def __init__(
+        self, input_channels: int, hidden_channels: int, output_channels: int
+    ) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(input_channels, hidden_channels, 1),
+            nn.Mish(inplace=True),
+            nn.Conv1d(hidden_channels, output_channels, 1),
+        )
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, spatial: Tensor) -> Tensor:
+        return self.net(spatial)
 
 
 class MortalV4Encoder(ResidualEncoder):
@@ -215,12 +286,11 @@ class HeadDimensionsV1:
 
 
 class RiichiAnalysisModel(nn.Module):
-    """Shared state analysis with a separate decision-only feature path.
+    """Versioned multi-task model with preserved legacy loading paths.
 
-    Formats v1--v6 preserve old architectures solely for loading already
-    exported artifacts. New training uses v7, where policy
-    phase/action features and single-player EV tables no longer consume the
-    shared prediction encoder's capacity.
+    Formats v1--v7 preserve exported artifacts. New v8 training keeps a shared
+    low-level spatial trunk, then gives each related task family private
+    residual reasoning and task-specific output capacity.
     """
 
     def __init__(
@@ -230,16 +300,31 @@ class RiichiAnalysisModel(nn.Module):
         blocks: int | None = None,
         state_width: int | None = None,
         future_width: int | None = None,
-        format_version: int = 7,
-        architecture: ModelArchitecture | None = None,
+        format_version: int = 8,
+        architecture: ModelArchitecture | StructuredModelArchitecture | None = None,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2, 3, 4, 5, 6, 7}:
+        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
             raise ValueError(f"unsupported model format version: {format_version}")
-        if architecture is not None and format_version not in {6, 7}:
-            raise ValueError("only model formats v6 and v7 accept architecture metadata")
+        if architecture is not None and format_version not in {6, 7, 8}:
+            raise ValueError(
+                "only model formats v6 and later accept architecture metadata"
+            )
         self.format_version = format_version
-        self.architecture: ModelArchitecture | None = None
+        self.architecture: ModelArchitecture | StructuredModelArchitecture | None = None
+        if format_version == 8:
+            if any(
+                value is not None
+                for value in (channels, blocks, state_width, future_width)
+            ):
+                raise ValueError(
+                    "v8 architecture must be configured through its metadata"
+                )
+            configured = architecture or StructuredModelArchitecture()
+            if not isinstance(configured, StructuredModelArchitecture):
+                raise TypeError("model format v8 requires StructuredModelArchitecture")
+            self._init_v8(configured)
+            return
         self.dimensions = (
             HeadDimensionsV1()
             if format_version == 1
@@ -283,7 +368,8 @@ class RiichiAnalysisModel(nn.Module):
             future_width = architecture.future_width
             self.policy_adapter = nn.Sequential(
                 nn.Linear(
-                    architecture.analysis_latent_width + architecture.policy_context_width,
+                    architecture.analysis_latent_width
+                    + architecture.policy_context_width,
                     architecture.policy_width,
                 ),
                 nn.Mish(inplace=True),
@@ -295,7 +381,9 @@ class RiichiAnalysisModel(nn.Module):
             latent_width = 1024
             state_width = 1024 if state_width is None else state_width
             future_width = 768 if future_width is None else future_width
-            self.encoder = MortalV4Encoder(channels=legacy_channels, blocks=legacy_blocks)
+            self.encoder = MortalV4Encoder(
+                channels=legacy_channels, blocks=legacy_blocks
+            )
         self.state_adapter = nn.Sequential(
             nn.Linear(latent_width, state_width),
             nn.Mish(inplace=True),
@@ -313,17 +401,76 @@ class RiichiAnalysisModel(nn.Module):
         nn.init.zeros_(self.future_head.bias)
         nn.init.zeros_(self.policy_head.bias)
 
+    def _init_v8(self, architecture: StructuredModelArchitecture) -> None:
+        self.architecture = architecture
+        channels = architecture.shared_channels
+        latent = architecture.family_latent_width
+        task = architecture.task_width
+        self.shared_trunk = SpatialTrunk(
+            ANALYSIS_CHANNELS,
+            channels=channels,
+            blocks=architecture.shared_blocks,
+        )
+        self.opponent_tower = FamilyTower(
+            channels, blocks=architecture.opponent_blocks, latent_width=latent
+        )
+        self.hidden_tower = FamilyTower(
+            channels, blocks=architecture.hidden_blocks, latent_width=latent
+        )
+        self.value_tower = FamilyTower(
+            channels, blocks=architecture.value_blocks, latent_width=latent
+        )
+        self.kyoku_tower = FamilyTower(
+            channels, blocks=architecture.kyoku_blocks, latent_width=latent
+        )
+        self.match_tower = FamilyTower(
+            channels, blocks=architecture.match_blocks, latent_width=latent
+        )
+        self.policy_tower = FamilyTower(
+            channels, blocks=architecture.policy_blocks, latent_width=latent
+        )
+        self.policy_context = ResidualEncoder(
+            POLICY_CONTEXT_CHANNELS,
+            channels=architecture.policy_context_channels,
+            blocks=architecture.policy_context_blocks,
+            latent_width=architecture.policy_context_width,
+        )
+
+        self.shanten_head = DensePredictionHead(latent, task, 3 * 7)
+        self.furiten_head = DensePredictionHead(latent, task, 3)
+        self.wait_head = TilePredictionHead(channels, architecture.tile_width, 3)
+        self.hidden_source_head = TilePredictionHead(
+            channels, architecture.tile_width, 4
+        )
+        self.hidden_red_head = DensePredictionHead(latent, task, 3 * 4)
+        self.dora_head = DensePredictionHead(latent, task, 3 * len(DORA_VALUES))
+        self.dora_tail_head = DensePredictionHead(latent, task, 3)
+        self.score_head = DensePredictionHead(latent, task, 3 * len(SCORE_VALUES))
+        self.outcome_head = DensePredictionHead(latent, task, OUTCOME_COUNT)
+        self.kyoku_account_head = DensePredictionHead(latent, task, 5)
+        self.placement_head = DensePredictionHead(latent, task, 24)
+        self.match_score_head = DensePredictionHead(latent, task, 4)
+        self.policy_head = DensePredictionHead(
+            latent + architecture.policy_context_width,
+            architecture.policy_width,
+            ACTION_SPACE,
+        )
+
     @staticmethod
     def _split(value: Tensor, dimensions: tuple[int, ...]) -> tuple[Tensor, ...]:
         return value.split(dimensions, dim=-1)
 
     def forward(self, observation: Tensor) -> dict[str, Tensor]:
+        if self.format_version == 8:
+            return self._forward_v8(observation)
         if self.format_version in {6, 7}:
             if observation.shape[1:] != (OBS_CHANNELS, TILE_TYPES):
                 raise ValueError(f"wrong observation shape: {tuple(observation.shape)}")
             latent = self.encoder(observation[:, :ANALYSIS_CHANNELS])
             policy_context = self.policy_context(observation[:, POLICY_CONTEXT_START:])
-            policy = self.policy_head(self.policy_adapter(torch.cat((latent, policy_context), dim=-1)))
+            policy = self.policy_head(
+                self.policy_adapter(torch.cat((latent, policy_context), dim=-1))
+            )
         else:
             latent = self.encoder(observation)
             policy = self.policy_head(latent)
@@ -362,18 +509,20 @@ class RiichiAnalysisModel(nn.Module):
             )
         if self.format_version == 1:
             assert isinstance(d, HeadDimensionsV1)
-            dora, score, outcome, deal_player, target, delta, placement, match_score = self._split(
-                future,
-                (
-                    d.dora,
-                    d.score,
-                    d.outcome,
-                    d.deal_in_player,
-                    d.target,
-                    d.kyoku_delta,
-                    d.placement,
-                    d.match_score,
-                ),
+            dora, score, outcome, deal_player, target, delta, placement, match_score = (
+                self._split(
+                    future,
+                    (
+                        d.dora,
+                        d.score,
+                        d.outcome,
+                        d.deal_in_player,
+                        d.target,
+                        d.kyoku_delta,
+                        d.placement,
+                        d.match_score,
+                    ),
+                )
             )
             outputs.update(
                 {
@@ -414,9 +563,13 @@ class RiichiAnalysisModel(nn.Module):
             )
             outputs.update(
                 {
-                    "dora_distribution": dora_distribution.view(batch, 3, len(DORA_VALUES)),
+                    "dora_distribution": dora_distribution.view(
+                        batch, 3, len(DORA_VALUES)
+                    ),
                     "dora_point": dora_point.view(batch, 3),
-                    "score_distribution": score_distribution.view(batch, 3, len(SCORE_VALUES)),
+                    "score_distribution": score_distribution.view(
+                        batch, 3, len(SCORE_VALUES)
+                    ),
                     "outcome": outcome.view(batch, OUTCOME_COUNT),
                     "kyoku_delta": delta.view(batch, 4),
                     "placement": placement.view(batch, 24),
@@ -451,9 +604,13 @@ class RiichiAnalysisModel(nn.Module):
             )
             outputs.update(
                 {
-                    "dora_distribution": dora_distribution.view(batch, 3, len(DORA_VALUES)),
+                    "dora_distribution": dora_distribution.view(
+                        batch, 3, len(DORA_VALUES)
+                    ),
                     "dora_point": dora_point.view(batch, 3),
-                    "score_distribution": score_distribution.view(batch, 3, len(SCORE_VALUES)),
+                    "score_distribution": score_distribution.view(
+                        batch, 3, len(SCORE_VALUES)
+                    ),
                     "score_point": score_point.view(batch, 3),
                     "outcome": outcome.view(batch, OUTCOME_COUNT),
                     "kyoku_delta": delta.view(batch, 4),
@@ -495,9 +652,13 @@ class RiichiAnalysisModel(nn.Module):
             )
             outputs.update(
                 {
-                    "dora_distribution": dora_distribution.view(batch, 3, len(DORA_VALUES)),
+                    "dora_distribution": dora_distribution.view(
+                        batch, 3, len(DORA_VALUES)
+                    ),
                     "dora_point": dora_point.view(batch, 3),
-                    "score_distribution": score_distribution.view(batch, 3, len(SCORE_VALUES)),
+                    "score_distribution": score_distribution.view(
+                        batch, 3, len(SCORE_VALUES)
+                    ),
                     "score_point": score_point.view(batch, 3),
                     "outcome_any_win": outcome_any_win.view(batch),
                     "outcome_winner": outcome_winner.view(batch, 4),
@@ -542,7 +703,9 @@ class RiichiAnalysisModel(nn.Module):
             {
                 "dora_distribution": dora_distribution.view(batch, 3, len(DORA_VALUES)),
                 "dora_point": dora_point.view(batch, 3),
-                "score_distribution": score_distribution.view(batch, 3, len(SCORE_VALUES)),
+                "score_distribution": score_distribution.view(
+                    batch, 3, len(SCORE_VALUES)
+                ),
                 "score_point": score_point.view(batch, 3),
                 "outcome_any_win": outcome_any_win.view(batch),
                 "outcome_winner": outcome_winner.view(batch, 4),
@@ -555,8 +718,97 @@ class RiichiAnalysisModel(nn.Module):
         )
         return outputs
 
+    def _forward_v8(self, observation: Tensor) -> dict[str, Tensor]:
+        if observation.shape[1:] != (OBS_CHANNELS, TILE_TYPES):
+            raise ValueError(f"wrong observation shape: {tuple(observation.shape)}")
+        shared = self.shared_trunk(observation[:, :ANALYSIS_CHANNELS])
+        return self._forward_v8_from_shared(observation, shared)
+
+    def forward_with_shared(
+        self, observation: Tensor
+    ) -> tuple[dict[str, Tensor], Tensor]:
+        """Return v8 outputs and the shared feature boundary for diagnostics."""
+
+        if self.format_version != 8:
+            raise RuntimeError("shared-feature diagnostics require model format v8")
+        if observation.shape[1:] != (OBS_CHANNELS, TILE_TYPES):
+            raise ValueError(f"wrong observation shape: {tuple(observation.shape)}")
+        shared = self.shared_trunk(observation[:, :ANALYSIS_CHANNELS])
+        return self._forward_v8_from_shared(observation, shared), shared
+
+    def _forward_v8_from_shared(
+        self, observation: Tensor, shared: Tensor
+    ) -> dict[str, Tensor]:
+        batch = len(observation)
+        opponent_spatial, opponent = self.opponent_tower(shared)
+        hidden_spatial, hidden = self.hidden_tower(shared)
+        _value_spatial, value = self.value_tower(shared)
+        _kyoku_spatial, kyoku = self.kyoku_tower(shared)
+        _match_spatial, match = self.match_tower(shared)
+        _policy_spatial, policy_analysis = self.policy_tower(shared)
+        policy_context = self.policy_context(observation[:, POLICY_CONTEXT_START:])
+
+        wait = self.wait_head(opponent_spatial)
+        hidden_source = self.hidden_source_head(hidden_spatial)
+        return {
+            "shanten": self.shanten_head(opponent).view(batch, 3, 7),
+            "furiten_no_yaku": self.furiten_head(opponent).view(batch, 3),
+            "deal_in_tile": wait.view(batch, 3, 34),
+            "hidden_source_affinity": hidden_source.view(batch, 4, 34),
+            "hidden_red_source": self.hidden_red_head(hidden).view(batch, 3, 4),
+            "dora_distribution": self.dora_head(value).view(batch, 3, len(DORA_VALUES)),
+            "dora_tail": self.dora_tail_head(value).view(batch, 3),
+            "score_distribution": self.score_head(value).view(
+                batch, 3, len(SCORE_VALUES)
+            ),
+            "outcome": self.outcome_head(kyoku).view(batch, OUTCOME_COUNT),
+            "kyoku_accounts": self.kyoku_account_head(kyoku).view(batch, 5),
+            "placement": self.placement_head(match).view(batch, 24),
+            "match_score": self.match_score_head(match).view(batch, 4),
+            "policy": self.policy_head(
+                torch.cat((policy_analysis, policy_context), dim=-1)
+            ),
+        }
+
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
+    if model.format_version == 8:
+        groups: dict[str, nn.Module] = {
+            "shared": model.shared_trunk,
+            "opponent": nn.ModuleList(
+                [
+                    model.opponent_tower,
+                    model.shanten_head,
+                    model.furiten_head,
+                    model.wait_head,
+                ]
+            ),
+            "hidden": nn.ModuleList(
+                [model.hidden_tower, model.hidden_source_head, model.hidden_red_head]
+            ),
+            "value": nn.ModuleList(
+                [
+                    model.value_tower,
+                    model.dora_head,
+                    model.dora_tail_head,
+                    model.score_head,
+                ]
+            ),
+            "kyoku": nn.ModuleList(
+                [model.kyoku_tower, model.outcome_head, model.kyoku_account_head]
+            ),
+            "match": nn.ModuleList(
+                [model.match_tower, model.placement_head, model.match_score_head]
+            ),
+            "policy_context": model.policy_context,
+            "policy": nn.ModuleList([model.policy_tower, model.policy_head]),
+        }
+        counts = {
+            name: sum(parameter.numel() for parameter in module.parameters())
+            for name, module in groups.items()
+        }
+        counts["total"] = sum(parameter.numel() for parameter in model.parameters())
+        return counts
     groups: dict[str, nn.Module] = {
         "encoder": model.encoder,
         "state": nn.ModuleList([model.state_adapter, model.state_head]),
