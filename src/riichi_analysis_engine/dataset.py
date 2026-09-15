@@ -94,6 +94,52 @@ def _settle_legacy_terminal_scores(arrays: dict[str, np.ndarray]) -> None:
         scores[row, winner] += deficits[row]
 
 
+def audit_terminal_score_arrays(arrays: dict[str, np.ndarray]) -> dict[str, object]:
+    """Summarize terminal-score conservation without expanding observations."""
+
+    scores = arrays.get("match_score")
+    if scores is None or scores.ndim != 2 or scores.shape[1] != 4:
+        raise ValueError("pack has no four-player terminal-score labels")
+    totals = arrays.get("system_total")
+    legacy = totals is None
+    if totals is None:
+        totals = np.full(len(scores), 100_000, dtype=np.int64)
+    totals = np.asarray(totals, dtype=np.int64).reshape(-1)
+    if len(totals) != len(scores):
+        raise ValueError("system-total labels do not match terminal-score labels")
+
+    sums = scores.astype(np.int64, copy=False).sum(axis=-1)
+    labeled = sums > 0
+    deficits = totals - sums
+    invalid = labeled & ((deficits < 0) | (deficits % 1_000 != 0))
+    if invalid.any():
+        raise ValueError("terminal scores are inconsistent with the system total")
+    deficient = labeled & (deficits > 0)
+    sources = arrays.get("source_game")
+    affected_games = (
+        len(np.unique(sources[deficient]))
+        if sources is not None and len(sources) == len(scores)
+        else None
+    )
+
+    def distribution(values: np.ndarray) -> dict[str, int]:
+        unique, counts = np.unique(values, return_counts=True)
+        return {
+            str(int(value)): int(count)
+            for value, count in zip(unique, counts, strict=True)
+        }
+
+    return {
+        "samples": len(scores),
+        "labeledSamples": int(labeled.sum()),
+        "deficientSamples": int(deficient.sum()),
+        "affectedSourceGames": affected_games,
+        "legacyAssumedTotal": legacy,
+        "rawScoreSums": distribution(sums[labeled]),
+        "deficitPoints": distribution(deficits[deficient]),
+    }
+
+
 class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
     """Iterate a pack directory once, in manifest order."""
 
