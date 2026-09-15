@@ -79,6 +79,8 @@ class StructuredModelArchitecture:
     shared_channels: int = 256
     shared_blocks: int = 30
     family_latent_width: int = 768
+    opponent_latent_width: int = 1024
+    policy_latent_width: int = 1024
     opponent_blocks: int = 24
     hidden_blocks: int = 8
     value_blocks: int = 6

@@ -13,6 +13,8 @@ def main() -> None:
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
     parser.add_argument("--family-latent-width", type=int, default=768)
+    parser.add_argument("--opponent-latent-width", type=int, default=1024)
+    parser.add_argument("--policy-latent-width", type=int, default=1024)
     parser.add_argument("--opponent-blocks", type=int, default=24)
     parser.add_argument("--hidden-blocks", type=int, default=8)
     parser.add_argument("--value-blocks", type=int, default=6)
@@ -37,6 +39,8 @@ def main() -> None:
                 shared_channels=args.shared_channels,
                 shared_blocks=args.shared_blocks,
                 family_latent_width=args.family_latent_width,
+                opponent_latent_width=args.opponent_latent_width,
+                policy_latent_width=args.policy_latent_width,
                 opponent_blocks=args.opponent_blocks,
                 hidden_blocks=args.hidden_blocks,
                 value_blocks=args.value_blocks,
