@@ -47,14 +47,14 @@ def test_default_parameter_budget() -> None:
     model = RiichiAnalysisModel()
     assert count_parameters(model) == {
         "shared": 12_762_080,
-        "opponent": 11_359_419,
+        "opponent": 11_971_614,
         "hidden": 4_516_400,
         "value": 4_563_532,
         "kyoku": 4_084_646,
         "match": 3_274_108,
         "policy_context": 1_260_086,
-        "policy": 11_754_190,
-        "total": 53_574_461,
+        "policy": 12_295_118,
+        "total": 54_727_584,
     }
 
 
@@ -110,11 +110,13 @@ def test_v6_architecture_round_trips_and_keeps_prediction_heads_state_only() -> 
     assert not torch.equal(first_outputs["policy"], second_outputs["policy"])
 
 
-def test_v8_family_towers_keep_tilewise_outputs_and_structured_accounts() -> None:
+def test_v8_family_towers_keep_global_waits_and_structured_outputs() -> None:
     architecture = StructuredModelArchitecture(
         shared_channels=16,
         shared_blocks=1,
         family_latent_width=32,
+        opponent_latent_width=40,
+        policy_latent_width=48,
         opponent_blocks=1,
         hidden_blocks=1,
         value_blocks=1,
@@ -139,6 +141,7 @@ def test_v8_family_towers_keep_tilewise_outputs_and_structured_accounts() -> Non
     assert outputs["hidden_red_source"].shape == (2, 3, 4)
     assert outputs["dora_tail"].shape == (2, 3)
     assert outputs["kyoku_accounts"].shape == (2, 5)
+    assert model.wait_head.in_features == architecture.opponent_latent_width
     assert count_parameters(model)["total"] == sum(
         parameter.numel() for parameter in model.parameters()
     )

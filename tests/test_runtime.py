@@ -242,6 +242,8 @@ def test_v8_runtime_reconstructs_structured_architecture(tmp_path, monkeypatch) 
         shared_channels=8,
         shared_blocks=1,
         family_latent_width=16,
+        opponent_latent_width=20,
+        policy_latent_width=24,
         opponent_blocks=1,
         hidden_blocks=1,
         value_blocks=1,

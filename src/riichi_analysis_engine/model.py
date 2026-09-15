@@ -404,7 +404,9 @@ class RiichiAnalysisModel(nn.Module):
     def _init_v8(self, architecture: StructuredModelArchitecture) -> None:
         self.architecture = architecture
         channels = architecture.shared_channels
-        latent = architecture.family_latent_width
+        family_latent = architecture.family_latent_width
+        opponent_latent = architecture.opponent_latent_width
+        policy_latent = architecture.policy_latent_width
         task = architecture.task_width
         self.shared_trunk = SpatialTrunk(
             ANALYSIS_CHANNELS,
@@ -412,22 +414,26 @@ class RiichiAnalysisModel(nn.Module):
             blocks=architecture.shared_blocks,
         )
         self.opponent_tower = FamilyTower(
-            channels, blocks=architecture.opponent_blocks, latent_width=latent
+            channels,
+            blocks=architecture.opponent_blocks,
+            latent_width=opponent_latent,
         )
         self.hidden_tower = FamilyTower(
-            channels, blocks=architecture.hidden_blocks, latent_width=latent
+            channels, blocks=architecture.hidden_blocks, latent_width=family_latent
         )
         self.value_tower = FamilyTower(
-            channels, blocks=architecture.value_blocks, latent_width=latent
+            channels, blocks=architecture.value_blocks, latent_width=family_latent
         )
         self.kyoku_tower = FamilyTower(
-            channels, blocks=architecture.kyoku_blocks, latent_width=latent
+            channels, blocks=architecture.kyoku_blocks, latent_width=family_latent
         )
         self.match_tower = FamilyTower(
-            channels, blocks=architecture.match_blocks, latent_width=latent
+            channels, blocks=architecture.match_blocks, latent_width=family_latent
         )
         self.policy_tower = FamilyTower(
-            channels, blocks=architecture.policy_blocks, latent_width=latent
+            channels,
+            blocks=architecture.policy_blocks,
+            latent_width=policy_latent,
         )
         self.policy_context = ResidualEncoder(
             POLICY_CONTEXT_CHANNELS,
@@ -436,22 +442,32 @@ class RiichiAnalysisModel(nn.Module):
             latent_width=architecture.policy_context_width,
         )
 
-        self.shanten_head = DensePredictionHead(latent, task, 3 * 7)
-        self.furiten_head = DensePredictionHead(latent, task, 3)
-        self.wait_head = TilePredictionHead(channels, architecture.tile_width, 3)
+        self.shanten_head = DensePredictionHead(opponent_latent, task, 3 * 7)
+        self.furiten_head = DensePredictionHead(opponent_latent, task, 3)
+        # The successful shanten/deal-in model decoded every wait from one
+        # complete Mortal-style state.  A tile-local output shortcut regressed
+        # that design and lets the matching input column dominate.  Keep the
+        # 34 outputs independent, but let every one read the full opponent
+        # representation.
+        self.wait_head = nn.Linear(opponent_latent, 3 * TILE_TYPES)
+        nn.init.zeros_(self.wait_head.bias)
         self.hidden_source_head = TilePredictionHead(
             channels, architecture.tile_width, 4
         )
-        self.hidden_red_head = DensePredictionHead(latent, task, 3 * 4)
-        self.dora_head = DensePredictionHead(latent, task, 3 * len(DORA_VALUES))
-        self.dora_tail_head = DensePredictionHead(latent, task, 3)
-        self.score_head = DensePredictionHead(latent, task, 3 * len(SCORE_VALUES))
-        self.outcome_head = DensePredictionHead(latent, task, OUTCOME_COUNT)
-        self.kyoku_account_head = DensePredictionHead(latent, task, 5)
-        self.placement_head = DensePredictionHead(latent, task, 24)
-        self.match_score_head = DensePredictionHead(latent, task, 4)
+        self.hidden_red_head = DensePredictionHead(family_latent, task, 3 * 4)
+        self.dora_head = DensePredictionHead(
+            family_latent, task, 3 * len(DORA_VALUES)
+        )
+        self.dora_tail_head = DensePredictionHead(family_latent, task, 3)
+        self.score_head = DensePredictionHead(
+            family_latent, task, 3 * len(SCORE_VALUES)
+        )
+        self.outcome_head = DensePredictionHead(family_latent, task, OUTCOME_COUNT)
+        self.kyoku_account_head = DensePredictionHead(family_latent, task, 5)
+        self.placement_head = DensePredictionHead(family_latent, task, 24)
+        self.match_score_head = DensePredictionHead(family_latent, task, 4)
         self.policy_head = DensePredictionHead(
-            latent + architecture.policy_context_width,
+            policy_latent + architecture.policy_context_width,
             architecture.policy_width,
             ACTION_SPACE,
         )
@@ -740,7 +756,7 @@ class RiichiAnalysisModel(nn.Module):
         self, observation: Tensor, shared: Tensor
     ) -> dict[str, Tensor]:
         batch = len(observation)
-        opponent_spatial, opponent = self.opponent_tower(shared)
+        _opponent_spatial, opponent = self.opponent_tower(shared)
         hidden_spatial, hidden = self.hidden_tower(shared)
         _value_spatial, value = self.value_tower(shared)
         _kyoku_spatial, kyoku = self.kyoku_tower(shared)
@@ -748,7 +764,7 @@ class RiichiAnalysisModel(nn.Module):
         _policy_spatial, policy_analysis = self.policy_tower(shared)
         policy_context = self.policy_context(observation[:, POLICY_CONTEXT_START:])
 
-        wait = self.wait_head(opponent_spatial)
+        wait = self.wait_head(opponent)
         hidden_source = self.hidden_source_head(hidden_spatial)
         return {
             "shanten": self.shanten_head(opponent).view(batch, 3, 7),

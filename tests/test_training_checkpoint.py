@@ -17,6 +17,8 @@ def test_v8_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> 
         shared_channels=16,
         shared_blocks=1,
         family_latent_width=32,
+        opponent_latent_width=40,
+        policy_latent_width=48,
         opponent_blocks=1,
         hidden_blocks=1,
         value_blocks=1,
