@@ -11,6 +11,7 @@ from riichi_analysis_engine.dataset import (
     METADATA_FIELDS,
     PackDataset,
     _settle_legacy_terminal_scores,
+    audit_terminal_score_arrays,
     read_manifest,
 )
 from riichi_analysis_engine.packing import (
@@ -143,6 +144,29 @@ def test_legacy_terminal_score_migration_awards_pool_to_absolute_first_place() -
         [17_600, 10_100, 45_300, 27_000],
         [10_100, 45_300, 27_000, 17_600],
     ]
+
+
+def test_terminal_score_audit_counts_legacy_deficits_without_mutation() -> None:
+    arrays = {
+        "match_score": np.asarray(
+            [[17_600, 10_100, 44_300, 27_000], [0, 0, 0, 0]], dtype=np.int32
+        ),
+        "source_game": np.asarray([42, 42], dtype=np.int32),
+    }
+    original = arrays["match_score"].copy()
+
+    summary = audit_terminal_score_arrays(arrays)
+
+    assert summary == {
+        "samples": 2,
+        "labeledSamples": 1,
+        "deficientSamples": 1,
+        "affectedSourceGames": 1,
+        "legacyAssumedTotal": True,
+        "rawScoreSums": {"99000": 1},
+        "deficitPoints": {"1000": 1},
+    }
+    assert np.array_equal(arrays["match_score"], original)
 
 
 def test_a_full_pass_yields_every_sample_once(scratch: Path) -> None:
