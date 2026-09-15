@@ -24,6 +24,7 @@ import numpy as np
 from riichi_analysis_engine.dataset import PackDataset, read_manifest
 from riichi_analysis_engine.packing import audit_packs, read_plan, staged_games
 from riichi_analysis_engine.storage import read_chunk_archive_meta, read_packed_shard
+from riichi_analysis_engine.training_schema import validate_v8_training_batch
 
 
 def build_arguments() -> argparse.Namespace:
@@ -116,7 +117,13 @@ def check_loader(root: Path, batch_size: int, samples: int) -> dict[str, object]
 
     sizes: list[int] = []
     total = 0
+    contract: dict[str, int] | None = None
     for batch in PackDataset(root, batch_size=batch_size, max_samples=samples):
+        if contract is None:
+            try:
+                contract = validate_v8_training_batch(batch)
+            except ValueError as error:
+                raise SystemExit(str(error)) from error
         length = len(batch["policy"])
         sizes.append(length)
         total += length
@@ -126,6 +133,7 @@ def check_loader(root: Path, batch_size: int, samples: int) -> dict[str, object]
         "samples": total,
         "shortBatches": sum(1 for size in sizes if size != batch_size),
         "emptyBatches": sum(1 for size in sizes if size == 0),
+        "v8Contract": contract,
     }
 
 
