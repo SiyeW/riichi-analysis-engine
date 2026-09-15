@@ -117,13 +117,15 @@ def check_loader(root: Path, batch_size: int, samples: int) -> dict[str, object]
 
     sizes: list[int] = []
     total = 0
-    contract: dict[str, int] | None = None
+    contract_samples = 0
+    contract_seat_winds: set[int] = set()
     for batch in PackDataset(root, batch_size=batch_size, max_samples=samples):
-        if contract is None:
-            try:
-                contract = validate_v8_training_batch(batch)
-            except ValueError as error:
-                raise SystemExit(str(error)) from error
+        try:
+            contract = validate_v8_training_batch(batch)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        contract_samples += contract["samples"]
+        contract_seat_winds.add(contract["seatWinds"])
         length = len(batch["policy"])
         sizes.append(length)
         total += length
@@ -133,7 +135,11 @@ def check_loader(root: Path, batch_size: int, samples: int) -> dict[str, object]
         "samples": total,
         "shortBatches": sum(1 for size in sizes if size != batch_size),
         "emptyBatches": sum(1 for size in sizes if size == 0),
-        "v8Contract": contract,
+        "v8Contract": {
+            "batches": len(sizes),
+            "samples": contract_samples,
+            "distinctSeatWindCountsPerBatch": sorted(contract_seat_winds),
+        },
     }
 
 
