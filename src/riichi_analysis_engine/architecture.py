@@ -41,13 +41,76 @@ class ModelArchitecture:
         }
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
-            raise ValueError(f"architecture dimensions must be positive: {', '.join(invalid)}")
+            raise ValueError(
+                f"architecture dimensions must be positive: {', '.join(invalid)}"
+            )
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, value: Any) -> "ModelArchitecture":
+    def from_dict(cls, value: Any) -> ModelArchitecture:
+        if not isinstance(value, dict):
+            raise ValueError("model architecture must be an object")
+        expected = set(cls.__dataclass_fields__)
+        if set(value) != expected:
+            missing = sorted(expected - set(value))
+            extra = sorted(set(value) - expected)
+            raise ValueError(
+                "model architecture fields do not match "
+                f"(missing={missing}, extra={extra})"
+            )
+        if not all(type(item) is int for item in value.values()):
+            raise ValueError("model architecture values must be integers")
+        return cls(**value)
+
+
+@dataclass(frozen=True)
+class StructuredModelArchitecture:
+    """Trainable shape of the v8 family-tower model.
+
+    The shared trunk learns low-level public-state features. Each prediction
+    family then owns residual depth and task-specific heads, so unrelated
+    objectives cannot force every useful abstraction through one shallow
+    adapter.
+    """
+
+    observation_version: int = 4
+    shared_channels: int = 256
+    shared_blocks: int = 30
+    family_latent_width: int = 768
+    opponent_blocks: int = 24
+    hidden_blocks: int = 8
+    value_blocks: int = 6
+    kyoku_blocks: int = 6
+    match_blocks: int = 4
+    policy_blocks: int = 24
+    task_width: int = 512
+    tile_width: int = 128
+    policy_context_channels: int = 144
+    policy_context_blocks: int = 6
+    policy_context_width: int = 384
+    policy_width: int = 1024
+
+    def __post_init__(self) -> None:
+        if self.observation_version != 4:
+            raise ValueError("only observation version 4 is supported")
+        positive = {
+            name: value
+            for name, value in asdict(self).items()
+            if name != "observation_version"
+        }
+        invalid = [name for name, value in positive.items() if value <= 0]
+        if invalid:
+            raise ValueError(
+                f"architecture dimensions must be positive: {', '.join(invalid)}"
+            )
+
+    def to_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Any) -> StructuredModelArchitecture:
         if not isinstance(value, dict):
             raise ValueError("model architecture must be an object")
         expected = set(cls.__dataclass_fields__)

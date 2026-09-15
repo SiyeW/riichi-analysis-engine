@@ -7,7 +7,12 @@ import pytest
 from test_storage import sample_arrays
 
 from riichi_analysis_engine import dataset
-from riichi_analysis_engine.dataset import METADATA_FIELDS, PackDataset, read_manifest
+from riichi_analysis_engine.dataset import (
+    METADATA_FIELDS,
+    PackDataset,
+    _settle_legacy_terminal_scores,
+    read_manifest,
+)
 from riichi_analysis_engine.packing import (
     LEGACY_MANIFEST_FORMATS,
     MANIFEST_FORMAT,
@@ -29,7 +34,9 @@ def scratch() -> Path:
     write, and a packing test needs real files on disk.
     """
 
-    root = Path(__file__).resolve().parents[1] / "runs" / "test-dataset" / uuid.uuid4().hex
+    root = (
+        Path(__file__).resolve().parents[1] / "runs" / "test-dataset" / uuid.uuid4().hex
+    )
     root.mkdir(parents=True)
     try:
         yield root
@@ -116,6 +123,26 @@ def stored_tags(root: Path) -> np.ndarray:
 
 def collect(dataset: PackDataset) -> list[dict[str, np.ndarray]]:
     return [{name: value.numpy() for name, value in batch.items()} for batch in dataset]
+
+
+def test_legacy_terminal_score_migration_awards_pool_to_absolute_first_place() -> None:
+    arrays = {
+        "match_score": np.asarray(
+            [
+                [17_600, 10_100, 44_300, 27_000],
+                [10_100, 44_300, 27_000, 17_600],
+            ],
+            dtype=np.int32,
+        ),
+        "perspective": np.asarray([0, 1], dtype=np.uint8),
+    }
+
+    _settle_legacy_terminal_scores(arrays)
+
+    assert arrays["match_score"].tolist() == [
+        [17_600, 10_100, 45_300, 27_000],
+        [10_100, 45_300, 27_000, 17_600],
+    ]
 
 
 def test_a_full_pass_yields_every_sample_once(scratch: Path) -> None:
@@ -216,7 +243,9 @@ def test_sample_cursor_is_exact_after_a_short_budget_batch(scratch: Path) -> Non
     )
 
 
-def test_sample_budget_stops_inside_a_batch_carried_between_packs(scratch: Path) -> None:
+def test_sample_budget_stops_inside_a_batch_carried_between_packs(
+    scratch: Path,
+) -> None:
     root = pack_directory(scratch, pack_samples=10)
     full = np.concatenate(
         [batch["sample_tag"] for batch in collect(PackDataset(root, batch_size=8))]

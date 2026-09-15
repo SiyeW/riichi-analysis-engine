@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-import sys
 import shutil
+import sys
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -16,7 +16,12 @@ from riichi_analysis_engine import train
 
 @pytest.fixture()
 def scratch() -> Iterator[Path]:
-    root = Path(__file__).resolve().parents[1] / "runs" / "test-single-pass" / uuid.uuid4().hex
+    root = (
+        Path(__file__).resolve().parents[1]
+        / "runs"
+        / "test-single-pass"
+        / uuid.uuid4().hex
+    )
     root.mkdir(parents=True)
     try:
         yield root
@@ -51,16 +56,28 @@ def run_training(
         str(checkpoint_every_samples),
         "--device",
         "cpu",
-        "--analysis-channels",
+        "--shared-channels",
         "16",
-        "--analysis-blocks",
+        "--shared-blocks",
         "1",
-        "--analysis-latent-width",
+        "--family-latent-width",
         "32",
-        "--state-width",
+        "--opponent-blocks",
+        "1",
+        "--hidden-blocks",
+        "1",
+        "--value-blocks",
+        "1",
+        "--kyoku-blocks",
+        "1",
+        "--match-blocks",
+        "1",
+        "--policy-blocks",
+        "1",
+        "--task-width",
         "24",
-        "--future-width",
-        "20",
+        "--tile-width",
+        "8",
         "--policy-context-channels",
         "16",
         "--policy-context-blocks",
@@ -81,7 +98,9 @@ def run_training(
 
 
 def load_cursor(checkpoint: Path) -> dict[str, object]:
-    return torch.load(checkpoint, map_location="cpu", weights_only=True)["trainingCursor"]
+    return torch.load(checkpoint, map_location="cpu", weights_only=True)[
+        "trainingCursor"
+    ]
 
 
 def test_training_resumes_forward_and_completes_one_pass(
@@ -128,7 +147,9 @@ def test_training_checkpoint_is_durable_before_validation(
     run = scratch / "run"
 
     def interrupt_validation(*_args: object, **_kwargs: object) -> dict[str, float]:
-        pointer = json.loads((run / "latest_checkpoint.json").read_text(encoding="utf-8"))
+        pointer = json.loads(
+            (run / "latest_checkpoint.json").read_text(encoding="utf-8")
+        )
         assert pointer["samplesSeen"] == 16
         assert pointer["validationComplete"] is False
         checkpoint = torch.load(pointer["path"], map_location="cpu", weights_only=True)
@@ -230,6 +251,4 @@ def test_terminal_sample_boundary_is_not_saved_twice(
     )
 
     assert final_checkpoint.name == "checkpoint-step-4.pt"
-    assert sorted(path.name for path in run.glob("ckpt-*.pt")) == [
-        "ckpt-000000002.pt"
-    ]
+    assert sorted(path.name for path in run.glob("ckpt-*.pt")) == ["ckpt-000000002.pt"]

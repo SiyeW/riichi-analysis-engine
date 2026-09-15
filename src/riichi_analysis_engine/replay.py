@@ -74,11 +74,15 @@ def _dora_from_marker(marker: str) -> str:
 
 @dataclass
 class FullState:
-    hands: list[Counter[str]] = field(default_factory=lambda: [Counter() for _ in range(4)])
+    hands: list[Counter[str]] = field(
+        default_factory=lambda: [Counter() for _ in range(4)]
+    )
     melds: list[list[list[str]]] = field(default_factory=lambda: [[] for _ in range(4)])
     wall: np.ndarray = field(default_factory=lambda: np.zeros(34, dtype=np.uint8))
     wall_red: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.uint8))
-    scores: np.ndarray = field(default_factory=lambda: np.full(4, 25_000, dtype=np.int32))
+    scores: np.ndarray = field(
+        default_factory=lambda: np.full(4, 25_000, dtype=np.int32)
+    )
     dora_markers: list[str] = field(default_factory=list)
     riichi: list[bool] = field(default_factory=lambda: [False] * 4)
     honba: int = 0
@@ -179,12 +183,19 @@ class FullState:
             if marker in RED_TILE_TO_INDEX:
                 red_index = RED_TILE_TO_INDEX[marker]
                 if self.wall_red[red_index] == 0:
-                    raise ValueError(f"negative red wall count after dora marker {marker}")
+                    raise ValueError(
+                        f"negative red wall count after dora marker {marker}"
+                    )
                 self.wall_red[red_index] -= 1
         elif kind in {"hora", "ryukyoku"}:
             deltas = event.get("deltas")
             if isinstance(deltas, list):
                 self.scores = self.scores + np.asarray(deltas, dtype=np.int32)
+            if kind == "hora":
+                # The first winner's settlement already contains every riichi
+                # stick on the table. Later winners in the same settlement do
+                # not collect it again.
+                self.kyotaku = 0
 
     def concealed_counts(self, player: int) -> np.ndarray:
         counts = np.zeros(34, dtype=np.uint8)
@@ -232,7 +243,8 @@ def hand_score(event: dict[str, Any], state: FullState, *, first_winner: bool) -
         value -= state.honba * 300 + state.kyotaku * 1000
     if value not in SCORE_VALUE_SET:
         raise ValueError(
-            f"hora produced an unsupported hand score: {value} (deltas={deltas.tolist()})"
+            "hora produced an unsupported hand score: "
+            f"{value} (deltas={deltas.tolist()})"
         )
     return value
 
@@ -279,7 +291,9 @@ def annotate_game(events: list[dict[str, Any]]) -> dict[int, FutureAnnotation]:
             active.targets[actor] = target
             if actor != target:
                 active.deal_in[target] = 1
-            active.dora[actor] = state.dora_count(actor, target, list(event.get("ura_markers", [])))
+            active.dora[actor] = state.dora_count(
+                actor, target, list(event.get("ura_markers", []))
+            )
             active.score[actor] = hand_score(
                 event, state, first_winner=not active.first_winner_seen
             )
@@ -292,7 +306,7 @@ def annotate_game(events: list[dict[str, Any]]) -> dict[int, FutureAnnotation]:
             builders.append((active, state.scores.copy()))
             active = None
 
-    final_match_scores = state.scores.copy()
+    final_match_scores = terminal_match_scores(state.scores, state.kyotaku)
     annotations: dict[int, FutureAnnotation] = {}
     for builder, final_kyoku_scores in builders:
         annotation = FutureAnnotation(
@@ -307,6 +321,27 @@ def annotate_game(events: list[dict[str, Any]]) -> dict[int, FutureAnnotation]:
         )
         annotations.update((index, annotation) for index in builder.frame_indices)
     return annotations
+
+
+def terminal_match_scores(scores: np.ndarray, kyotaku: int) -> np.ndarray:
+    """Return final net-mahjong scores after assigning unclaimed riichi sticks.
+
+    source-style MJAI logs can end immediately after a drawn last hand. In
+    that case the final ``ryukyoku`` settlement leaves the sticks outside the
+    four player accounts and no later event records their award. RMS uses the
+    common online rule that the current first-place player receives that pool.
+    Ties follow the initial-seat order, matching :func:`placement_label`.
+    """
+
+    if kyotaku < 0:
+        raise ValueError("kyotaku cannot be negative")
+    result = np.asarray(scores, dtype=np.int32).copy()
+    if result.shape != (PLAYERS,):
+        raise ValueError(f"scores must contain exactly {PLAYERS} values")
+    if kyotaku:
+        first = min(range(PLAYERS), key=lambda player: (-int(result[player]), player))
+        result[first] += kyotaku * 1_000
+    return result
 
 
 class ExactTargetTracker:
@@ -351,7 +386,9 @@ class ExactTargetTracker:
         if int(hand.sum()) % 3 != 1:
             return shanten, 0, ron_waits
 
-        open_melds = len(state.chis) + len(state.pons) + len(state.minkans) + len(state.ankans)
+        open_melds = (
+            len(state.chis) + len(state.pons) + len(state.minkans) + len(state.ankans)
+        )
         waits = np.zeros(34, dtype=bool)
         for tile in range(34):
             if hand[tile] >= 4:
@@ -437,7 +474,9 @@ class ExactTargetTracker:
                 base = position * 8
                 rotated[perspective, base + shanten] = 1
                 rotated[perspective, base + 7] = stuck
-                rotated[perspective, 24 + position * 34 : 24 + (position + 1) * 34] = waits
+                rotated[perspective, 24 + position * 34 : 24 + (position + 1) * 34] = (
+                    waits
+                )
         if kind == "dahai":
             discarder = int(event["actor"])
             tile = tile34_index(event["pai"])
@@ -461,7 +500,9 @@ def action_label(
     while len(window) < 3:
         window.append({"type": "end_game"})
     immediate = window[0]
-    next_event = window[1] if immediate["type"] in {"reach_accepted", "dora"} else immediate
+    next_event = (
+        window[1] if immediate["type"] in {"reach_accepted", "dora"} else immediate
+    )
     kind = next_event["type"]
     kan_select: int | None = None
 
@@ -527,11 +568,15 @@ PERMUTATIONS = tuple(itertools.permutations(range(PLAYERS)))
 
 
 def placement_label(scores: np.ndarray, perspective: int) -> int:
-    absolute_order = sorted(range(PLAYERS), key=lambda player: (-int(scores[player]), player))
+    absolute_order = sorted(
+        range(PLAYERS), key=lambda player: (-int(scores[player]), player)
+    )
     rank_by_player = np.empty(PLAYERS, dtype=np.uint8)
     for rank, player in enumerate(absolute_order):
         rank_by_player[player] = rank
-    relative = tuple(int(value) for value in rotate_absolute(rank_by_player, perspective))
+    relative = tuple(
+        int(value) for value in rotate_absolute(rank_by_player, perspective)
+    )
     return PERMUTATIONS.index(relative)
 
 

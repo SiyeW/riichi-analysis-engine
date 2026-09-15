@@ -1,11 +1,20 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
-from riichi_analysis_engine.architecture import ModelArchitecture
-from riichi_analysis_engine.constants import ACTION_SPACE, MORTAL_OBS_CHANNELS, TILE_TYPES
-from riichi_analysis_engine.observation_layout import ANALYSIS_CHANNELS
+from riichi_analysis_engine.architecture import (
+    ModelArchitecture,
+    StructuredModelArchitecture,
+)
+from riichi_analysis_engine.constants import (
+    ACTION_SPACE,
+    MORTAL_OBS_CHANNELS,
+    TILE_TYPES,
+)
 from riichi_analysis_engine.model import RiichiAnalysisModel
+from riichi_analysis_engine.observation_layout import ANALYSIS_CHANNELS
 from riichi_analysis_engine.prediction_values import DORA_VALUES, SCORE_VALUES
 from riichi_analysis_engine.runtime import (
     AnalysisRuntime,
@@ -22,9 +31,10 @@ from riichi_analysis_engine.score_state import PublicScoreState
 def test_candidate_action_mapping() -> None:
     assert candidate_action_index({"type": "dahai", "pai": "5mr"}) == 34
     assert candidate_action_index({"type": "reach"}) == 37
-    assert candidate_action_index(
-        {"type": "chi", "pai": "3m", "consumed": ["1m", "2m"]}
-    ) == 40
+    assert (
+        candidate_action_index({"type": "chi", "pai": "3m", "consumed": ["1m", "2m"]})
+        == 40
+    )
     assert candidate_action_index({"type": "pon"}) == 41
     assert candidate_action_index({"type": "ankan"}) == 42
     assert candidate_action_index({"type": "hora"}) == 43
@@ -164,7 +174,9 @@ def test_v6_runtime_adds_ranks_from_public_score_events() -> None:
         player_id = 1
 
         @staticmethod
-        def encode_obs(version: int, at_kan_select: bool) -> tuple[np.ndarray, np.ndarray]:
+        def encode_obs(
+            version: int, at_kan_select: bool
+        ) -> tuple[np.ndarray, np.ndarray]:
             assert version == 4
             assert not at_kan_select
             return (
@@ -215,9 +227,152 @@ def test_v6_runtime_reconstructs_weight_architecture(tmp_path, monkeypatch) -> N
         },
         checkpoint,
     )
-    monkeypatch.setattr("riichi_analysis_engine.runtime._load_player_state", lambda: object)
+    monkeypatch.setattr(
+        "riichi_analysis_engine.runtime._load_player_state", lambda: object
+    )
 
     runtime = AnalysisRuntime(checkpoint, "cpu")
 
     assert runtime.format_version == 6
     assert runtime.model.architecture == architecture
+
+
+def test_v8_runtime_reconstructs_structured_architecture(tmp_path, monkeypatch) -> None:
+    architecture = StructuredModelArchitecture(
+        shared_channels=8,
+        shared_blocks=1,
+        family_latent_width=16,
+        opponent_blocks=1,
+        hidden_blocks=1,
+        value_blocks=1,
+        kyoku_blocks=1,
+        match_blocks=1,
+        policy_blocks=1,
+        task_width=12,
+        tile_width=6,
+        policy_context_channels=4,
+        policy_context_blocks=1,
+        policy_context_width=8,
+        policy_width=16,
+    )
+    checkpoint = tmp_path / "weights.pt"
+    torch.save(
+        {
+            "format": "riichi-analysis-model-v8",
+            "model": RiichiAnalysisModel(
+                format_version=8, architecture=architecture
+            ).state_dict(),
+            "architecture": {
+                "model": architecture.to_dict(),
+                "predictionValues": {
+                    "dora": list(DORA_VALUES),
+                    "score": list(SCORE_VALUES),
+                },
+            },
+        },
+        checkpoint,
+    )
+    monkeypatch.setattr(
+        "riichi_analysis_engine.runtime._load_player_state", lambda: object
+    )
+
+    runtime = AnalysisRuntime(checkpoint, "cpu")
+
+    assert runtime.format_version == 8
+    assert runtime.model.architecture == architecture
+
+
+def test_v8_runtime_emits_constrained_probabilities_and_score_totals() -> None:
+    class FakePlayerState:
+        def __init__(self, player_id: int) -> None:
+            self.player_id = player_id
+
+        def update(self, _event: str) -> SimpleNamespace:
+            return SimpleNamespace()
+
+        @staticmethod
+        def encode_obs(
+            _version: int, _kan_select: bool
+        ) -> tuple[np.ndarray, np.ndarray]:
+            return (
+                np.zeros((MORTAL_OBS_CHANNELS, TILE_TYPES), dtype=np.float32),
+                np.ones(ACTION_SPACE, dtype=bool),
+            )
+
+    class FakeModel:
+        @staticmethod
+        def __call__(observation: torch.Tensor) -> dict[str, torch.Tensor]:
+            batch = len(observation)
+            return {
+                "shanten": torch.zeros(batch, 3, 7),
+                "furiten_no_yaku": torch.zeros(batch, 3),
+                "deal_in_tile": torch.full((batch, 3, 34), 10.0),
+                "hidden_source_affinity": torch.zeros(batch, 4, 34),
+                "hidden_red_source": torch.zeros(batch, 3, 4),
+                "dora_distribution": torch.zeros(batch, 3, len(DORA_VALUES)),
+                "dora_tail": torch.zeros(batch, 3),
+                "score_distribution": torch.zeros(batch, 3, len(SCORE_VALUES)),
+                "outcome": torch.zeros(batch, 33),
+                "kyoku_accounts": torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]]).expand(
+                    batch, -1
+                ),
+                "placement": torch.zeros(batch, 24),
+                "match_score": torch.zeros(batch, 4),
+                "policy": torch.zeros(batch, ACTION_SPACE),
+            }
+
+    own_hand = [
+        "1m",
+        "2m",
+        "3m",
+        "4m",
+        "5mr",
+        "6m",
+        "7m",
+        "8m",
+        "9m",
+        "1s",
+        "2s",
+        "3s",
+        "4s",
+    ]
+    events = [
+        {
+            "type": "start_kyoku",
+            "bakaze": "E",
+            "kyoku": 1,
+            "honba": 0,
+            "kyotaku": 0,
+            "oya": 0,
+            "dora_marker": "1p",
+            "scores": [25_000] * 4,
+            "tehais": [own_hand, ["?"] * 13, ["?"] * 13, ["?"] * 13],
+        }
+    ]
+    runtime = AnalysisRuntime.__new__(AnalysisRuntime)
+    runtime.device = torch.device("cpu")
+    runtime.format_version = 8
+    runtime.model = FakeModel()
+    runtime.player_state_type = FakePlayerState
+
+    results, _elapsed = runtime.predict(events, 0, [], protocol_minor=2)
+
+    opponent_totals = [
+        sum(tile["expectedValue"] for tile in player["tiles"].values())
+        for player in results["opponent-concealed-tile-count"]["players"]
+    ]
+    wall_total = sum(
+        tile["expectedValue"] for tile in results["wall-tile-count"]["tiles"].values()
+    )
+    assert opponent_totals == pytest.approx([13.0, 13.0, 13.0], abs=1e-4)
+    assert wall_total == pytest.approx(83.0, abs=1e-4)
+    assert sum(
+        player["prediction"]["expectedValue"]
+        for player in results["match-score"]["players"]
+    ) == pytest.approx(100_000.0, abs=1e-3)
+    tenpai_probability = 1.0 / 7.0
+    assert all(
+        probability <= tenpai_probability
+        for player in results["opponent-deal-in-probability"]["players"]
+        for probability in player["tiles"].values()
+    )

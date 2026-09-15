@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from .architecture import ModelArchitecture
+from .architecture import ModelArchitecture, StructuredModelArchitecture
 from .constants import (
     MORTAL_OBS_CHANNELS,
     OBS_CHANNELS,
@@ -23,6 +23,11 @@ from .constants import (
     TILES_34,
     relative_players,
     tile34_index,
+)
+from .hidden_transport import (
+    balanced_source_probabilities,
+    count_marginals,
+    physical_affinities,
 )
 from .kyoku_outcome import OUTCOME_CLASSES, outcome_marginals
 from .model import RiichiAnalysisModel
@@ -34,6 +39,11 @@ from .rule_certainties import (
     constrain_distribution,
 )
 from .score_state import PublicScoreState
+from .structured_outputs import (
+    conditional_deal_in_probabilities,
+    fixed_total_values,
+    zero_sum_accounts,
+)
 
 PERMUTATIONS = tuple(itertools.permutations(range(4)))
 
@@ -47,7 +57,8 @@ def _load_player_state() -> Any:
         root = os.environ.get("RIICHI_LIBRIICHI_ROOT")
         if not root:
             raise RuntimeError(
-                "libriichi is unavailable; set RIICHI_LIBRIICHI_ROOT for a development build"
+                "libriichi is unavailable; set RIICHI_LIBRIICHI_ROOT "
+                "for a development build"
             ) from None
         sys.path.insert(0, str(Path(root).resolve()))
         from libriichi.state import PlayerState
@@ -62,14 +73,18 @@ def _finite(value: float) -> float:
     return value
 
 
-def _distribution(probabilities: np.ndarray, *, first_value: int = 0) -> list[dict[str, float | int]]:
+def _distribution(
+    probabilities: np.ndarray, *, first_value: int = 0
+) -> list[dict[str, float | int]]:
     return [
         {"value": index + first_value, "probability": _finite(probability)}
         for index, probability in enumerate(probabilities)
     ]
 
 
-def _prediction_from_distribution(probabilities: np.ndarray, *, first_value: int = 0) -> dict[str, Any]:
+def _prediction_from_distribution(
+    probabilities: np.ndarray, *, first_value: int = 0
+) -> dict[str, Any]:
     values = np.arange(len(probabilities), dtype=np.float32) + first_value
     return {
         "distribution": _distribution(probabilities, first_value=first_value),
@@ -141,7 +156,10 @@ def _selected_softmax(logits: np.ndarray, indices: list[int]) -> dict[int, float
     shifted = values - values.max()
     probabilities = np.exp(shifted)
     probabilities /= probabilities.sum()
-    return {index: _finite(probability) for index, probability in zip(indices, probabilities)}
+    return {
+        index: _finite(probability)
+        for index, probability in zip(indices, probabilities, strict=True)
+    }
 
 
 def complete_candidate_policy(
@@ -190,7 +208,9 @@ def complete_candidate_policy(
             values[candidate["candidateId"]] = _finite(share)
         return values
     if len(selection_candidates) != len(kan_candidates):
-        raise ValueError("cannot combine daiminkan with ankan/kakan in one action state")
+        raise ValueError(
+            "cannot combine daiminkan with ankan/kakan in one action state"
+        )
     if kan_selection_logits is None or kan_selection_mask is None:
         raise ValueError("ankan/kakan candidates require conditional kan policy logits")
 
@@ -201,9 +221,13 @@ def complete_candidate_policy(
         by_tile[tile].append(candidate)
     selection_tiles = sorted(by_tile)
     mask = np.asarray(kan_selection_mask, dtype=bool)
-    unsupported = [tile for tile in selection_tiles if tile >= len(mask) or not mask[tile]]
+    unsupported = [
+        tile for tile in selection_tiles if tile >= len(mask) or not mask[tile]
+    ]
     if unsupported:
-        raise ValueError(f"kan candidates are unavailable in the engine state: {unsupported}")
+        raise ValueError(
+            f"kan candidates are unavailable in the engine state: {unsupported}"
+        )
     conditional = _selected_softmax(kan_selection_logits, selection_tiles)
     for tile, tile_candidates in by_tile.items():
         share = primary[42] * conditional[tile] / len(tile_candidates)
@@ -212,14 +236,21 @@ def complete_candidate_policy(
     return values
 
 
-def best_candidate(candidates: list[dict[str, Any]], values: dict[str, float]) -> dict[str, Any]:
+def best_candidate(
+    candidates: list[dict[str, Any]], values: dict[str, float]
+) -> dict[str, Any]:
     """Choose deterministically without letting host array order break ties."""
 
     return min(
         candidates,
         key=lambda candidate: (
             -values[candidate["candidateId"]],
-            json.dumps(candidate["action"], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            json.dumps(
+                candidate["action"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
             candidate["candidateId"],
         ),
     )
@@ -238,6 +269,7 @@ class AnalysisRuntime:
             "riichi-analysis-model-v5": 5,
             "riichi-analysis-model-v6": 6,
             "riichi-analysis-model-v7": 7,
+            "riichi-analysis-model-v8": 8,
         }
         if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
@@ -248,18 +280,28 @@ class AnalysisRuntime:
                 "score": list(SCORE_VALUES),
             }
             architecture = payload.get("architecture")
-            if not isinstance(architecture, dict) or architecture.get(
-                "predictionValues"
-            ) != expected_values:
+            if (
+                not isinstance(architecture, dict)
+                or architecture.get("predictionValues") != expected_values
+            ):
                 raise RuntimeError("weight file uses different prediction values")
-        if self.format_version in {6, 7}:
+        if self.format_version in {6, 7, 8}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict):
                 raise RuntimeError("weight file has no architecture metadata")
             try:
-                model_architecture = ModelArchitecture.from_dict(architecture.get("model"))
+                architecture_type = (
+                    StructuredModelArchitecture
+                    if self.format_version == 8
+                    else ModelArchitecture
+                )
+                model_architecture = architecture_type.from_dict(
+                    architecture.get("model")
+                )
             except ValueError as error:
-                raise RuntimeError(f"weight file has invalid architecture metadata: {error}") from error
+                raise RuntimeError(
+                    f"weight file has invalid architecture metadata: {error}"
+                ) from error
             self.model = RiichiAnalysisModel(
                 format_version=self.format_version, architecture=model_architecture
             )
@@ -269,7 +311,7 @@ class AnalysisRuntime:
         self.model.to(self.device).eval()
         self.player_state_type = _load_player_state()
         observation_channels = (
-            OBS_CHANNELS if self.format_version in {6, 7} else MORTAL_OBS_CHANNELS
+            OBS_CHANNELS if self.format_version in {6, 7, 8} else MORTAL_OBS_CHANNELS
         )
         with torch.inference_mode():
             self.model(torch.zeros(1, observation_channels, 34, device=self.device))
@@ -297,11 +339,15 @@ class AnalysisRuntime:
         self, state: Any, score_state: PublicScoreState, *, at_kan_select: bool
     ) -> tuple[np.ndarray, np.ndarray]:
         observation, mask = state.encode_obs(4, at_kan_select)
-        if self.format_version in {6, 7}:
-            observation = add_all_player_ranks(observation, score_state.relative(state.player_id))
+        if self.format_version in {6, 7, 8}:
+            observation = add_all_player_ranks(
+                observation, score_state.relative(state.player_id)
+            )
         return np.asarray(observation, dtype=np.float32), np.asarray(mask, dtype=bool)
 
-    def _observation(self, events: list[dict[str, Any]], controlled_seat: int) -> np.ndarray:
+    def _observation(
+        self, events: list[dict[str, Any]], controlled_seat: int
+    ) -> np.ndarray:
         state = self._state(events, controlled_seat)
         score_state = PublicScoreState()
         for event in events:
@@ -334,7 +380,8 @@ class AnalysisRuntime:
         order = [(controlled_seat + offset) % 4 for offset in range(4)]
         opponents = relative_players(controlled_seat)
         start_kyoku = next(
-            (event for event in reversed(events) if event.get("type") == "start_kyoku"), None
+            (event for event in reversed(events) if event.get("type") == "start_kyoku"),
+            None,
         )
         if start_kyoku is None:
             raise ValueError("history has no start_kyoku event")
@@ -343,7 +390,11 @@ class AnalysisRuntime:
 
         shanten = outputs["shanten"].softmax(-1).numpy()
         furiten = outputs["furiten_no_yaku"].sigmoid().numpy()
-        waits = outputs["deal_in_tile"].sigmoid().numpy()
+        waits = (
+            conditional_deal_in_probabilities(outputs).numpy()
+            if self.format_version >= 8
+            else outputs["deal_in_tile"].sigmoid().numpy()
+        )
         for index, seat in enumerate(opponents):
             shanten[index], waits[index] = apply_opponent_rule_certainties(
                 shanten[index],
@@ -365,35 +416,64 @@ class AnalysisRuntime:
             "players": [
                 {
                     "seat": seat,
-                    "tiles": {tile: _finite(waits[index, tile_index]) for tile_index, tile in enumerate(TILES_34)},
+                    "tiles": {
+                        tile: _finite(waits[index, tile_index])
+                        for tile_index, tile in enumerate(TILES_34)
+                    },
                 }
                 for index, seat in enumerate(opponents)
             ]
         }
-        concealed = outputs["concealed_count"].softmax(-1).numpy()
-        concealed_red = (
-            outputs["concealed_red_count"].softmax(-1).numpy()
-            if self.format_version >= 3
-            else None
-        )
-        for index, seat in enumerate(opponents):
-            for tile_index, tile in enumerate(TILES_34):
-                concealed[index, tile_index] = constrain_distribution(
-                    concealed[index, tile_index],
-                    *rule_state.concealed_range(seat, tile),
-                )
-            if concealed_red is not None:
-                for tile_index, tile in enumerate(RED_TILES):
-                    concealed_red[index, tile_index] = constrain_distribution(
-                        concealed_red[index, tile_index],
-                        *rule_state.concealed_red_range(seat, tile),
+        if self.format_version >= 8:
+            physical_inventory, source_capacities = (
+                rule_state.hidden_transport_constraints(controlled_seat)
+            )
+            affinity = physical_affinities(
+                outputs["hidden_source_affinity"].unsqueeze(0),
+                outputs["hidden_red_source"].unsqueeze(0),
+            )
+            source_probability = balanced_source_probabilities(
+                affinity,
+                torch.from_numpy(physical_inventory).unsqueeze(0),
+                torch.from_numpy(source_capacities).unsqueeze(0),
+            )
+            hidden_counts, hidden_red = count_marginals(
+                source_probability,
+                torch.from_numpy(physical_inventory).unsqueeze(0),
+            )
+            hidden_counts = hidden_counts[0].numpy()
+            hidden_red = hidden_red[0].numpy()
+            concealed = hidden_counts[:3]
+            concealed_red = hidden_red[:3]
+            wall = hidden_counts[3]
+            wall_red = hidden_red[3]
+        else:
+            concealed = outputs["concealed_count"].softmax(-1).numpy()
+            concealed_red = (
+                outputs["concealed_red_count"].softmax(-1).numpy()
+                if self.format_version >= 3
+                else None
+            )
+            for index, seat in enumerate(opponents):
+                for tile_index, tile in enumerate(TILES_34):
+                    concealed[index, tile_index] = constrain_distribution(
+                        concealed[index, tile_index],
+                        *rule_state.concealed_range(seat, tile),
                     )
+                if concealed_red is not None:
+                    for tile_index, tile in enumerate(RED_TILES):
+                        concealed_red[index, tile_index] = constrain_distribution(
+                            concealed_red[index, tile_index],
+                            *rule_state.concealed_red_range(seat, tile),
+                        )
         results["opponent-concealed-tile-count"] = {
             "players": [
                 {
                     "seat": seat,
                     "tiles": {
-                        tile: _prediction_from_distribution(concealed[index, tile_index])
+                        tile: _prediction_from_distribution(
+                            concealed[index, tile_index]
+                        )
                         for tile_index, tile in enumerate(TILES_34)
                     },
                     **(
@@ -412,23 +492,24 @@ class AnalysisRuntime:
                 for index, seat in enumerate(opponents)
             ]
         }
-        wall = outputs["wall_count"].softmax(-1).numpy()
-        wall_red = (
-            outputs["wall_red_count"].softmax(-1).numpy()
-            if self.format_version >= 3
-            else None
-        )
-        for tile_index, tile in enumerate(TILES_34):
-            wall[tile_index] = constrain_distribution(
-                wall[tile_index],
-                *rule_state.wall_range(tile),
+        if self.format_version < 8:
+            wall = outputs["wall_count"].softmax(-1).numpy()
+            wall_red = (
+                outputs["wall_red_count"].softmax(-1).numpy()
+                if self.format_version >= 3
+                else None
             )
-        if wall_red is not None:
-            for tile_index, tile in enumerate(RED_TILES):
-                wall_red[tile_index] = constrain_distribution(
-                    wall_red[tile_index],
-                    *rule_state.wall_red_range(tile),
+            for tile_index, tile in enumerate(TILES_34):
+                wall[tile_index] = constrain_distribution(
+                    wall[tile_index],
+                    *rule_state.wall_range(tile),
                 )
+            if wall_red is not None:
+                for tile_index, tile in enumerate(RED_TILES):
+                    wall_red[tile_index] = constrain_distribution(
+                        wall_red[tile_index],
+                        *rule_state.wall_red_range(tile),
+                    )
         results["wall-tile-count"] = {
             "tiles": {
                 tile: _prediction_from_distribution(wall[tile_index])
@@ -456,7 +537,15 @@ class AnalysisRuntime:
             ]
         else:
             dora_distribution = outputs["dora_distribution"].softmax(-1).numpy()
-            dora_point = F.softplus(outputs["dora_point"]).numpy()
+            if self.format_version >= 8:
+                tail_mean = 7.0 + F.softplus(outputs["dora_tail"]).numpy()
+                finite_values = np.arange(7, dtype=np.float32)
+                dora_point = (
+                    dora_distribution[:, :7] @ finite_values
+                    + dora_distribution[:, 7] * tail_mean
+                )
+            else:
+                dora_point = F.softplus(outputs["dora_point"]).numpy()
             score_logits = outputs["score_distribution"].clone()
             for index, seat in enumerate(opponents):
                 valid = torch.as_tensor(
@@ -469,21 +558,29 @@ class AnalysisRuntime:
             if protocol_minor >= 2:
                 dora_predictions = [
                     {
-                        "distribution": _valued_distribution(probabilities, DORA_VALUES),
+                        "distribution": _valued_distribution(
+                            probabilities, DORA_VALUES
+                        ),
                         "pointEstimate": _finite(dora_point[index]),
                     }
                     for index, probabilities in enumerate(dora_distribution)
                 ]
                 if self.format_version >= 7:
                     score_predictions = [
-                        {"distribution": _valued_distribution(probabilities, SCORE_VALUES)}
+                        {
+                            "distribution": _valued_distribution(
+                                probabilities, SCORE_VALUES
+                            )
+                        }
                         for probabilities in score_distribution
                     ]
                 else:
                     score_point = (F.softplus(outputs["score_point"]) * 1000.0).numpy()
                     score_predictions = [
                         {
-                            "distribution": _valued_distribution(probabilities, SCORE_VALUES),
+                            "distribution": _valued_distribution(
+                                probabilities, SCORE_VALUES
+                            ),
                             "pointEstimate": _finite(score_point[index]),
                         }
                         for index, probabilities in enumerate(score_distribution)
@@ -494,7 +591,9 @@ class AnalysisRuntime:
                 ]
                 score_predictions = [
                     {
-                        "distribution": _valued_distribution(probabilities, SCORE_VALUES),
+                        "distribution": _valued_distribution(
+                            probabilities, SCORE_VALUES
+                        ),
                         "expectedValue": _valued_expected_value(
                             probabilities, SCORE_VALUES
                         ),
@@ -519,7 +618,9 @@ class AnalysisRuntime:
             draw = _finite(outcome[0])
             win = np.asarray(
                 [
-                    sum(outcome[mask] for mask in range(1, 16) if mask & (1 << relative))
+                    sum(
+                        outcome[mask] for mask in range(1, 16) if mask & (1 << relative)
+                    )
                     for relative in range(4)
                 ],
                 dtype=np.float32,
@@ -560,7 +661,9 @@ class AnalysisRuntime:
                     item["winner"] = order[outcome_class.winners[0]]
                 elif outcome_class.kind == "ron":
                     assert outcome_class.target is not None
-                    item["winners"] = [order[winner] for winner in outcome_class.winners]
+                    item["winners"] = [
+                        order[winner] for winner in outcome_class.winners
+                    ]
                     item["target"] = order[outcome_class.target]
                 serialized_outcomes.append(item)
             outcome_result["outcomes"] = serialized_outcomes
@@ -598,37 +701,62 @@ class AnalysisRuntime:
                     for target_relative, target_seat in enumerate(order)
                 ]
         results["kyoku-outcome"] = outcome_result
-        delta = (outputs["kyoku_delta"] * 10_000.0).numpy()
+        delta = (
+            zero_sum_accounts(outputs["kyoku_accounts"])[0:4] * 10_000.0
+            if self.format_version >= 8
+            else outputs["kyoku_delta"] * 10_000.0
+        ).numpy()
         results["kyoku-score-delta"] = {
             "players": [
-                {"seat": seat, "prediction": {"expectedValue": _finite(delta[relative])}}
+                {
+                    "seat": seat,
+                    "prediction": {"expectedValue": _finite(delta[relative])},
+                }
                 for relative, seat in enumerate(order)
             ]
         }
         joint = outputs["placement"].softmax(-1).numpy()
         placement = np.zeros((4, 4), dtype=np.float32)
-        for probability, permutation in zip(joint, PERMUTATIONS):
+        for probability, permutation in zip(joint, PERMUTATIONS, strict=True):
             for relative, rank in enumerate(permutation):
                 placement[relative, rank] += probability
         results["match-placement"] = {
             "players": [
                 {
                     "seat": seat,
-                    "prediction": _prediction_from_distribution(placement[relative], first_value=1),
+                    "prediction": _prediction_from_distribution(
+                        placement[relative], first_value=1
+                    ),
                 }
                 for relative, seat in enumerate(order)
             ]
         }
-        match_score = (outputs["match_score"] * 10_000.0).numpy()
+        if self.format_version >= 8:
+            system_total = float(sum(start_kyoku["scores"])) + 1_000.0 * float(
+                start_kyoku.get("kyotaku", 0)
+            )
+            match_score = (
+                fixed_total_values(
+                    outputs["match_score"].unsqueeze(0),
+                    outputs["match_score"].new_tensor([system_total / 10_000.0]),
+                )[0]
+                * 10_000.0
+            ).numpy()
+        else:
+            match_score = (outputs["match_score"] * 10_000.0).numpy()
         results["match-score"] = {
             "players": [
-                {"seat": seat, "prediction": {"expectedValue": _finite(match_score[relative])}}
+                {
+                    "seat": seat,
+                    "prediction": {"expectedValue": _finite(match_score[relative])},
+                }
                 for relative, seat in enumerate(order)
             ]
         }
 
         policy_request = next(
-            (item for item in requested if item.get("id") == "action-recommendation"), None
+            (item for item in requested if item.get("id") == "action-recommendation"),
+            None,
         )
         if policy_request is not None:
             candidates = policy_request.get("parameters", {}).get("candidates")
@@ -646,9 +774,13 @@ class AnalysisRuntime:
                 selection_observation, kan_selection_mask = self._encode_observation(
                     state, score_state, at_kan_select=True
                 )
-                selection_tensor = torch.from_numpy(selection_observation).unsqueeze(0).to(self.device)
+                selection_tensor = (
+                    torch.from_numpy(selection_observation).unsqueeze(0).to(self.device)
+                )
                 with torch.inference_mode():
-                    kan_selection_logits = self.model(selection_tensor)["policy"][0].float().cpu().numpy()
+                    kan_selection_logits = (
+                        self.model(selection_tensor)["policy"][0].float().cpu().numpy()
+                    )
             values = complete_candidate_policy(
                 outputs["policy"].numpy(),
                 candidates,
