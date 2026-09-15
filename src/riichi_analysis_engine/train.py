@@ -223,6 +223,8 @@ def resume_training_cursor(
     checkpoint: dict[str, object],
     datasets: dict[str, dict[str, object]],
     batch_size: int,
+    *,
+    allow_complete: bool = False,
 ) -> tuple[int, int]:
     """Validate and return the next unread sample and completed update count."""
 
@@ -232,7 +234,10 @@ def resume_training_cursor(
             "resume checkpoint predates the single-pass cursor and cannot "
             "be resumed safely"
         )
-    if cursor.get("complete") is not False:
+    complete = cursor.get("complete")
+    if complete not in (False, True):
+        raise RuntimeError("resume checkpoint has an invalid pass-complete marker")
+    if complete and not allow_complete:
         raise RuntimeError("resume checkpoint has already completed its training pass")
     if int(cursor.get("batchSize", -1)) != batch_size:
         raise RuntimeError("resume checkpoint uses a different training batch size")
@@ -503,12 +508,7 @@ def validate(
     }
     for name, value in nulls.items():
         result[f"null/{name}"] = value
-    if nulls["policy"] > 0 and nulls["shanten"] > 0:
-        score = 0.5 * (
-            result["policy"] / nulls["policy"] + result["shanten"] / nulls["shanten"]
-        )
-        result["Selection/core_score"] = score
-        result["Selection/core_skill"] = 1.0 - score
+    add_core_selection_metrics(result, nulls)
     result.update(
         {
             f"lossWeight/{name}": balance_totals[name] / max(1, batches)
@@ -566,6 +566,23 @@ def _label_entropy(counts: np.ndarray) -> float:
         return 0.0
     probabilities = counts[counts > 0] / total
     return float(-(probabilities * np.log(probabilities)).sum())
+
+
+def add_core_selection_metrics(
+    result: dict[str, float], nulls: Mapping[str, float]
+) -> None:
+    """Add the joint selection score only when both constituent losses exist."""
+
+    if not {"policy", "shanten"}.issubset(result):
+        return
+    if nulls["policy"] <= 0 or nulls["shanten"] <= 0:
+        return
+    score = 0.5 * (
+        result["policy"] / nulls["policy"]
+        + result["shanten"] / nulls["shanten"]
+    )
+    result["Selection/core_score"] = score
+    result["Selection/core_skill"] = 1.0 - score
 
 
 def write_pointer(run: Path, checkpoint: Path, **fields: object) -> None:
@@ -827,6 +844,11 @@ def main() -> None:
     )
     parser.add_argument("--keep-checkpoints", type=int, default=3)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="validate a saved checkpoint without consuming more training samples",
+    )
     parser.add_argument("--seed", type=int, default=20252026)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -846,6 +868,8 @@ def main() -> None:
         raise ValueError("gradient diagnostics interval must be non-negative")
     if args.gradient_diagnostics_every and args.model_format != 8:
         raise ValueError("shared-gradient diagnostics require model format 8")
+    if args.validate_only and args.resume is None:
+        raise ValueError("--validate-only requires --resume")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -954,34 +978,45 @@ def main() -> None:
         scaler.load_state_dict(checkpoint["scaler"])
         restore_random_state(checkpoint.get("randomState"))
         samples_seen, step = resume_training_cursor(
-            checkpoint, datasets, args.batch_size
+            checkpoint,
+            datasets,
+            args.batch_size,
+            allow_complete=args.validate_only,
         )
-        if step_budget_reached(step, args.max_steps):
+        if not args.validate_only and step_budget_reached(step, args.max_steps):
             raise RuntimeError(
                 "resume budget is already exhausted; increase --max-steps"
             )
     # The order comes from the training manifest: one pass over globally mixed
     # packs, with no shuffling left for the loader to do.
     train_manifest = PackDataset(args.train, batch_size=args.batch_size)
-    sample_limit, unread_samples = single_pass_window(
-        train_manifest.samples, samples_seen, args.max_train_samples
-    )
-    train_data = PackDataset(
-        args.train,
-        start_sample=samples_seen,
-        max_samples=unread_samples,
-        batch_size=args.batch_size,
-    )
+    if args.validate_only:
+        sample_limit = samples_seen
+        train_data = None
+    else:
+        sample_limit, unread_samples = single_pass_window(
+            train_manifest.samples, samples_seen, args.max_train_samples
+        )
+        train_data = PackDataset(
+            args.train,
+            start_sample=samples_seen,
+            max_samples=unread_samples,
+            batch_size=args.batch_size,
+        )
     validation_data = PackDataset(
         args.validation,
         max_samples=args.max_validation_samples,
         batch_size=args.batch_size,
     )
-    train_loader = DataLoader(
-        train_data,
-        batch_size=None,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
+    train_loader = (
+        DataLoader(
+            train_data,
+            batch_size=None,
+            num_workers=0,
+            pin_memory=device.type == "cuda",
+        )
+        if train_data is not None
+        else ()
     )
     validation_loader = DataLoader(
         validation_data,
@@ -994,16 +1029,33 @@ def main() -> None:
     except StopIteration:
         fixture = None
     if args.model_format == 8:
-        try:
-            train_fixture = next(iter(train_loader))
-        except StopIteration as error:
-            raise RuntimeError("training data contains no samples") from error
-        training_contract = {
-            "train": validate_v8_training_batch(train_fixture),
-            "validation": (
-                validate_v8_training_batch(fixture) if fixture is not None else None
-            ),
-        }
+        if args.validate_only:
+            saved_contract = checkpoint.get("trainingContract")
+            training_contract = (
+                saved_contract
+                if isinstance(saved_contract, dict)
+                else {
+                    "train": None,
+                    "validation": (
+                        validate_v8_training_batch(fixture)
+                        if fixture is not None
+                        else None
+                    ),
+                }
+            )
+        else:
+            try:
+                train_fixture = next(iter(train_loader))
+            except StopIteration as error:
+                raise RuntimeError("training data contains no samples") from error
+            training_contract = {
+                "train": validate_v8_training_batch(train_fixture),
+                "validation": (
+                    validate_v8_training_batch(fixture)
+                    if fixture is not None
+                    else None
+                ),
+            }
     else:
         training_contract = None
 
@@ -1073,7 +1125,7 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    stop_reason: str | None = None
+    stop_reason: str | None = "validation-only" if args.validate_only else None
     last_log_time = started
     last_log_samples = samples_seen
     checkpoint_interval = args.checkpoint_every_samples

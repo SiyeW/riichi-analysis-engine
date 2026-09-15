@@ -9,6 +9,7 @@ import torch
 
 from riichi_analysis_engine.train import (
     _label_entropy,
+    add_core_selection_metrics,
     capture_random_state,
     prune_numbered_checkpoints,
     restore_random_state,
@@ -60,6 +61,17 @@ def test_label_entropy_of_a_uniform_distribution_is_log_of_the_classes() -> None
     assert _label_entropy(np.zeros(4, dtype=np.int64)) == 0.0
     assert _label_entropy(np.asarray([3, 3, 3, 3])) == pytest.approx(np.log(4))
     assert _label_entropy(np.asarray([4, 0, 0, 0])) == 0.0
+
+
+def test_core_selection_metrics_require_both_losses() -> None:
+    opponent_only = {"shanten": 1.0}
+    add_core_selection_metrics(opponent_only, {"policy": 2.0, "shanten": 2.0})
+    assert "Selection/core_score" not in opponent_only
+
+    all_tasks = {"policy": 1.0, "shanten": 0.5}
+    add_core_selection_metrics(all_tasks, {"policy": 2.0, "shanten": 1.0})
+    assert all_tasks["Selection/core_score"] == pytest.approx(0.5)
+    assert all_tasks["Selection/core_skill"] == pytest.approx(0.5)
 
 
 def test_dashboard_keeps_distinct_metrics_with_the_same_value() -> None:
