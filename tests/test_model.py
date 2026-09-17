@@ -178,3 +178,38 @@ def test_v9_policy_context_cannot_change_analysis_outputs() -> None:
     for name in first_outputs.keys() - {"policy"}:
         assert torch.equal(first_outputs[name], second_outputs[name])
     assert not torch.equal(first_outputs["policy"], second_outputs["policy"])
+
+
+def test_v10_preserves_the_continuous_opponent_residual_path() -> None:
+    architecture = StructuredModelArchitecture(
+        shared_channels=8,
+        shared_blocks=2,
+        family_latent_width=16,
+        opponent_latent_width=20,
+        policy_latent_width=24,
+        opponent_blocks=3,
+        hidden_blocks=1,
+        value_blocks=1,
+        kyoku_blocks=1,
+        match_blocks=1,
+        policy_blocks=1,
+        task_width=12,
+        tile_width=6,
+        policy_context_channels=4,
+        policy_context_blocks=1,
+        policy_context_width=8,
+        policy_width=16,
+    )
+
+    v9 = RiichiAnalysisModel(format_version=9, architecture=architecture)
+    v10 = RiichiAnalysisModel(format_version=10, architecture=architecture)
+
+    assert isinstance(v9.shared_trunk.output, torch.nn.Sequential)
+    assert isinstance(v10.shared_trunk.output, torch.nn.Identity)
+    assert len(v10.shared_trunk.blocks) + len(v10.opponent_tower.blocks) == 5
+    assert v9.shanten_head.net[0].out_features == architecture.task_width
+    assert v10.shanten_head.net[0].out_features == architecture.opponent_latent_width
+    assert torch.count_nonzero(v10.opponent_tower.summary[2].bias) == 0
+    assert torch.all(v10.opponent_tower.summary[0].weight == 1)
+    outputs = v10(torch.zeros(2, MODEL_INPUT_CHANNELS, 34))
+    assert outputs["shanten"].shape == (2, 3, 7)

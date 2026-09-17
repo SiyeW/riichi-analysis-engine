@@ -110,6 +110,7 @@ def convert_game(
         *,
         policy: int,
         kan_select: bool,
+        analysis_active: bool,
     ) -> None:
         mortal_observation, action_mask = states[perspective].encode_obs(
             OBS_VERSION, kan_select
@@ -132,6 +133,7 @@ def convert_game(
             "obs": np.asarray(observation, dtype=np.float16),
             "action_mask": np.asarray(action_mask, dtype=bool),
             "policy": np.int8(policy),
+            "analysis_active": np.bool_(analysis_active),
             "perspective": np.uint8(perspective),
             "event_index": np.int32(event_index),
             "kyoku_index": np.int32(kyoku_index),
@@ -155,6 +157,7 @@ def convert_game(
             raise RuntimeError(f"missing exact targets at {source_id}:{index}")
 
         sampled: set[int] = set()
+        analysis_perspective = passive_perspective(source_id, index)
         for perspective, cans in enumerate(candidates):
             _obs, mask = states[perspective].encode_obs(OBS_VERSION, False)
             if not bool(mask.any()):
@@ -171,6 +174,7 @@ def convert_game(
                 exact_targets,
                 policy=policy,
                 kan_select=False,
+                analysis_active=perspective == analysis_perspective,
             )
             sampled.add(perspective)
             if kan_tile is not None:
@@ -181,22 +185,32 @@ def convert_game(
                     exact_targets,
                     policy=kan_tile,
                     kan_select=True,
+                    analysis_active=False,
                 )
 
-        passive = passive_perspective(source_id, index)
-        if passive not in sampled:
+        if analysis_perspective not in sampled:
             append_sample(
                 index,
                 event,
-                passive,
+                analysis_perspective,
                 exact_targets,
                 policy=-1,
                 kan_select=False,
+                analysis_active=True,
             )
 
     if not samples:
         raise ValueError(f"game produced no samples: {source_id}")
-    return {name: np.asarray(values) for name, values in samples.items()}
+    arrays = {name: np.asarray(values) for name, values in samples.items()}
+    frame_indices = arrays["event_index"]
+    active_indices = frame_indices[arrays["analysis_active"]]
+    frames, active_counts = np.unique(active_indices, return_counts=True)
+    all_frames = np.unique(frame_indices)
+    if not np.array_equal(frames, all_frames) or np.any(active_counts != 1):
+        raise RuntimeError(
+            f"analysis supervision is not one row per frame in {source_id}"
+        )
+    return arrays
 
 
 def convert_record_to_archive(

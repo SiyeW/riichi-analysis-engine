@@ -52,6 +52,7 @@ def test_v8_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> 
         architecture,
         step=10,
         samples_seen=20,
+        analysis_samples_seen=12,
         batch_size=2,
         pass_complete=False,
         parameters={},
@@ -63,6 +64,7 @@ def test_v8_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> 
     payload = torch.load(destination, map_location="cpu", weights_only=True)
     assert payload["format"] == "riichi-analysis-model-v8"
     assert payload["modelArchitecture"] == architecture.to_dict()
+    assert payload["analysisSamplesSeen"] == 12
     assert payload["lossBalancer"]["terms"] == list(LOSS_TERMS_V8)
     assert payload["trainingCursor"] == {
         "type": "single-pass-v1",

@@ -91,17 +91,15 @@ def _observation_contract(observation: Tensor) -> Tensor:
     ):
         _fail("obs does not encode exactly one controlled-player seat wind")
 
-    ranks = observation[
-        :, rank_start : rank_start + RANK_FEATURE_CHANNELS
-    ].reshape(len(observation), 4, 4, TILE_TYPES)
+    ranks = observation[:, rank_start : rank_start + RANK_FEATURE_CHANNELS].reshape(
+        len(observation), 4, 4, TILE_TYPES
+    )
     if not torch.equal(ranks, ranks[..., :1].expand_as(ranks)):
         _fail("all-player rank planes are not constant across tile positions")
     active_ranks = ranks[..., 0] > 0
     if not torch.equal(
         active_ranks.sum(dim=-1),
-        torch.ones(
-            (len(observation), 4), dtype=torch.long, device=observation.device
-        ),
+        torch.ones((len(observation), 4), dtype=torch.long, device=observation.device),
     ):
         _fail("obs does not encode exactly one current rank for every player")
     return winds.argmax(dim=-1)
@@ -125,7 +123,9 @@ def _policy_contract(batch: Mapping[str, Tensor], batch_size: int) -> None:
         _fail("policy contains an action that its legal-action mask rejects")
 
 
-def _target_contract(batch: Mapping[str, Tensor], batch_size: int, self_wind: Tensor) -> None:
+def _target_contract(
+    batch: Mapping[str, Tensor], batch_size: int, self_wind: Tensor
+) -> None:
     shanten = _shape(batch, "shanten", (3,)).long()
     if len(shanten) != batch_size or ((shanten < 0) | (shanten > 6)).any():
         _fail("shanten must contain only classes 0 through 6")
@@ -174,9 +174,10 @@ def _target_contract(batch: Mapping[str, Tensor], batch_size: int, self_wind: Te
             (winner & ~is_dealer, NON_DEALER_SCORE_VALUE_SET),
         ):
             allowed_scores = torch.as_tensor(tuple(values), device=score.device)
-            if rows.any() and not torch.isin(
-                score[rows, opponent], allowed_scores
-            ).all():
+            if (
+                rows.any()
+                and not torch.isin(score[rows, opponent], allowed_scores).all()
+            ):
                 _fail("winner score contradicts the controlled player's seat wind")
 
     outcome = _shape(batch, "outcome", ()).long()
@@ -189,7 +190,9 @@ def _target_contract(batch: Mapping[str, Tensor], batch_size: int, self_wind: Te
     _shape(batch, "match_score", (4,))
 
 
-def validate_v8_training_batch(batch: Mapping[str, Tensor]) -> dict[str, int]:
+def validate_v8_training_batch(
+    batch: Mapping[str, Tensor], *, require_analysis_active: bool = False
+) -> dict[str, int]:
     """Reject a decoded batch that cannot safely supervise a v8/v9 model.
 
     The function is deliberately bounded to the supplied batch.  It is a
@@ -208,7 +211,26 @@ def validate_v8_training_batch(batch: Mapping[str, Tensor]) -> dict[str, int]:
         name for name in V8_TRAINING_FIELDS if len(batch[name]) != batch_size
     ]
     if inconsistent:
-        _fail(f"fields do not share obs batch length: {', '.join(sorted(inconsistent))}")
+        _fail(
+            f"fields do not share obs batch length: {', '.join(sorted(inconsistent))}"
+        )
     _policy_contract(batch, batch_size)
+    analysis_active = batch.get("analysis_active")
+    if require_analysis_active and analysis_active is None:
+        _fail("missing field: analysis_active")
+    if analysis_active is not None:
+        analysis_active = _shape(batch, "analysis_active", ())
+        if len(analysis_active) != batch_size:
+            _fail("analysis_active batch length differs from obs")
+        if not ((analysis_active == 0) | (analysis_active == 1)).all():
+            _fail("analysis_active must be binary")
     _target_contract(batch, batch_size, self_wind)
-    return {"samples": batch_size, "seatWinds": int(self_wind.unique().numel())}
+    return {
+        "samples": batch_size,
+        "seatWinds": int(self_wind.unique().numel()),
+        **(
+            {"analysisSamples": int(analysis_active.bool().sum())}
+            if analysis_active is not None
+            else {}
+        ),
+    }

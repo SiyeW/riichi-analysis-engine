@@ -40,6 +40,7 @@ def run_training(
     checkpoint_every_samples: int = 0,
     validate_only: bool = False,
     model_format: int = 8,
+    max_analysis_samples: int = 0,
 ) -> Path:
     arguments = [
         "riichi-analysis-train",
@@ -53,6 +54,8 @@ def run_training(
         "8",
         "--max-train-samples",
         str(max_samples),
+        "--max-analysis-samples",
+        str(max_analysis_samples),
         "--max-validation-samples",
         "8",
         "--checkpoint-every-samples",
@@ -128,6 +131,54 @@ def test_v9_training_smoke_uses_the_versioned_input_contract(
     assert checkpoint["format"] == "riichi-analysis-model-v9"
     assert checkpoint["modelInput"]["schema"] == "riichi-analysis-model-input-v1"
     assert checkpoint["trainingCursor"]["nextSample"] == 8
+    assert checkpoint["analysisSamplesSeen"] == 8
+
+
+def test_v10_training_smoke_requires_canonical_analysis_rows(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packs = pack_directory(
+        scratch, games=2, chunks=1, samples=8, training_targets=True, model_format=10
+    )
+    checkpoint_path = run_training(
+        monkeypatch,
+        packs,
+        scratch / "v10-run",
+        max_samples=8,
+        model_format=10,
+    )
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert checkpoint["format"] == "riichi-analysis-model-v10"
+    assert checkpoint["modelInput"]["schema"] == "riichi-analysis-model-input-v1"
+    assert checkpoint["trainingCursor"]["nextSample"] == 8
+    assert checkpoint["analysisSamplesSeen"] == 8
+
+
+def test_v10_can_stop_on_a_canonical_analysis_sample_budget(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packs = pack_directory(scratch, training_targets=True, model_format=10)
+    checkpoint_path = run_training(
+        monkeypatch,
+        packs,
+        scratch / "v10-analysis-budget",
+        max_samples=0,
+        max_analysis_samples=13,
+        model_format=10,
+    )
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert checkpoint["samplesSeen"] == 16
+    assert checkpoint["analysisSamplesSeen"] == 16
+    assert checkpoint["trainingCursor"]["complete"] is False
+    metrics = [
+        json.loads(line)
+        for line in (scratch / "v10-analysis-budget" / "metrics.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert metrics[-1]["stopReason"] == "max-analysis-samples"
 
 
 def test_v9_training_rejects_legacy_packs_before_reading_batches(

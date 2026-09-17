@@ -77,15 +77,16 @@ def main() -> None:
         "riichi-analysis-model-v7": 7,
         "riichi-analysis-model-v8": 8,
         "riichi-analysis-model-v9": 9,
+        "riichi-analysis-model-v10": 10,
     }
     if model_format not in formats:
         raise RuntimeError("checkpoint has an unsupported format")
     format_version = formats[model_format]
     architecture: ModelArchitecture | StructuredModelArchitecture | None = None
-    if format_version in {6, 7, 8, 9}:
+    if format_version in {6, 7, 8, 9, 10}:
         architecture_type = (
             StructuredModelArchitecture
-            if format_version in {8, 9}
+            if format_version in {8, 9, 10}
             else ModelArchitecture
         )
         architecture = architecture_type.from_dict(checkpoint.get("modelArchitecture"))
@@ -98,6 +99,9 @@ def main() -> None:
     training = {
         "step": int(checkpoint.get("step", 0)),
         "samplesSeen": int(checkpoint.get("samplesSeen", 0)),
+        "analysisSamplesSeen": int(
+            checkpoint.get("analysisSamplesSeen", checkpoint.get("samplesSeen", 0))
+        ),
         "trainingData": args.training_data,
         "validationData": args.validation_data,
         "datasets": public_dataset_metadata(checkpoint),
@@ -136,7 +140,7 @@ def main() -> None:
         },
         "training": training,
     }
-    if format_version == 9:
+    if format_version in {9, 10}:
         expected_input = model_input_metadata()
         if checkpoint.get("modelInput") != expected_input:
             raise RuntimeError("checkpoint uses a different model-input contract")

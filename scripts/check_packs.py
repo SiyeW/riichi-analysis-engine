@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import io
 import json
 import statistics
 from pathlib import Path
@@ -23,19 +24,44 @@ import numpy as np
 
 from riichi_analysis_engine.dataset import PackDataset, read_manifest
 from riichi_analysis_engine.packing import audit_packs, read_plan, staged_games
-from riichi_analysis_engine.storage import read_chunk_archive_meta, read_packed_shard
+from riichi_analysis_engine.storage import (
+    read_chunk_archive_meta,
+    read_chunk_payload,
+    read_packed_shard,
+)
 from riichi_analysis_engine.training_schema import validate_v8_training_batch
 
 
 def build_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--packs", type=Path, required=True)
-    parser.add_argument("--plan", type=Path, help="defaults to the plan inside the pack directory")
-    parser.add_argument("--stage", type=Path, help="staged games, to check conservation from the source")
+    parser.add_argument(
+        "--plan", type=Path, help="defaults to the plan inside the pack directory"
+    )
+    parser.add_argument(
+        "--stage", type=Path, help="staged games, to check conservation from the source"
+    )
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--window", type=int, default=0, help="window for game diversity (default: batch size)")
-    parser.add_argument("--windows", type=int, default=4096, help="how many windows to sample")
-    parser.add_argument("--loader-samples", type=int, default=4096, help="samples read through the loader")
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=0,
+        help="window for game diversity (default: batch size)",
+    )
+    parser.add_argument(
+        "--windows", type=int, default=4096, help="how many windows to sample"
+    )
+    parser.add_argument(
+        "--loader-samples",
+        type=int,
+        default=4096,
+        help="samples read through the loader",
+    )
+    parser.add_argument(
+        "--require-analysis-active",
+        action="store_true",
+        help="require the v10 one-analysis-row-per-frame training contract",
+    )
     parser.add_argument(
         "--verify-storage",
         action="store_true",
@@ -51,18 +77,59 @@ def check_one_pack(path: Path) -> dict[str, object]:
     packed = read_packed_shard(path)
     samples = len(packed["obs_offsets"]) - 1
     if len(packed["obs_values"]) != int(packed["obs_offsets"][-1]):
-        raise SystemExit(f"{path.name} holds {len(packed['obs_values'])} values for its offsets")
+        raise SystemExit(
+            f"{path.name} holds {len(packed['obs_values'])} values for its offsets"
+        )
     for name in ("obs_nonzero", "obs_nonone", "action_mask"):
         if len(packed[name]) != samples:
-            raise SystemExit(f"{path.name} holds {len(packed[name])} {name} for {samples} samples")
+            raise SystemExit(
+                f"{path.name} holds {len(packed[name])} {name} for {samples} samples"
+            )
     for name, value in packed.items():
         if name.startswith("obs_") or value.ndim == 0 or len(value) == samples:
             continue
-        raise SystemExit(f"{path.name} holds {name} with {len(value)} rows for {samples} samples")
+        raise SystemExit(
+            f"{path.name} holds {name} with {len(value)} rows for {samples} samples"
+        )
     return {"pack": path.name, "samples": samples, "values": len(packed["obs_values"])}
 
 
-def verify_storage(root: Path, manifest: dict[str, object], workers: int) -> dict[str, object]:
+def check_analysis_rows(paths: list[Path]) -> dict[str, int]:
+    """Verify that each staged natural frame owns exactly one analysis row."""
+
+    frames = 0
+    rows = 0
+    for path in paths:
+        meta = read_chunk_archive_meta(path)
+        event_parts: list[np.ndarray] = []
+        active_parts: list[np.ndarray] = []
+        for member_index in range(len(meta["chunkLengths"])):
+            with np.load(
+                io.BytesIO(read_chunk_payload(path, member_index)),
+                allow_pickle=False,
+            ) as chunk:
+                if "event_index" not in chunk or "analysis_active" not in chunk:
+                    raise SystemExit(f"{path.name} lacks v10 analysis-row metadata")
+                event_parts.append(chunk["event_index"])
+                active_parts.append(chunk["analysis_active"].astype(bool, copy=False))
+        event_index = np.concatenate(event_parts)
+        analysis_active = np.concatenate(active_parts)
+        all_frames = np.unique(event_index)
+        active_frames, active_counts = np.unique(
+            event_index[analysis_active], return_counts=True
+        )
+        if not np.array_equal(active_frames, all_frames) or np.any(active_counts != 1):
+            raise SystemExit(
+                f"{path.name} does not contain exactly one analysis row per frame"
+            )
+        frames += len(all_frames)
+        rows += int(analysis_active.sum())
+    return {"games": len(paths), "frames": frames, "analysisRows": rows}
+
+
+def verify_storage(
+    root: Path, manifest: dict[str, object], workers: int
+) -> dict[str, object]:
     """Read every pack and report what the whole corpus holds."""
 
     paths = [root / str(entry["pack"]) for entry in manifest["packs"]]
@@ -92,8 +159,12 @@ def game_stream(root: Path, manifest: dict[str, object]) -> np.ndarray:
 def window_diversity(stream: np.ndarray, window: int, wanted: int) -> dict[str, object]:
     """How many different games one window of the order holds, sampled evenly."""
 
-    starts = np.linspace(0, len(stream) - window, num=min(wanted, max(1, len(stream) - window + 1)))
-    counts = [len(np.unique(stream[int(start) : int(start) + window])) for start in starts]
+    starts = np.linspace(
+        0, len(stream) - window, num=min(wanted, max(1, len(stream) - window + 1))
+    )
+    counts = [
+        len(np.unique(stream[int(start) : int(start) + window])) for start in starts
+    ]
     return {
         "window": window,
         "windowsSampled": len(counts),
@@ -112,7 +183,13 @@ def longest_run(stream: np.ndarray) -> int:
     return int(np.diff(np.concatenate(([0], breaks, [len(stream)]))).max())
 
 
-def check_loader(root: Path, batch_size: int, samples: int) -> dict[str, object]:
+def check_loader(
+    root: Path,
+    batch_size: int,
+    samples: int,
+    *,
+    require_analysis_active: bool,
+) -> dict[str, object]:
     """Read a bounded prefix through the training loader and check the batches."""
 
     sizes: list[int] = []
@@ -121,7 +198,9 @@ def check_loader(root: Path, batch_size: int, samples: int) -> dict[str, object]
     contract_seat_winds: set[int] = set()
     for batch in PackDataset(root, batch_size=batch_size, max_samples=samples):
         try:
-            contract = validate_v8_training_batch(batch)
+            contract = validate_v8_training_batch(
+                batch, require_analysis_active=require_analysis_active
+            )
         except ValueError as error:
             raise SystemExit(str(error)) from error
         contract_samples += contract["samples"]
@@ -145,15 +224,21 @@ def check_loader(root: Path, batch_size: int, samples: int) -> dict[str, object]
 
 def main() -> None:
     arguments = build_arguments()
+    if arguments.require_analysis_active and arguments.stage is None:
+        raise SystemExit("--require-analysis-active also requires --stage")
     manifest = read_manifest(arguments.packs)
     plan = read_plan(arguments.plan or arguments.packs / "plan.npz")
     audit = audit_packs(arguments.packs, manifest, plan)
 
     stream = game_stream(arguments.packs, manifest)
     if len(stream) != int(manifest["samples"]):
-        raise SystemExit(f"packs hold {len(stream)} samples, the manifest says {manifest['samples']}")
+        raise SystemExit(
+            f"packs hold {len(stream)} samples, the manifest says {manifest['samples']}"
+        )
     if len(np.unique(stream)) != int(manifest["sourceGames"]):
-        raise SystemExit("the packs hold a different number of source games than the manifest says")
+        raise SystemExit(
+            "the packs hold a different number of source games than the manifest says"
+        )
 
     report: dict[str, object] = {
         "packs": len(manifest["packs"]),
@@ -167,25 +252,40 @@ def main() -> None:
         ),
     }
     if report["longestRunOfOneGame"] != 1:
-        raise SystemExit(f"a game owns {report['longestRunOfOneGame']} consecutive samples")
+        raise SystemExit(
+            f"a game owns {report['longestRunOfOneGame']} consecutive samples"
+        )
 
     if arguments.stage is not None:
         games = staged_games(arguments.stage)
         samples = sum(int(read_chunk_archive_meta(path)["samples"]) for path in games)
-        chunks = sum(len(read_chunk_archive_meta(path)["chunkLengths"]) for path in games)
+        chunks = sum(
+            len(read_chunk_archive_meta(path)["chunkLengths"]) for path in games
+        )
         if len(games) != int(manifest["sourceGames"]):
-            raise SystemExit(f"the stage holds {len(games)} games, the packs say {manifest['sourceGames']}")
+            raise SystemExit(
+                f"the stage holds {len(games)} games, the packs say {manifest['sourceGames']}"
+            )
         if samples != len(stream):
-            raise SystemExit(f"the stage holds {samples} samples, the packs hold {len(stream)}")
+            raise SystemExit(
+                f"the stage holds {samples} samples, the packs hold {len(stream)}"
+            )
         report["stage"] = {"games": len(games), "chunks": chunks, "samples": samples}
+        if arguments.require_analysis_active:
+            report["analysisRows"] = check_analysis_rows(games)
 
     report["loader"] = check_loader(
-        arguments.packs, arguments.batch_size, arguments.loader_samples
+        arguments.packs,
+        arguments.batch_size,
+        arguments.loader_samples,
+        require_analysis_active=arguments.require_analysis_active,
     )
     if report["loader"]["emptyBatches"]:
         raise SystemExit("the loader yielded an empty batch")
     if report["loader"]["shortBatches"] > 1:
-        raise SystemExit(f"the loader yielded {report['loader']['shortBatches']} short batches")
+        raise SystemExit(
+            f"the loader yielded {report['loader']['shortBatches']} short batches"
+        )
 
     if arguments.verify_storage:
         storage = verify_storage(arguments.packs, manifest, arguments.workers)

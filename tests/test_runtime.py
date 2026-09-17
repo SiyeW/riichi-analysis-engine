@@ -285,7 +285,10 @@ def test_v8_runtime_reconstructs_structured_architecture(tmp_path, monkeypatch) 
     assert runtime.model.architecture == architecture
 
 
-def test_v9_runtime_reconstructs_versioned_input_contract(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("format_version", [9, 10])
+def test_runtime_reconstructs_versioned_input_contract(
+    tmp_path, monkeypatch, format_version
+) -> None:
     architecture = StructuredModelArchitecture(
         shared_channels=8,
         shared_blocks=1,
@@ -305,12 +308,12 @@ def test_v9_runtime_reconstructs_versioned_input_contract(tmp_path, monkeypatch)
         policy_context_width=8,
         policy_width=16,
     )
-    checkpoint = tmp_path / "weights-v9.pt"
+    checkpoint = tmp_path / f"weights-v{format_version}.pt"
     torch.save(
         {
-            "format": "riichi-analysis-model-v9",
+            "format": f"riichi-analysis-model-v{format_version}",
             "model": RiichiAnalysisModel(
-                format_version=9, architecture=architecture
+                format_version=format_version, architecture=architecture
             ).state_dict(),
             "architecture": {
                 "model": architecture.to_dict(),
@@ -329,7 +332,7 @@ def test_v9_runtime_reconstructs_versioned_input_contract(tmp_path, monkeypatch)
 
     runtime = AnalysisRuntime(checkpoint, "cpu")
 
-    assert runtime.format_version == 9
+    assert runtime.format_version == format_version
     assert runtime.model.architecture == architecture
 
 

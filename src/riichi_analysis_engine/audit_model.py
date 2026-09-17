@@ -9,7 +9,7 @@ from .model import RiichiAnalysisModel, count_parameters
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Print the model parameter budget.")
-    parser.add_argument("--model-format", type=int, choices=(7, 8), default=8)
+    parser.add_argument("--model-format", type=int, choices=(7, 8, 9, 10), default=10)
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
     parser.add_argument("--family-latent-width", type=int, default=768)
@@ -33,7 +33,7 @@ def main() -> None:
     parser.add_argument("--policy-context-width", type=int, default=384)
     parser.add_argument("--policy-width", type=int, default=1024)
     args = parser.parse_args()
-    if args.model_format == 8:
+    if args.model_format >= 8:
         architecture: ModelArchitecture | StructuredModelArchitecture = (
             StructuredModelArchitecture(
                 shared_channels=args.shared_channels,
