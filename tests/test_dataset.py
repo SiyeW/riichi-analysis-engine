@@ -6,14 +6,21 @@ import numpy as np
 import pytest
 from test_storage import sample_arrays
 
-from riichi_analysis_engine.constants import TILE_TYPES
 from riichi_analysis_engine import dataset
+from riichi_analysis_engine.analysis_observation import channel_index
+from riichi_analysis_engine.constants import OBS_CHANNELS, TILE_TYPES
 from riichi_analysis_engine.dataset import (
     METADATA_FIELDS,
     PackDataset,
     _settle_legacy_terminal_scores,
     audit_terminal_score_arrays,
     read_manifest,
+)
+from riichi_analysis_engine.model_input import MODEL_INPUT_CHANNELS
+from riichi_analysis_engine.observation_layout import (
+    JIKAZE_CHANNEL,
+    MORTAL_ANALYSIS_CHANNELS,
+    WIND_TILE_START,
 )
 from riichi_analysis_engine.packing import (
     LEGACY_MANIFEST_FORMATS,
@@ -26,11 +33,6 @@ from riichi_analysis_engine.packing import (
     write_manifest,
 )
 from riichi_analysis_engine.storage import save_chunk_archive
-from riichi_analysis_engine.observation_layout import (
-    JIKAZE_CHANNEL,
-    MORTAL_ANALYSIS_CHANNELS,
-    WIND_TILE_START,
-)
 
 
 @pytest.fixture()
@@ -59,13 +61,20 @@ def pack_directory(
     samples: int = 8,
     pack_samples: int = 32,
     training_targets: bool = False,
+    model_format: int = 8,
 ) -> Path:
     """Stage a corpus, pack it, and return the pack directory."""
 
     stage = root / "stage"
     for game in range(games):
         count = chunks * samples
-        arrays = sample_arrays(count, kyoku=game)
+        arrays = sample_arrays(
+            count,
+            kyoku=game,
+            observation_channels=(
+                MODEL_INPUT_CHANNELS if model_format == 9 else OBS_CHANNELS
+            ),
+        )
         arrays["event_index"] = np.arange(count, dtype=np.int32) + game * 1000
         # A target-shaped array whose values identify one sample out of the
         # whole corpus, the way the real targets are shaped.
@@ -75,12 +84,18 @@ def pack_directory(
             # and one current-rank plane for each of four players.  The
             # generic storage fixture deliberately omits semantics, so add the
             # minimum coherent observation contract for training tests here.
-            arrays["obs"][:, JIKAZE_CHANNEL, WIND_TILE_START : WIND_TILE_START + 4] = 0
-            arrays["obs"][:, JIKAZE_CHANNEL, WIND_TILE_START] = 1
-            arrays["obs"][:, MORTAL_ANALYSIS_CHANNELS : MORTAL_ANALYSIS_CHANNELS + 16] = 0
+            jikaze = channel_index("jikaze") if model_format == 9 else JIKAZE_CHANNEL
+            rank_start = (
+                channel_index("rank_p0_r0")
+                if model_format == 9
+                else MORTAL_ANALYSIS_CHANNELS
+            )
+            arrays["obs"][:, jikaze, WIND_TILE_START : WIND_TILE_START + 4] = 0
+            arrays["obs"][:, jikaze, WIND_TILE_START] = 1
+            arrays["obs"][:, rank_start : rank_start + 16] = 0
             for player in range(4):
                 arrays["obs"][
-                    :, MORTAL_ANALYSIS_CHANNELS + player * 4 + player, :TILE_TYPES
+                    :, rank_start + player * 4 + player, :TILE_TYPES
                 ] = 1
             arrays.update(
                 {
@@ -123,6 +138,8 @@ def pack_directory(
             "chunks": len(plan["length"]),
             "sourceGames": games,
             "packs": entries,
+            "modelInputSchema": entries[0]["modelInputSchema"],
+            "observationChannels": entries[0]["observationChannels"],
         },
     )
     return output

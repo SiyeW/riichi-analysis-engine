@@ -9,10 +9,23 @@ from torch import Tensor, nn
 from .architecture import ModelArchitecture, StructuredModelArchitecture
 from .constants import ACTION_SPACE, MORTAL_OBS_CHANNELS, OBS_CHANNELS, TILE_TYPES
 from .kyoku_outcome import OUTCOME_COUNT
+from .model_input import (
+    ANALYSIS_CHANNELS as V9_ANALYSIS_CHANNELS,
+)
+from .model_input import (
+    POLICY_CONTEXT_CHANNELS as V9_POLICY_CONTEXT_CHANNELS,
+)
+from .model_input import (
+    split_model_input,
+)
 from .observation_layout import (
-    ANALYSIS_CHANNELS,
-    POLICY_CONTEXT_CHANNELS,
-    POLICY_CONTEXT_START,
+    ANALYSIS_CHANNELS as LEGACY_ANALYSIS_CHANNELS,
+)
+from .observation_layout import (
+    POLICY_CONTEXT_CHANNELS as LEGACY_POLICY_CONTEXT_CHANNELS,
+)
+from .observation_layout import (
+    POLICY_CONTEXT_START as LEGACY_POLICY_CONTEXT_START,
 )
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 
@@ -304,26 +317,40 @@ class RiichiAnalysisModel(nn.Module):
         architecture: ModelArchitecture | StructuredModelArchitecture | None = None,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
+        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
             raise ValueError(f"unsupported model format version: {format_version}")
-        if architecture is not None and format_version not in {6, 7, 8}:
+        if architecture is not None and format_version not in {6, 7, 8, 9}:
             raise ValueError(
                 "only model formats v6 and later accept architecture metadata"
             )
         self.format_version = format_version
         self.architecture: ModelArchitecture | StructuredModelArchitecture | None = None
-        if format_version == 8:
+        if format_version in {8, 9}:
             if any(
                 value is not None
                 for value in (channels, blocks, state_width, future_width)
             ):
                 raise ValueError(
-                    "v8 architecture must be configured through its metadata"
+                    "structured architecture must be configured through its metadata"
                 )
             configured = architecture or StructuredModelArchitecture()
             if not isinstance(configured, StructuredModelArchitecture):
-                raise TypeError("model format v8 requires StructuredModelArchitecture")
-            self._init_v8(configured)
+                raise TypeError(
+                    "model format v8/v9 requires StructuredModelArchitecture"
+                )
+            self._init_v8(
+                configured,
+                analysis_channels=(
+                    V9_ANALYSIS_CHANNELS
+                    if format_version == 9
+                    else LEGACY_ANALYSIS_CHANNELS
+                ),
+                policy_context_channels=(
+                    V9_POLICY_CONTEXT_CHANNELS
+                    if format_version == 9
+                    else LEGACY_POLICY_CONTEXT_CHANNELS
+                ),
+            )
             return
         self.dimensions = (
             HeadDimensionsV1()
@@ -352,13 +379,13 @@ class RiichiAnalysisModel(nn.Module):
             self.architecture = replace(configured, **overrides)
             architecture = self.architecture
             self.encoder = ResidualEncoder(
-                ANALYSIS_CHANNELS,
+                LEGACY_ANALYSIS_CHANNELS,
                 channels=architecture.analysis_channels,
                 blocks=architecture.analysis_blocks,
                 latent_width=architecture.analysis_latent_width,
             )
             self.policy_context = ResidualEncoder(
-                POLICY_CONTEXT_CHANNELS,
+                LEGACY_POLICY_CONTEXT_CHANNELS,
                 channels=architecture.policy_context_channels,
                 blocks=architecture.policy_context_blocks,
                 latent_width=architecture.policy_context_width,
@@ -401,7 +428,13 @@ class RiichiAnalysisModel(nn.Module):
         nn.init.zeros_(self.future_head.bias)
         nn.init.zeros_(self.policy_head.bias)
 
-    def _init_v8(self, architecture: StructuredModelArchitecture) -> None:
+    def _init_v8(
+        self,
+        architecture: StructuredModelArchitecture,
+        *,
+        analysis_channels: int,
+        policy_context_channels: int,
+    ) -> None:
         self.architecture = architecture
         channels = architecture.shared_channels
         family_latent = architecture.family_latent_width
@@ -409,7 +442,7 @@ class RiichiAnalysisModel(nn.Module):
         policy_latent = architecture.policy_latent_width
         task = architecture.task_width
         self.shared_trunk = SpatialTrunk(
-            ANALYSIS_CHANNELS,
+            analysis_channels,
             channels=channels,
             blocks=architecture.shared_blocks,
         )
@@ -436,7 +469,7 @@ class RiichiAnalysisModel(nn.Module):
             latent_width=policy_latent,
         )
         self.policy_context = ResidualEncoder(
-            POLICY_CONTEXT_CHANNELS,
+            policy_context_channels,
             channels=architecture.policy_context_channels,
             blocks=architecture.policy_context_blocks,
             latent_width=architecture.policy_context_width,
@@ -477,13 +510,17 @@ class RiichiAnalysisModel(nn.Module):
         return value.split(dimensions, dim=-1)
 
     def forward(self, observation: Tensor) -> dict[str, Tensor]:
+        if self.format_version == 9:
+            return self._forward_v9(observation)
         if self.format_version == 8:
             return self._forward_v8(observation)
         if self.format_version in {6, 7}:
             if observation.shape[1:] != (OBS_CHANNELS, TILE_TYPES):
                 raise ValueError(f"wrong observation shape: {tuple(observation.shape)}")
-            latent = self.encoder(observation[:, :ANALYSIS_CHANNELS])
-            policy_context = self.policy_context(observation[:, POLICY_CONTEXT_START:])
+            latent = self.encoder(observation[:, :LEGACY_ANALYSIS_CHANNELS])
+            policy_context = self.policy_context(
+                observation[:, LEGACY_POLICY_CONTEXT_START:]
+            )
             policy = self.policy_head(
                 self.policy_adapter(torch.cat((latent, policy_context), dim=-1))
             )
@@ -737,33 +774,55 @@ class RiichiAnalysisModel(nn.Module):
     def _forward_v8(self, observation: Tensor) -> dict[str, Tensor]:
         if observation.shape[1:] != (OBS_CHANNELS, TILE_TYPES):
             raise ValueError(f"wrong observation shape: {tuple(observation.shape)}")
-        shared = self.shared_trunk(observation[:, :ANALYSIS_CHANNELS])
+        shared = self.shared_trunk(observation[:, :LEGACY_ANALYSIS_CHANNELS])
         return self._forward_v8_from_shared(observation, shared)
+
+    def _forward_v9(self, observation: Tensor) -> dict[str, Tensor]:
+        analysis, policy = split_model_input(observation)
+        shared = self.shared_trunk(analysis)
+        return self._forward_structured_from_shared(
+            shared, self.policy_context(policy)
+        )
 
     def forward_with_shared(
         self, observation: Tensor
     ) -> tuple[dict[str, Tensor], Tensor]:
         """Return v8 outputs and the shared feature boundary for diagnostics."""
 
+        if self.format_version == 9:
+            analysis, policy = split_model_input(observation)
+            shared = self.shared_trunk(analysis)
+            return (
+                self._forward_structured_from_shared(
+                    shared, self.policy_context(policy)
+                ),
+                shared,
+            )
         if self.format_version != 8:
-            raise RuntimeError("shared-feature diagnostics require model format v8")
+            raise RuntimeError("shared-feature diagnostics require model format v8 or v9")
         if observation.shape[1:] != (OBS_CHANNELS, TILE_TYPES):
             raise ValueError(f"wrong observation shape: {tuple(observation.shape)}")
-        shared = self.shared_trunk(observation[:, :ANALYSIS_CHANNELS])
+        shared = self.shared_trunk(observation[:, :LEGACY_ANALYSIS_CHANNELS])
         return self._forward_v8_from_shared(observation, shared), shared
 
     def _forward_v8_from_shared(
         self, observation: Tensor, shared: Tensor
     ) -> dict[str, Tensor]:
-        batch = len(observation)
+        return self._forward_structured_from_shared(
+            shared,
+            self.policy_context(observation[:, LEGACY_POLICY_CONTEXT_START:]),
+        )
+
+    def _forward_structured_from_shared(
+        self, shared: Tensor, policy_context: Tensor
+    ) -> dict[str, Tensor]:
+        batch = len(shared)
         _opponent_spatial, opponent = self.opponent_tower(shared)
         hidden_spatial, hidden = self.hidden_tower(shared)
         _value_spatial, value = self.value_tower(shared)
         _kyoku_spatial, kyoku = self.kyoku_tower(shared)
         _match_spatial, match = self.match_tower(shared)
         _policy_spatial, policy_analysis = self.policy_tower(shared)
-        policy_context = self.policy_context(observation[:, POLICY_CONTEXT_START:])
-
         wait = self.wait_head(opponent)
         hidden_source = self.hidden_source_head(hidden_spatial)
         return {
@@ -788,7 +847,7 @@ class RiichiAnalysisModel(nn.Module):
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
-    if model.format_version == 8:
+    if model.format_version in {8, 9}:
         groups: dict[str, nn.Module] = {
             "shared": model.shared_trunk,
             "opponent": nn.ModuleList(

@@ -6,6 +6,7 @@ from riichi_analysis_engine.architecture import (
 )
 from riichi_analysis_engine.constants import MORTAL_OBS_CHANNELS, OBS_CHANNELS
 from riichi_analysis_engine.model import RiichiAnalysisModel, count_parameters
+from riichi_analysis_engine.model_input import ANALYSIS_CHANNELS, MODEL_INPUT_CHANNELS
 from riichi_analysis_engine.observation_layout import POLICY_CONTEXT_START
 
 
@@ -145,3 +146,35 @@ def test_v8_family_towers_keep_global_waits_and_structured_outputs() -> None:
     assert count_parameters(model)["total"] == sum(
         parameter.numel() for parameter in model.parameters()
     )
+
+
+def test_v9_policy_context_cannot_change_analysis_outputs() -> None:
+    architecture = StructuredModelArchitecture(
+        shared_channels=8,
+        shared_blocks=1,
+        family_latent_width=16,
+        opponent_latent_width=20,
+        policy_latent_width=24,
+        opponent_blocks=1,
+        hidden_blocks=1,
+        value_blocks=1,
+        kyoku_blocks=1,
+        match_blocks=1,
+        policy_blocks=1,
+        task_width=12,
+        tile_width=6,
+        policy_context_channels=4,
+        policy_context_blocks=1,
+        policy_context_width=8,
+        policy_width=16,
+    )
+    model = RiichiAnalysisModel(format_version=9, architecture=architecture).eval()
+    first = torch.randn(2, MODEL_INPUT_CHANNELS, 34)
+    second = first.clone()
+    second[:, ANALYSIS_CHANNELS:] = torch.randn_like(second[:, ANALYSIS_CHANNELS:])
+
+    first_outputs = model(first)
+    second_outputs = model(second)
+    for name in first_outputs.keys() - {"policy"}:
+        assert torch.equal(first_outputs[name], second_outputs[name])
+    assert not torch.equal(first_outputs["policy"], second_outputs["policy"])

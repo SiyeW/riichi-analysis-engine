@@ -8,6 +8,10 @@ import numpy as np
 import pytest
 
 from riichi_analysis_engine.constants import ACTION_SPACE, OBS_CHANNELS, TILE_TYPES
+from riichi_analysis_engine.model_input import (
+    MODEL_INPUT_CHANNELS,
+    MODEL_INPUT_SCHEMA_ID,
+)
 from riichi_analysis_engine.storage import (
     PackedObservations,
     concatenate_packed,
@@ -38,14 +42,20 @@ def scratch() -> Path:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def sample_arrays(count: int, *, kyoku: int = 0) -> dict[str, np.ndarray]:
+def sample_arrays(
+    count: int, *, kyoku: int = 0, observation_channels: int = OBS_CHANNELS
+) -> dict[str, np.ndarray]:
     # The number of values that are neither zero nor one varies per sample, the
     # way real observations do, so slicing them by sample index cannot pass.
-    obs = np.zeros((count, OBS_CHANNELS, TILE_TYPES), dtype=np.float32)
+    obs = np.zeros((count, observation_channels, TILE_TYPES), dtype=np.float32)
     for index in range(count):
-        obs[index, index % OBS_CHANNELS, index % TILE_TYPES] = 1
+        obs[index, index % observation_channels, index % TILE_TYPES] = 1
         for extra in range(index % 4):
-            obs[index, (index * 7 + extra) % OBS_CHANNELS, (index * 3 + extra) % TILE_TYPES] = 0.25
+            obs[
+                index,
+                (index * 7 + extra) % observation_channels,
+                (index * 3 + extra) % TILE_TYPES,
+            ] = 0.25
     masks = np.zeros((count, ACTION_SPACE), dtype=bool)
     masks[:, 0] = True
     masks[np.arange(count) % 2 == 0, 45] = True
@@ -70,6 +80,19 @@ def test_sparse_observation_round_trip() -> None:
         PackedObservations(packed.nonzero, packed.nonone, packed.values, packed.offsets)
     )
     np.testing.assert_allclose(restored, source, rtol=0, atol=5e-4)
+
+
+def test_v9_observation_width_and_schema_round_trip() -> None:
+    source = np.zeros((2, MODEL_INPUT_CHANNELS, TILE_TYPES), dtype=np.float32)
+    source[0, -1, 33] = 0.25
+    arrays = sample_arrays(2)
+    arrays["obs"] = source
+
+    packed = pack_shard_arrays(arrays)
+    assert packed["model_input_schema"].item() == MODEL_INPUT_SCHEMA_ID
+    assert int(packed["obs_channels"].item()) == MODEL_INPUT_CHANNELS
+    restored = unpack_shard_arrays(packed)
+    np.testing.assert_allclose(restored["obs"], source, rtol=0, atol=5e-4)
 
 
 def test_action_mask_round_trip() -> None:

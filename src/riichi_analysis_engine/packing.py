@@ -29,9 +29,11 @@ from pathlib import Path
 
 import numpy as np
 
+from .constants import OBS_CHANNELS
 from .storage import (
-    STORAGE_FORMAT,
+    SUPPORTED_STORAGE_FORMATS,
     concatenate_packed,
+    normalize_packed_metadata,
     permute_packed,
     read_chunk_archive_meta,
     write_packed_shard,
@@ -331,7 +333,11 @@ def load_slot(
     for position, payload in enumerate(payloads):
         assert payload is not None
         with np.load(io.BytesIO(payload), allow_pickle=False) as data:
-            parts.append({name: data[name] for name in data.files})
+            parts.append(
+                normalize_packed_metadata(
+                    {name: data[name] for name in data.files}
+                )
+            )
         source_game.extend([int(games[position])] * int(lengths[position]))
     combined = concatenate_packed(parts)
     combined["source_game"] = np.asarray(source_game, dtype=np.uint32)
@@ -368,6 +374,8 @@ def build_pack(
         "sourceGames": len(np.unique(combined["source_game"])),
         "firstGame": int(permuted["source_game"][0]),
         "lastGame": int(permuted["source_game"][-1]),
+        "modelInputSchema": permuted["model_input_schema"].item(),
+        "observationChannels": int(permuted["obs_channels"].item()),
     }
     return meta, int(permuted["source_game"][-1])
 
@@ -397,13 +405,30 @@ def audit_packs(
     total = 0
     adjacent_pairs = 0
     previous_game: int | None = None
+    input_schema: str | None = None
+    observation_channels: int | None = None
     for entry in entries:
         assert isinstance(entry, dict)
         name = str(entry["pack"])
         with np.load(output / name, allow_pickle=False) as source:
-            if source["storage_format"].item() != STORAGE_FORMAT:
+            if source["storage_format"].item() not in SUPPORTED_STORAGE_FORMATS:
                 raise ValueError(f"{name} declares an unsupported storage format")
             games = source["source_game"]
+            pack_schema = (
+                str(source["model_input_schema"].item())
+                if "model_input_schema" in source.files
+                else "riichi-analysis-model-input-legacy-v8"
+            )
+            pack_channels = (
+                int(source["obs_channels"].item())
+                if "obs_channels" in source.files
+                else OBS_CHANNELS
+            )
+        if input_schema is None:
+            input_schema = pack_schema
+            observation_channels = pack_channels
+        elif (pack_schema, pack_channels) != (input_schema, observation_channels):
+            raise ValueError("packs do not share one model-input contract")
         if len(games) != int(entry["samples"]):
             raise ValueError(f"{name} holds {len(games)} samples, manifest says {entry['samples']}")
         if len(games) == 0:
@@ -430,4 +455,6 @@ def audit_packs(
         "sourceGames": unique_game_count,
         "plannedChunks": len(plan["length"]),
         "adjacentSameGamePairs": 0,
+        "modelInputSchema": input_schema,
+        "observationChannels": observation_channels,
     }

@@ -11,6 +11,7 @@ import torch
 
 from .architecture import ModelArchitecture, StructuredModelArchitecture
 from .model import RiichiAnalysisModel, count_parameters
+from .model_input import model_input_metadata
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 
 
@@ -75,14 +76,17 @@ def main() -> None:
         "riichi-analysis-model-v6": 6,
         "riichi-analysis-model-v7": 7,
         "riichi-analysis-model-v8": 8,
+        "riichi-analysis-model-v9": 9,
     }
     if model_format not in formats:
         raise RuntimeError("checkpoint has an unsupported format")
     format_version = formats[model_format]
     architecture: ModelArchitecture | StructuredModelArchitecture | None = None
-    if format_version in {6, 7, 8}:
+    if format_version in {6, 7, 8, 9}:
         architecture_type = (
-            StructuredModelArchitecture if format_version == 8 else ModelArchitecture
+            StructuredModelArchitecture
+            if format_version in {8, 9}
+            else ModelArchitecture
         )
         architecture = architecture_type.from_dict(checkpoint.get("modelArchitecture"))
         model = RiichiAnalysisModel(
@@ -132,6 +136,11 @@ def main() -> None:
         },
         "training": training,
     }
+    if format_version == 9:
+        expected_input = model_input_metadata()
+        if checkpoint.get("modelInput") != expected_input:
+            raise RuntimeError("checkpoint uses a different model-input contract")
+        payload["architecture"]["modelInput"] = expected_input
     if format_version >= 2:
         prediction_values = {
             "dora": list(DORA_VALUES),

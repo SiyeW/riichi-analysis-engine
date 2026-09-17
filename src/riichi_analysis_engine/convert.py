@@ -11,8 +11,14 @@ from typing import Any
 
 import numpy as np
 
+from .analysis_observation import IncrementalTilePlaneEncoder
+from .analysis_state import PublicHistoryState
 from .constants import OBS_VERSION, relative_players
-from .observations import add_all_player_ranks
+from .model_input import (
+    MODEL_INPUT_SCHEMA_ID,
+    compose_model_input,
+    extract_policy_context,
+)
 from .replay import (
     FRAME_EVENTS,
     ExactTargetTracker,
@@ -23,8 +29,7 @@ from .replay import (
     read_events,
     rotated_future,
 )
-from .score_state import relative_scores
-from .storage import read_chunk_archive_meta, save_chunk_archive
+from .storage import STAGED_GAME_FORMAT, read_chunk_archive_meta, save_chunk_archive
 
 
 def read_manifest(path: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
@@ -90,6 +95,8 @@ def convert_game(
 ) -> dict[str, np.ndarray]:
     annotations = annotate_game(events)
     full_state = FullState()
+    public_state = PublicHistoryState()
+    analysis_encoder = IncrementalTilePlaneEncoder()
     exact_tracker = ExactTargetTracker()
     states = [player_state_type(player) for player in range(4)]
     samples: dict[str, list[Any]] = {}
@@ -97,17 +104,19 @@ def convert_game(
 
     def append_sample(
         event_index: int,
+        event: dict[str, Any],
         perspective: int,
         exact_targets: np.ndarray,
         *,
         policy: int,
         kan_select: bool,
     ) -> None:
-        observation, action_mask = states[perspective].encode_obs(
+        mortal_observation, action_mask = states[perspective].encode_obs(
             OBS_VERSION, kan_select
         )
-        observation = add_all_player_ranks(
-            observation, relative_scores(full_state.scores, perspective)
+        observation = compose_model_input(
+            analysis_encoder.encode(event, perspective),
+            extract_policy_context(mortal_observation),
         )
         if policy >= 0 and not bool(action_mask[policy]):
             raise ValueError(
@@ -137,9 +146,11 @@ def convert_game(
         event_json = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         candidates = [state.update(event_json) for state in states]
         full_state.process(event)
+        public_state.process(event)
         exact_targets = exact_tracker.process(event, states)
         if event["type"] not in FRAME_EVENTS:
             continue
+        analysis_encoder.advance(event, public_state)
         if exact_targets is None:
             raise RuntimeError(f"missing exact targets at {source_id}:{index}")
 
@@ -155,6 +166,7 @@ def convert_game(
                 continue
             append_sample(
                 index,
+                event,
                 perspective,
                 exact_targets,
                 policy=policy,
@@ -164,6 +176,7 @@ def convert_game(
             if kan_tile is not None:
                 append_sample(
                     index,
+                    event,
                     perspective,
                     exact_targets,
                     policy=kan_tile,
@@ -174,6 +187,7 @@ def convert_game(
         if passive not in sampled:
             append_sample(
                 index,
+                event,
                 passive,
                 exact_targets,
                 policy=-1,
@@ -199,7 +213,12 @@ def convert_record_to_archive(
     if destination.exists() and not overwrite:
         try:
             meta = read_chunk_archive_meta(destination)
-            return record_index, record["sourceId"], int(meta["samples"]), None
+            if (
+                meta.get("format") == STAGED_GAME_FORMAT
+                and meta.get("modelInputSchema") == MODEL_INPUT_SCHEMA_ID
+            ):
+                return record_index, record["sourceId"], int(meta["samples"]), None
+            destination.unlink()
         except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
             destination.unlink()
     if mortal_python_root not in sys.path:

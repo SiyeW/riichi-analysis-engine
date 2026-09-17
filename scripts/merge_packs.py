@@ -69,7 +69,12 @@ def merge(
         manifest_format = manifest.get("format")
         if manifest_format not in SUPPORTED_MANIFEST_FORMATS:
             raise ValueError(f"{segment} declares an unsupported manifest format")
-        for key in ("seed", "packSamples"):
+        for key in (
+            "seed",
+            "packSamples",
+            "modelInputSchema",
+            "observationChannels",
+        ):
             if key in shared and manifest.get(key) != shared[key]:
                 raise ValueError(f"segment {name} was packed with a different {key}")
             shared[key] = manifest.get(key)
@@ -129,6 +134,8 @@ def merge(
         "sourceGames": len(seen_games),
         "segments": names,
         "packs": entries,
+        "modelInputSchema": shared.get("modelInputSchema"),
+        "observationChannels": shared.get("observationChannels"),
     }
     write_manifest(root / "manifest.json", manifest)
     report = audit_packs(root, manifest, merged)

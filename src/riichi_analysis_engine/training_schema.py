@@ -1,4 +1,4 @@
-"""Semantic checks for a v8 supervised-training batch.
+"""Semantic checks for a structured supervised-training batch.
 
 The packed-storage checks prove that an archive can be decoded.  They cannot
 prove that it was produced by the observation and label contract the
@@ -13,9 +13,11 @@ from collections.abc import Mapping
 import torch
 from torch import Tensor
 
+from .analysis_observation import channel_index as analysis_channel_index
 from .constants import ACTION_SPACE, OBS_CHANNELS, RANK_FEATURE_CHANNELS, TILE_TYPES
 from .hidden_transport import physical_hidden_counts
 from .kyoku_outcome import OUTCOME_COUNT
+from .model_input import MODEL_INPUT_CHANNELS
 from .observation_layout import (
     JIKAZE_CHANNEL,
     MORTAL_ANALYSIS_CHANNELS,
@@ -26,7 +28,6 @@ from .prediction_values import (
     NON_DEALER_SCORE_VALUE_SET,
     SCORE_VALUE_SET,
 )
-
 
 V8_TRAINING_FIELDS = frozenset(
     {
@@ -52,7 +53,7 @@ V8_TRAINING_FIELDS = frozenset(
 
 
 def _fail(message: str) -> None:
-    raise ValueError(f"v8 training-batch contract violation: {message}")
+    raise ValueError(f"structured training-batch contract violation: {message}")
 
 
 def _shape(batch: Mapping[str, Tensor], name: str, expected: tuple[int, ...]) -> Tensor:
@@ -70,11 +71,20 @@ def _finite(batch: Mapping[str, Tensor]) -> None:
 
 
 def _observation_contract(observation: Tensor) -> Tensor:
-    if observation.ndim != 3 or tuple(observation.shape[1:]) != (OBS_CHANNELS, TILE_TYPES):
+    if observation.ndim != 3 or observation.shape[2] != TILE_TYPES:
         _fail(
-            f"obs has shape {tuple(observation.shape)}, expected (batch, {OBS_CHANNELS}, {TILE_TYPES})"
+            f"obs has shape {tuple(observation.shape)}, expected a supported structured input"
         )
-    winds = observation[:, JIKAZE_CHANNEL, WIND_TILE_START : WIND_TILE_START + 4]
+    channels = int(observation.shape[1])
+    if channels == MODEL_INPUT_CHANNELS:
+        jikaze = analysis_channel_index("jikaze")
+        rank_start = analysis_channel_index("rank_p0_r0")
+    elif channels == OBS_CHANNELS:
+        jikaze = JIKAZE_CHANNEL
+        rank_start = MORTAL_ANALYSIS_CHANNELS
+    else:
+        _fail(f"obs has unsupported channel count {channels}")
+    winds = observation[:, jikaze, WIND_TILE_START : WIND_TILE_START + 4]
     if not torch.equal(
         (winds > 0).sum(dim=-1),
         torch.ones(len(observation), dtype=torch.long, device=observation.device),
@@ -82,7 +92,7 @@ def _observation_contract(observation: Tensor) -> Tensor:
         _fail("obs does not encode exactly one controlled-player seat wind")
 
     ranks = observation[
-        :, MORTAL_ANALYSIS_CHANNELS : MORTAL_ANALYSIS_CHANNELS + RANK_FEATURE_CHANNELS
+        :, rank_start : rank_start + RANK_FEATURE_CHANNELS
     ].reshape(len(observation), 4, 4, TILE_TYPES)
     if not torch.equal(ranks, ranks[..., :1].expand_as(ranks)):
         _fail("all-player rank planes are not constant across tile positions")
@@ -180,7 +190,7 @@ def _target_contract(batch: Mapping[str, Tensor], batch_size: int, self_wind: Te
 
 
 def validate_v8_training_batch(batch: Mapping[str, Tensor]) -> dict[str, int]:
-    """Reject a decoded batch that cannot safely supervise a v8 model.
+    """Reject a decoded batch that cannot safely supervise a v8/v9 model.
 
     The function is deliberately bounded to the supplied batch.  It is a
     startup preflight, not another full-corpus scan, and it shares the exact

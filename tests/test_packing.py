@@ -1,8 +1,10 @@
 import importlib.util
+import io
 import json
 import shutil
 import sys
 import uuid
+import zipfile
 from itertools import pairwise
 from pathlib import Path
 
@@ -26,6 +28,8 @@ from riichi_analysis_engine.packing import (
     write_plan,
 )
 from riichi_analysis_engine.storage import (
+    LEGACY_STAGED_GAME_FORMATS,
+    PACKED_METADATA_FIELDS,
     read_packed_shard,
     save_chunk_archive,
     write_packed_shard,
@@ -116,6 +120,46 @@ def test_plan_keeps_archive_identity_when_an_earlier_game_is_missing(scratch: Pa
     source_two_events = packed["event_index"][packed["source_game"] == 2]
     assert int(source_two_events.min()) >= 2000
     assert int(source_two_events.max()) < 3000
+
+
+def test_load_slot_attaches_input_contract_to_legacy_staged_chunks(
+    scratch: Path,
+) -> None:
+    stage = stage_corpus(scratch, games=1, chunks=2, samples=4)
+    path = next(stage.glob("game-*.zip"))
+    rewritten = path.with_suffix(".legacy.zip")
+    with zipfile.ZipFile(path, "r") as source, zipfile.ZipFile(
+        rewritten, "w", compression=zipfile.ZIP_STORED
+    ) as destination:
+        for name in source.namelist():
+            if name == "meta.json":
+                meta = json.loads(source.read(name))
+                meta["format"] = next(iter(LEGACY_STAGED_GAME_FORMATS))
+                meta.pop("modelInputSchema", None)
+                meta.pop("observationChannels", None)
+                destination.writestr(name, json.dumps(meta))
+                continue
+            with np.load(io.BytesIO(source.read(name)), allow_pickle=False) as chunk:
+                legacy = {
+                    field: chunk[field]
+                    for field in chunk.files
+                    if field not in PACKED_METADATA_FIELDS - {"storage_format"}
+                }
+            legacy["storage_format"] = np.asarray(
+                "dual-bitpack-sparse-float16-v4"
+            )
+            buffer = io.BytesIO()
+            np.savez_compressed(buffer, **legacy)
+            destination.writestr(name, buffer.getvalue())
+    path.unlink()
+    rewritten.rename(path)
+
+    games = staged_games(stage)
+    plan = plan_corpus(games, 20252026)
+    packed = load_slot(games, plan, PackSlot(0, 0, len(plan["length"])))
+
+    assert int(packed["obs_channels"].item()) == 1028
+    assert packed["model_input_schema"].item().endswith("legacy-v8")
 
 
 def test_plan_round_trips_through_disk(scratch: Path) -> None:

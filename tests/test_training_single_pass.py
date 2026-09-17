@@ -12,6 +12,7 @@ import torch
 from test_dataset import pack_directory
 
 from riichi_analysis_engine import train
+from riichi_analysis_engine.model_input import LEGACY_MODEL_INPUT_SCHEMA_ID
 
 
 @pytest.fixture()
@@ -38,6 +39,7 @@ def run_training(
     resume: Path | None = None,
     checkpoint_every_samples: int = 0,
     validate_only: bool = False,
+    model_format: int = 8,
 ) -> Path:
     arguments = [
         "riichi-analysis-train",
@@ -57,6 +59,8 @@ def run_training(
         str(checkpoint_every_samples),
         "--device",
         "cpu",
+        "--model-format",
+        str(model_format),
         "--shared-channels",
         "16",
         "--shared-blocks",
@@ -104,6 +108,44 @@ def load_cursor(checkpoint: Path) -> dict[str, object]:
     return torch.load(checkpoint, map_location="cpu", weights_only=True)[
         "trainingCursor"
     ]
+
+
+def test_v9_training_smoke_uses_the_versioned_input_contract(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packs = pack_directory(
+        scratch, games=2, chunks=1, samples=8, training_targets=True, model_format=9
+    )
+    checkpoint_path = run_training(
+        monkeypatch,
+        packs,
+        scratch / "v9-run",
+        max_samples=8,
+        model_format=9,
+    )
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert checkpoint["format"] == "riichi-analysis-model-v9"
+    assert checkpoint["modelInput"]["schema"] == "riichi-analysis-model-input-v1"
+    assert checkpoint["trainingCursor"]["nextSample"] == 8
+
+
+def test_v9_training_rejects_legacy_packs_before_reading_batches(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packs = pack_directory(scratch, training_targets=True, model_format=8)
+
+    with pytest.raises(RuntimeError, match="different model-input contract"):
+        run_training(
+            monkeypatch,
+            packs,
+            scratch / "wrong-input-run",
+            max_samples=8,
+            model_format=9,
+        )
+
+    manifest = json.loads((packs / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["modelInputSchema"] == LEGACY_MODEL_INPUT_SCHEMA_ID
 
 
 def test_training_resumes_forward_and_completes_one_pass(
