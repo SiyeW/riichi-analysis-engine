@@ -40,6 +40,29 @@ FRAME_EVENTS = {
 }
 
 
+def _ron_label_hand(
+    hand: np.ndarray,
+    *,
+    player: int,
+    last_tsumo_actor: int | None,
+    last_tsumo_tile: int | None,
+) -> np.ndarray:
+    """Return the 3n+1 concealed shape used for ron-label supervision.
+
+    The target is defined at a frame immediately before the acting player has
+    made the required discard.  In particular, a chi/pon does not erase that
+    player's earlier draw for this label convention.
+    """
+    result = hand.copy()
+    if (
+        player == last_tsumo_actor
+        and last_tsumo_tile is not None
+        and int(result.sum()) % 3 == 2
+    ):
+        result[last_tsumo_tile] -= 1
+    return result
+
+
 def read_events(source: str) -> list[dict[str, Any]]:
     if source.startswith("zip://"):
         archive_path, member = source[6:].split("!", 1)
@@ -352,6 +375,7 @@ class ExactTargetTracker:
         self.oya = 0
         self.wall_remaining = 70
         self.last_tsumo_actor: int | None = None
+        self.last_tsumo_tile: int | None = None
         self.chankan_tile: int | None = None
         self.discarded = np.zeros((4, 34), dtype=bool)
         self.temporary_furiten = np.zeros(4, dtype=bool)
@@ -369,7 +393,6 @@ class ExactTargetTracker:
             if isinstance(hand_raw, bytes)
             else np.asarray(hand_raw, dtype=np.uint8)
         ).astype(np.int16)
-        drawn = state.last_self_tsumo()
         can_improve_after_discard = int(hand.sum()) % 3 == 2 and bool(
             state.has_next_shanten_discard
         )
@@ -381,8 +404,15 @@ class ExactTargetTracker:
         if shanten != 0:
             return shanten, 0, ron_waits
 
-        if drawn is not None and int(hand.sum()) % 3 == 2:
-            hand[tile34_index(drawn)] -= 1
+        # Keep the established public-label convention independent from a
+        # policy-state implementation detail such as PlayerState's transient
+        # last_self_tsumo marker.
+        hand = _ron_label_hand(
+            hand,
+            player=player,
+            last_tsumo_actor=self.last_tsumo_actor,
+            last_tsumo_tile=self.last_tsumo_tile,
+        )
         if int(hand.sum()) % 3 != 1:
             return shanten, 0, ron_waits
 
@@ -452,12 +482,14 @@ class ExactTargetTracker:
             self.oya = int(event["oya"])
             self.wall_remaining = 70
             self.last_tsumo_actor = None
+            self.last_tsumo_tile = None
             self.discarded.fill(False)
             self.temporary_furiten.fill(False)
             self.riichi_pass_furiten.fill(False)
         elif kind == "tsumo":
             self.wall_remaining = max(0, self.wall_remaining - 1)
             self.last_tsumo_actor = int(event["actor"])
+            self.last_tsumo_tile = tile34_index(event["pai"])
             self.temporary_furiten[int(event["actor"])] = False
         elif kind == "dahai":
             self.discarded[int(event["actor"]), tile34_index(event["pai"])] = True
