@@ -12,16 +12,25 @@ from pathlib import Path
 import numpy as np
 
 from .constants import ACTION_SPACE, OBS_CHANNELS, TILE_TYPES
+from .model_input import (
+    LEGACY_MODEL_INPUT_SCHEMA_ID,
+    MODEL_INPUT_CHANNELS,
+    MODEL_INPUT_SCHEMA_ID,
+)
 
-OBS_ELEMENTS = OBS_CHANNELS * TILE_TYPES
-OBS_BYTES = (OBS_ELEMENTS + 7) // 8
 ACTION_BYTES = (ACTION_SPACE + 7) // 8
 # v4 adds the kyoku index, so a corpus can later be resampled a whole kyoku at
 # a time instead of a sample at a time.  The marker prevents a run from mixing
 # earlier shards silently.
-STORAGE_FORMAT = "dual-bitpack-sparse-float16-v4"
-STAGED_GAME_FORMAT = "riichi-analysis-staged-game-v1"
-PACK_FORMAT = "riichi-analysis-global-pack-v1"
+STORAGE_FORMAT = "dual-bitpack-sparse-float16-v5"
+LEGACY_STORAGE_FORMATS = frozenset({"dual-bitpack-sparse-float16-v4"})
+SUPPORTED_STORAGE_FORMATS = frozenset({STORAGE_FORMAT, *LEGACY_STORAGE_FORMATS})
+STAGED_GAME_FORMAT = "riichi-analysis-staged-game-v2"
+LEGACY_STAGED_GAME_FORMATS = frozenset({"riichi-analysis-staged-game-v1"})
+PACK_FORMAT = "riichi-analysis-global-pack-v2"
+PACKED_METADATA_FIELDS = frozenset(
+    {"storage_format", "obs_channels", "model_input_schema"}
+)
 
 
 @dataclass
@@ -30,15 +39,19 @@ class PackedObservations:
     nonone: np.ndarray
     values: np.ndarray
     offsets: np.ndarray
+    channels: int = OBS_CHANNELS
 
 
 def pack_observations(observations: np.ndarray) -> PackedObservations:
     observations = np.asarray(observations)
-    if observations.ndim != 3 or observations.shape[1:] != (OBS_CHANNELS, TILE_TYPES):
+    if observations.ndim != 3 or observations.shape[2] != TILE_TYPES:
         raise ValueError(f"wrong observation shape: {observations.shape}")
     if not np.isfinite(observations).all():
         raise ValueError("observations contain NaN or infinity")
-    flat = observations.reshape(len(observations), OBS_ELEMENTS)
+    channels = int(observations.shape[1])
+    if channels <= 0:
+        raise ValueError("observations must contain at least one channel")
+    flat = observations.reshape(len(observations), channels * TILE_TYPES)
     nonzero_bool = flat != 0
     nonone_bool = nonzero_bool & (flat != 1)
     nonzero = np.packbits(nonzero_bool, axis=1, bitorder="little")
@@ -48,28 +61,30 @@ def pack_observations(observations: np.ndarray) -> PackedObservations:
     offsets[0] = 0
     np.cumsum(counts, out=offsets[1:])
     values = flat[nonone_bool].astype(np.float16, copy=False)
-    return PackedObservations(nonzero, nonone, values, offsets)
+    return PackedObservations(nonzero, nonone, values, offsets, channels)
 
 
 def unpack_observations(packed: PackedObservations) -> np.ndarray:
     length = len(packed.nonzero)
-    if packed.nonzero.shape != (length, OBS_BYTES):
+    elements = packed.channels * TILE_TYPES
+    packed_bytes = (elements + 7) // 8
+    if packed.nonzero.shape != (length, packed_bytes):
         raise ValueError(f"wrong nonzero shape: {packed.nonzero.shape}")
-    if packed.nonone.shape != (length, OBS_BYTES):
+    if packed.nonone.shape != (length, packed_bytes):
         raise ValueError(f"wrong nonone shape: {packed.nonone.shape}")
     if packed.offsets.shape != (length + 1,):
         raise ValueError(f"wrong offsets shape: {packed.offsets.shape}")
 
     nonzero = np.unpackbits(
-        packed.nonzero, axis=1, count=OBS_ELEMENTS, bitorder="little"
+        packed.nonzero, axis=1, count=elements, bitorder="little"
     ).astype(np.float32, copy=False)
     nonone = np.unpackbits(
-        packed.nonone, axis=1, count=OBS_ELEMENTS, bitorder="little"
+        packed.nonone, axis=1, count=elements, bitorder="little"
     ).astype(bool, copy=False)
     if int(packed.offsets[-1]) != int(nonone.sum()):
         raise ValueError("sparse value count does not match non-one mask")
     nonzero[nonone] = packed.values.astype(np.float32, copy=False)
-    return nonzero.reshape(length, OBS_CHANNELS, TILE_TYPES)
+    return nonzero.reshape(length, packed.channels, TILE_TYPES)
 
 
 def pack_action_masks(masks: np.ndarray) -> np.ndarray:
@@ -99,8 +114,16 @@ def pack_shard_arrays(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         raise ValueError(f"missing arrays: {sorted(missing)}")
     payload = dict(arrays)
     obs = pack_observations(payload.pop("obs"))
+    if obs.channels == MODEL_INPUT_CHANNELS:
+        input_schema = MODEL_INPUT_SCHEMA_ID
+    elif obs.channels == OBS_CHANNELS:
+        input_schema = LEGACY_MODEL_INPUT_SCHEMA_ID
+    else:
+        raise ValueError(f"unsupported observation channel count: {obs.channels}")
     return {
         "storage_format": np.asarray(STORAGE_FORMAT),
+        "obs_channels": np.asarray(obs.channels, dtype=np.uint16),
+        "model_input_schema": np.asarray(input_schema),
         "obs_nonzero": obs.nonzero,
         "obs_nonone": obs.nonone,
         "obs_values": obs.values,
@@ -115,12 +138,15 @@ def unpack_shard_arrays(packed: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 
     arrays = dict(packed)
     arrays.pop("storage_format", None)
+    channels = int(arrays.pop("obs_channels", np.asarray(OBS_CHANNELS)).item())
+    arrays.pop("model_input_schema", None)
     arrays["obs"] = unpack_observations(
         PackedObservations(
             arrays.pop("obs_nonzero"),
             arrays.pop("obs_nonone"),
             arrays.pop("obs_values"),
             arrays.pop("obs_offsets"),
+            channels,
         )
     )
     arrays["action_mask"] = unpack_action_masks(arrays["action_mask"])
@@ -170,8 +196,25 @@ def read_packed_shard(path: str | Path) -> dict[str, np.ndarray]:
     with np.load(Path(path), allow_pickle=False) as source:
         arrays = {name: source[name] for name in source.files}
     marker = arrays.get("storage_format")
-    if marker is None or marker.item() != STORAGE_FORMAT:
+    if marker is None or marker.item() not in SUPPORTED_STORAGE_FORMATS:
         raise ValueError(f"unsupported storage format in {path}")
+    return normalize_packed_metadata(arrays)
+
+
+def normalize_packed_metadata(
+    packed: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Attach the explicit v8 input contract omitted by legacy v4 shards."""
+
+    arrays = dict(packed)
+    marker = arrays.get("storage_format")
+    if marker is None or marker.item() not in SUPPORTED_STORAGE_FORMATS:
+        raise ValueError("unsupported packed storage format")
+    arrays.setdefault("obs_channels", np.asarray(OBS_CHANNELS, dtype=np.uint16))
+    arrays.setdefault(
+        "model_input_schema",
+        np.asarray(LEGACY_MODEL_INPUT_SCHEMA_ID),
+    )
     return arrays
 
 
@@ -194,8 +237,13 @@ def concatenate_packed(parts: list[dict[str, np.ndarray]]) -> dict[str, np.ndarr
     names = set(parts[0])
     if any(set(part) != names for part in parts):
         raise ValueError("packed shard schemas differ")
-    result: dict[str, np.ndarray] = {"storage_format": parts[0]["storage_format"]}
-    for name in sorted(names - {"storage_format"}):
+    for name in PACKED_METADATA_FIELDS.intersection(names):
+        if any(part[name].item() != parts[0][name].item() for part in parts[1:]):
+            raise ValueError(f"packed shard metadata differs: {name}")
+    result: dict[str, np.ndarray] = {
+        name: parts[0][name] for name in PACKED_METADATA_FIELDS.intersection(names)
+    }
+    for name in sorted(names - PACKED_METADATA_FIELDS):
         if name == "obs_offsets":
             pieces = [parts[0][name][:-1]]
             total = int(parts[0][name][-1])
@@ -236,14 +284,14 @@ def permute_packed(packed: dict[str, np.ndarray], order: np.ndarray) -> dict[str
     values = packed["obs_values"][element_start + within_run]
 
     result: dict[str, np.ndarray] = {
-        "storage_format": packed["storage_format"],
+        **{name: packed[name] for name in PACKED_METADATA_FIELDS if name in packed},
         "obs_nonzero": packed["obs_nonzero"][order],
         "obs_nonone": packed["obs_nonone"][order],
         "obs_values": values,
         "obs_offsets": new_offsets.astype(offsets.dtype, copy=False),
     }
     for name, value in packed.items():
-        if name in result or name == "storage_format":
+        if name in result or name in PACKED_METADATA_FIELDS:
             continue
         result[name] = value[order]
     return result
@@ -263,14 +311,14 @@ def slice_packed(packed: dict[str, np.ndarray], start: int, stop: int) -> dict[s
         raise ValueError(f"sample range {start}:{stop} is outside 0:{count}")
 
     result: dict[str, np.ndarray] = {
-        "storage_format": packed["storage_format"],
+        **{name: packed[name] for name in PACKED_METADATA_FIELDS if name in packed},
         "obs_offsets": (offsets[start : stop + 1] - offsets[start]).astype(
             offsets.dtype, copy=False
         ),
         "obs_values": packed["obs_values"][int(offsets[start]) : int(offsets[stop])],
     }
     for name, value in packed.items():
-        if name in result or name == "storage_format":
+        if name in result or name in PACKED_METADATA_FIELDS:
             continue
         result[name] = value[start:stop]
     return result
@@ -293,9 +341,13 @@ def save_chunk_archive(
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
             for member_index, start in enumerate(range(0, total, chunk_samples)):
                 stop = min(total, start + chunk_samples)
-                chunk = {"storage_format": packed["storage_format"]}
+                chunk = {
+                    name: packed[name]
+                    for name in PACKED_METADATA_FIELDS
+                    if name in packed
+                }
                 for name, value in packed.items():
-                    if name not in {"storage_format", "obs_offsets", "obs_values"}:
+                    if name not in {*PACKED_METADATA_FIELDS, "obs_offsets", "obs_values"}:
                         chunk[name] = value[start:stop]
                 # The sparse values are not one per sample, so they are cut by the
                 # offset window rather than by the sample range. A chunk keeps one
@@ -310,6 +362,8 @@ def save_chunk_archive(
                 lengths.append(stop - start)
             meta: dict[str, object] = {
                 "format": STAGED_GAME_FORMAT,
+                "modelInputSchema": packed["model_input_schema"].item(),
+                "observationChannels": int(packed["obs_channels"].item()),
                 "samples": total,
                 "chunkSamples": chunk_samples,
                 "chunkLengths": lengths,
@@ -324,7 +378,7 @@ def save_chunk_archive(
 def read_chunk_archive_meta(path: str | Path) -> dict[str, object]:
     with zipfile.ZipFile(Path(path), "r") as archive:
         meta = json.loads(archive.read("meta.json"))
-    if meta.get("format") != STAGED_GAME_FORMAT:
+    if meta.get("format") not in {STAGED_GAME_FORMAT, *LEGACY_STAGED_GAME_FORMATS}:
         raise ValueError(f"unsupported staged game format in {path}")
     return meta
 

@@ -6,12 +6,14 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from .analysis_observation import channel_index as analysis_channel_index
 from .hidden_transport import (
     balanced_source_probabilities,
     hidden_transport_nll,
     physical_affinities,
     physical_hidden_counts,
 )
+from .model_input import MODEL_INPUT_CHANNELS
 from .observation_layout import JIKAZE_CHANNEL, WIND_TILE_START
 from .prediction_values import DORA_TAIL_START, SCORE_VALUES, score_class_mask
 from .structured_outputs import fixed_total_values, zero_sum_accounts
@@ -77,7 +79,12 @@ def score_class_indices(values: Tensor) -> Tensor:
 def opponent_dealer_mask(observation: Tensor) -> Tensor:
     """Return which of the three relative opponents is the current dealer."""
 
-    winds = observation[:, JIKAZE_CHANNEL, WIND_TILE_START : WIND_TILE_START + 4]
+    jikaze_channel = (
+        analysis_channel_index("jikaze")
+        if observation.shape[1] == MODEL_INPUT_CHANNELS
+        else JIKAZE_CHANNEL
+    )
+    winds = observation[:, jikaze_channel, WIND_TILE_START : WIND_TILE_START + 4]
     wind_index = winds.argmax(-1)
     if (winds.amax(-1) <= 0).any():
         raise ValueError(

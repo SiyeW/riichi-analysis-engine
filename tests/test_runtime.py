@@ -14,6 +14,7 @@ from riichi_analysis_engine.constants import (
     TILE_TYPES,
 )
 from riichi_analysis_engine.model import RiichiAnalysisModel
+from riichi_analysis_engine.model_input import model_input_metadata
 from riichi_analysis_engine.observation_layout import ANALYSIS_CHANNELS
 from riichi_analysis_engine.prediction_values import DORA_VALUES, SCORE_VALUES
 from riichi_analysis_engine.runtime import (
@@ -281,6 +282,54 @@ def test_v8_runtime_reconstructs_structured_architecture(tmp_path, monkeypatch) 
     runtime = AnalysisRuntime(checkpoint, "cpu")
 
     assert runtime.format_version == 8
+    assert runtime.model.architecture == architecture
+
+
+def test_v9_runtime_reconstructs_versioned_input_contract(tmp_path, monkeypatch) -> None:
+    architecture = StructuredModelArchitecture(
+        shared_channels=8,
+        shared_blocks=1,
+        family_latent_width=16,
+        opponent_latent_width=20,
+        policy_latent_width=24,
+        opponent_blocks=1,
+        hidden_blocks=1,
+        value_blocks=1,
+        kyoku_blocks=1,
+        match_blocks=1,
+        policy_blocks=1,
+        task_width=12,
+        tile_width=6,
+        policy_context_channels=4,
+        policy_context_blocks=1,
+        policy_context_width=8,
+        policy_width=16,
+    )
+    checkpoint = tmp_path / "weights-v9.pt"
+    torch.save(
+        {
+            "format": "riichi-analysis-model-v9",
+            "model": RiichiAnalysisModel(
+                format_version=9, architecture=architecture
+            ).state_dict(),
+            "architecture": {
+                "model": architecture.to_dict(),
+                "modelInput": model_input_metadata(),
+                "predictionValues": {
+                    "dora": list(DORA_VALUES),
+                    "score": list(SCORE_VALUES),
+                },
+            },
+        },
+        checkpoint,
+    )
+    monkeypatch.setattr(
+        "riichi_analysis_engine.runtime._load_player_state", lambda: object
+    )
+
+    runtime = AnalysisRuntime(checkpoint, "cpu")
+
+    assert runtime.format_version == 9
     assert runtime.model.architecture == architecture
 
 

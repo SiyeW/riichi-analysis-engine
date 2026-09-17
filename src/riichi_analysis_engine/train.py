@@ -20,6 +20,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from .architecture import ModelArchitecture, StructuredModelArchitecture
+from .constants import OBS_CHANNELS
 from .dataset import PackDataset
 from .hidden_transport import (
     balanced_source_probabilities,
@@ -37,6 +38,12 @@ from .losses import (
     score_class_indices,
 )
 from .model import RiichiAnalysisModel, count_parameters
+from .model_input import (
+    LEGACY_MODEL_INPUT_SCHEMA_ID,
+    MODEL_INPUT_CHANNELS,
+    MODEL_INPUT_SCHEMA_ID,
+    model_input_metadata,
+)
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
 from .structured_outputs import (
     conditional_deal_in_probabilities,
@@ -179,9 +186,33 @@ def dataset_metadata(root: Path) -> dict[str, object]:
         "samples": manifest.get("samples"),
         "chunks": manifest.get("chunks"),
         "sourceGames": manifest.get("sourceGames"),
+        "modelInputSchema": manifest.get("modelInputSchema"),
+        "observationChannels": manifest.get("observationChannels"),
         "verified": audit.get("verified") if isinstance(audit, dict) else None,
         "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
     }
+
+
+def validate_dataset_input_contract(
+    datasets: dict[str, dict[str, object]], model_format: int
+) -> None:
+    """Fail before training when packs cannot supply the selected model input."""
+
+    expected_schema = (
+        MODEL_INPUT_SCHEMA_ID if model_format == 9 else LEGACY_MODEL_INPUT_SCHEMA_ID
+    )
+    expected_channels = MODEL_INPUT_CHANNELS if model_format == 9 else OBS_CHANNELS
+    for split, metadata in datasets.items():
+        schema = metadata.get("modelInputSchema")
+        channels = metadata.get("observationChannels")
+        # Manifests written before the explicit metadata fields are v8 by
+        # construction. They remain readable only by legacy model formats.
+        if schema is None and channels is None and model_format != 9:
+            continue
+        if schema != expected_schema or channels != expected_channels:
+            raise RuntimeError(
+                f"{split} dataset uses a different model-input contract"
+            )
 
 
 def move_batch(
@@ -758,6 +789,11 @@ def save_checkpoint(
             },
             "model": model.state_dict(),
             "modelArchitecture": architecture.to_dict(),
+            **(
+                {"modelInput": model_input_metadata()}
+                if model.format_version == 9
+                else {}
+            ),
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
             "lossBalancer": {
@@ -788,7 +824,7 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--model-format", type=int, choices=(7, 8), default=8)
+    parser.add_argument("--model-format", type=int, choices=(7, 8, 9), default=9)
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
     parser.add_argument("--family-latent-width", type=int, default=768)
@@ -866,8 +902,8 @@ def main() -> None:
         raise ValueError("checkpoint retention must be non-negative")
     if args.gradient_diagnostics_every < 0:
         raise ValueError("gradient diagnostics interval must be non-negative")
-    if args.gradient_diagnostics_every and args.model_format != 8:
-        raise ValueError("shared-gradient diagnostics require model format 8")
+    if args.gradient_diagnostics_every and args.model_format not in {8, 9}:
+        raise ValueError("shared-gradient diagnostics require model format 8 or 9")
     if args.validate_only and args.resume is None:
         raise ValueError("--validate-only requires --resume")
 
@@ -882,7 +918,7 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
     amp_dtype = torch.float16 if device.type == "cuda" else None
 
-    if args.model_format == 8:
+    if args.model_format in {8, 9}:
         architecture: ModelArchitecture | StructuredModelArchitecture = (
             StructuredModelArchitecture(
                 shared_channels=args.shared_channels,
@@ -955,6 +991,7 @@ def main() -> None:
         "train": dataset_metadata(args.train),
         "validation": dataset_metadata(args.validation),
     }
+    validate_dataset_input_contract(datasets, args.model_format)
     environment = environment_metadata(device)
     if args.resume is not None:
         resume_path = resolve_resume_path(args.resume)
@@ -964,6 +1001,8 @@ def main() -> None:
             raise RuntimeError("resume checkpoint has an unsupported format")
         if checkpoint.get("modelArchitecture") != architecture.to_dict():
             raise RuntimeError("resume checkpoint uses a different model architecture")
+        if args.model_format == 9 and checkpoint.get("modelInput") != model_input_metadata():
+            raise RuntimeError("resume checkpoint uses a different model-input contract")
         if checkpoint.get("predictionValues") != {
             "dora": list(DORA_VALUES),
             "score": list(SCORE_VALUES),
@@ -1028,7 +1067,7 @@ def main() -> None:
         fixture = next(iter(validation_loader))
     except StopIteration:
         fixture = None
-    if args.model_format == 8:
+    if args.model_format in {8, 9}:
         if args.validate_only:
             saved_contract = checkpoint.get("trainingContract")
             training_contract = (

@@ -14,6 +14,8 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
+from .analysis_observation import IncrementalTilePlaneEncoder
+from .analysis_state import FRAME_EVENTS, PublicHistoryState
 from .architecture import ModelArchitecture, StructuredModelArchitecture
 from .constants import (
     MORTAL_OBS_CHANNELS,
@@ -31,6 +33,12 @@ from .hidden_transport import (
 )
 from .kyoku_outcome import OUTCOME_CLASSES, outcome_marginals
 from .model import RiichiAnalysisModel
+from .model_input import (
+    MODEL_INPUT_CHANNELS,
+    compose_model_input,
+    extract_policy_context,
+    model_input_metadata,
+)
 from .observations import add_all_player_ranks
 from .prediction_values import DORA_VALUES, SCORE_VALUES, score_class_mask
 from .rule_certainties import (
@@ -270,10 +278,18 @@ class AnalysisRuntime:
             "riichi-analysis-model-v6": 6,
             "riichi-analysis-model-v7": 7,
             "riichi-analysis-model-v8": 8,
+            "riichi-analysis-model-v9": 9,
         }
         if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
         self.format_version = formats[model_format]
+        if self.format_version == 9:
+            architecture = payload.get("architecture")
+            if (
+                not isinstance(architecture, dict)
+                or architecture.get("modelInput") != model_input_metadata()
+            ):
+                raise RuntimeError("weight file uses a different model-input contract")
         if self.format_version >= 2:
             expected_values = {
                 "dora": list(DORA_VALUES),
@@ -285,14 +301,14 @@ class AnalysisRuntime:
                 or architecture.get("predictionValues") != expected_values
             ):
                 raise RuntimeError("weight file uses different prediction values")
-        if self.format_version in {6, 7, 8}:
+        if self.format_version in {6, 7, 8, 9}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict):
                 raise RuntimeError("weight file has no architecture metadata")
             try:
                 architecture_type = (
                     StructuredModelArchitecture
-                    if self.format_version == 8
+                    if self.format_version in {8, 9}
                     else ModelArchitecture
                 )
                 model_architecture = architecture_type.from_dict(
@@ -311,7 +327,11 @@ class AnalysisRuntime:
         self.model.to(self.device).eval()
         self.player_state_type = _load_player_state()
         observation_channels = (
-            OBS_CHANNELS if self.format_version in {6, 7, 8} else MORTAL_OBS_CHANNELS
+            MODEL_INPUT_CHANNELS
+            if self.format_version == 9
+            else OBS_CHANNELS
+            if self.format_version in {6, 7, 8}
+            else MORTAL_OBS_CHANNELS
         )
         with torch.inference_mode():
             self.model(torch.zeros(1, observation_channels, 34, device=self.device))
@@ -336,14 +356,41 @@ class AnalysisRuntime:
         return state
 
     def _encode_observation(
-        self, state: Any, score_state: PublicScoreState, *, at_kan_select: bool
+        self,
+        state: Any,
+        score_state: PublicScoreState,
+        *,
+        at_kan_select: bool,
+        analysis_observation: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         observation, mask = state.encode_obs(4, at_kan_select)
-        if self.format_version in {6, 7, 8}:
+        if self.format_version == 9:
+            if analysis_observation is None:
+                raise ValueError("model format v9 requires the public-history observation")
+            observation = compose_model_input(
+                analysis_observation, extract_policy_context(observation)
+            )
+        elif self.format_version in {6, 7, 8}:
             observation = add_all_player_ranks(
                 observation, score_state.relative(state.player_id)
             )
         return np.asarray(observation, dtype=np.float32), np.asarray(mask, dtype=bool)
+
+    @staticmethod
+    def _analysis_observation(
+        events: list[dict[str, Any]], controlled_seat: int
+    ) -> np.ndarray:
+        public_state = PublicHistoryState()
+        encoder = IncrementalTilePlaneEncoder()
+        frame: dict[str, Any] | None = None
+        for event in events:
+            public_state.process(event)
+            if event.get("type") in FRAME_EVENTS:
+                encoder.advance(event, public_state)
+                frame = event
+        if frame is None:
+            raise ValueError("history has no analysis frame event")
+        return encoder.encode(frame, controlled_seat)
 
     def _observation(
         self, events: list[dict[str, Any]], controlled_seat: int
@@ -352,8 +399,16 @@ class AnalysisRuntime:
         score_state = PublicScoreState()
         for event in events:
             score_state.process(event)
+        analysis_observation = (
+            self._analysis_observation(events, controlled_seat)
+            if self.format_version == 9
+            else None
+        )
         observation, _mask = self._encode_observation(
-            state, score_state, at_kan_select=False
+            state,
+            score_state,
+            at_kan_select=False,
+            analysis_observation=analysis_observation,
         )
         return observation
 
@@ -369,8 +424,16 @@ class AnalysisRuntime:
         score_state = PublicScoreState()
         for event in events:
             score_state.process(event)
+        analysis_observation = (
+            self._analysis_observation(events, controlled_seat)
+            if self.format_version == 9
+            else None
+        )
         observation, _primary_mask = self._encode_observation(
-            state, score_state, at_kan_select=False
+            state,
+            score_state,
+            at_kan_select=False,
+            analysis_observation=analysis_observation,
         )
         tensor = torch.from_numpy(observation).unsqueeze(0).to(self.device)
         with torch.inference_mode():
@@ -772,7 +835,10 @@ class AnalysisRuntime:
             kan_selection_mask: np.ndarray | None = None
             if needs_kan_selection:
                 selection_observation, kan_selection_mask = self._encode_observation(
-                    state, score_state, at_kan_select=True
+                    state,
+                    score_state,
+                    at_kan_select=True,
+                    analysis_observation=analysis_observation,
                 )
                 selection_tensor = (
                     torch.from_numpy(selection_observation).unsqueeze(0).to(self.device)

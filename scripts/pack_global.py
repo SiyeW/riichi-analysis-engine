@@ -175,6 +175,8 @@ def main() -> None:
         "firstSourceGame": int(plan["source_game"].min()),
         "lastSourceGame": int(plan["source_game"].max()),
         "packs": entries,
+        "modelInputSchema": entries[0]["modelInputSchema"],
+        "observationChannels": entries[0]["observationChannels"],
     }
     write_manifest(arguments.output / "manifest.json", manifest)
     report = audit_packs(arguments.output, manifest, plan)
