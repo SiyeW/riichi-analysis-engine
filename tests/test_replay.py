@@ -5,6 +5,7 @@ import numpy as np
 from riichi_analysis_engine.prediction_values import SCORE_VALUE_SET, SCORE_VALUES
 from riichi_analysis_engine.replay import (
     FullState,
+    _ron_label_hand,
     action_label,
     annotate_game,
     hand_score,
@@ -129,3 +130,23 @@ def test_kan_labels_belong_only_to_the_player_who_declared_the_kan() -> None:
 
     assert action_label(0, state, _empty_cans(), events, 0) == (None, None)
     assert action_label(1, state, _empty_cans(), events, 0) == (42, 1)
+
+
+def test_ron_label_hand_keeps_the_last_draw_across_a_call_frame() -> None:
+    # A call can leave its actor with a 3n+2 concealed shape before their
+    # required discard.  The established target convention removes that
+    # actor's latest draw even though an external policy-state implementation
+    # may have cleared its own transient draw marker during the call.
+    hand = np.zeros(34, dtype=np.int16)
+    hand[[19, 20, 21, 28, 30]] = [1, 1, 2, 1, 3]
+
+    result = _ron_label_hand(
+        hand,
+        player=2,
+        last_tsumo_actor=2,
+        last_tsumo_tile=21,
+    )
+
+    assert result.tolist()[21] == 1
+    assert int(result.sum()) == 7
+    assert hand.tolist()[21] == 2
