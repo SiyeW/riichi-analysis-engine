@@ -208,9 +208,21 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
 
     @staticmethod
     def _torch(arrays: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
+        # PyTorch exposes NumPy's wider unsigned integers on CPU, but many
+        # ordinary CUDA operations (including boolean row selection) do not
+        # implement them.  Targets such as winning score are categorical
+        # integers, so promote those storage-only dtypes at the loader boundary.
+        normalized = {
+            name: (
+                value.astype(np.int64)
+                if value.dtype.kind == "u" and value.dtype.itemsize > 1
+                else value
+            )
+            for name, value in arrays.items()
+        }
         return {
             name: torch.from_numpy(np.ascontiguousarray(value))
-            for name, value in arrays.items()
+            for name, value in normalized.items()
         }
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
