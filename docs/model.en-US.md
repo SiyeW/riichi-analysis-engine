@@ -12,15 +12,15 @@ The default configuration is below. Each weight file records the architecture it
 
 | Component | Default structure | Parameters |
 | --- | --- | ---: |
-| Shared state encoder | 256 channels, 30 pre-activation residual blocks | 12,850,400 |
-| Opponent analysis | 24 residual blocks, 1,024-dimensional output | 11,971,614 |
+| Shared state encoder | 256 channels, 30 pre-activation residual blocks | 12,849,888 |
+| Opponent analysis | 24 residual blocks, 1,024-dimensional output | 12,507,166 |
 | Concealed tiles and wall | 8 residual blocks, 768-dimensional output | 4,516,400 |
 | Dora and hand value | 6 residual blocks, 768-dimensional output | 4,563,532 |
 | Kyoku analysis | 6 residual blocks, 768-dimensional output | 4,084,646 |
 | Match analysis | 4 residual blocks, 768-dimensional output | 3,274,108 |
 | Decision context | 144 channels, 6 residual blocks, 384-dimensional output | 1,266,134 |
 | Action policy | 24 residual blocks, 1,024-dimensional output, 46 internal actions | 12,295,118 |
-| Total |  | 54,821,952 |
+| Total |  | 55,356,992 |
 
 Opponent analysis covers shanten, furiten or no yaku, and per-tile deal-in risk. Separate branches predict concealed tiles and the wall, dora and hand value, kyoku outcomes and score changes, and final placement and scores. The policy combines the same public state with its private decision context and learns recommendation strengths from recorded play.
 
@@ -39,7 +39,7 @@ Each supervised objective is balanced with a learned uncertainty weight during t
 
 Training inputs are supplied through a private external manifest.
 
-At least one deterministic perspective is retained for every public event. When an action can be supervised, the acting player or an explicit-pass perspective is retained as well. Observations are compressed using two bitmaps and sparse `float16` values. Repeated dora indicators are counted repeatedly, while honba and deposits are excluded from hand-value labels.
+Each public event uses one deterministic perspective to train the analysis outputs. When an action can be supervised, the acting player or explicit-pass perspective is also used to train the policy. Observations are compressed using two bitmaps and sparse `float16` values. Repeated dora indicators are counted repeatedly, while honba and deposits are excluded from hand-value labels.
 
 ## Running the test training job
 

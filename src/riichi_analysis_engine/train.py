@@ -199,20 +199,22 @@ def validate_dataset_input_contract(
     """Fail before training when packs cannot supply the selected model input."""
 
     expected_schema = (
-        MODEL_INPUT_SCHEMA_ID if model_format == 9 else LEGACY_MODEL_INPUT_SCHEMA_ID
+        MODEL_INPUT_SCHEMA_ID
+        if model_format in {9, 10}
+        else LEGACY_MODEL_INPUT_SCHEMA_ID
     )
-    expected_channels = MODEL_INPUT_CHANNELS if model_format == 9 else OBS_CHANNELS
+    expected_channels = (
+        MODEL_INPUT_CHANNELS if model_format in {9, 10} else OBS_CHANNELS
+    )
     for split, metadata in datasets.items():
         schema = metadata.get("modelInputSchema")
         channels = metadata.get("observationChannels")
         # Manifests written before the explicit metadata fields are v8 by
         # construction. They remain readable only by legacy model formats.
-        if schema is None and channels is None and model_format != 9:
+        if schema is None and channels is None and model_format not in {9, 10}:
             continue
         if schema != expected_schema or channels != expected_channels:
-            raise RuntimeError(
-                f"{split} dataset uses a different model-input contract"
-            )
+            raise RuntimeError(f"{split} dataset uses a different model-input contract")
 
 
 def move_batch(
@@ -344,15 +346,43 @@ def validate(
         policy_labels += (
             torch.bincount(batch["policy"][policy_valid], minlength=46).cpu().numpy()
         )
-        shanten_labels += (
-            torch.bincount(batch["shanten"].reshape(-1), minlength=7).cpu().numpy()
-        )
         policy_logits = outputs["policy"].masked_fill(~batch["action_mask"], -torch.inf)
         add_metric(
             "policyAccuracy",
             policy_logits.argmax(-1) == batch["policy"],
             policy_valid,
         )
+        analysis_rows = batch.get("analysis_active")
+        if analysis_rows is None:
+            analysis_rows = torch.ones(
+                len(batch["policy"]), dtype=torch.bool, device=batch["policy"].device
+            )
+        else:
+            analysis_rows = analysis_rows.bool()
+        shanten_labels += (
+            torch.bincount(batch["shanten"][analysis_rows].reshape(-1), minlength=7)
+            .cpu()
+            .numpy()
+        )
+        if not analysis_rows.any():
+            batches += 1
+            if progress_every > 0 and batches % progress_every == 0:
+                print(json.dumps({"phase": "validation-progress", "batches": batches}))
+            continue
+        row_count = len(analysis_rows)
+        outputs = {
+            name: value[analysis_rows]
+            for name, value in outputs.items()
+            if name != "policy"
+        }
+        batch = {
+            name: (
+                value[analysis_rows]
+                if value.ndim > 0 and len(value) == row_count
+                else value
+            )
+            for name, value in batch.items()
+        }
         add_metric(
             "shantenAccuracy",
             outputs["shanten"].argmax(-1) == batch["shanten"],
@@ -609,8 +639,7 @@ def add_core_selection_metrics(
     if nulls["policy"] <= 0 or nulls["shanten"] <= 0:
         return
     score = 0.5 * (
-        result["policy"] / nulls["policy"]
-        + result["shanten"] / nulls["shanten"]
+        result["policy"] / nulls["policy"] + result["shanten"] / nulls["shanten"]
     )
     result["Selection/core_score"] = score
     result["Selection/core_skill"] = 1.0 - score
@@ -766,6 +795,7 @@ def save_checkpoint(
     *,
     step: int,
     samples_seen: int,
+    analysis_samples_seen: int,
     batch_size: int,
     pass_complete: bool,
     parameters: dict[str, int],
@@ -780,6 +810,7 @@ def save_checkpoint(
             "format": f"riichi-analysis-model-v{model.format_version}",
             "step": step,
             "samplesSeen": samples_seen,
+            "analysisSamplesSeen": analysis_samples_seen,
             "trainingCursor": {
                 "type": "single-pass-v1",
                 "nextSample": samples_seen,
@@ -791,7 +822,7 @@ def save_checkpoint(
             "modelArchitecture": architecture.to_dict(),
             **(
                 {"modelInput": model_input_metadata()}
-                if model.format_version == 9
+                if model.format_version in {9, 10}
                 else {}
             ),
             "optimizer": optimizer.state_dict(),
@@ -824,7 +855,7 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--model-format", type=int, choices=(7, 8, 9), default=9)
+    parser.add_argument("--model-format", type=int, choices=(7, 8, 9, 10), default=10)
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
     parser.add_argument("--family-latent-width", type=int, default=768)
@@ -856,6 +887,12 @@ def main() -> None:
         "--future-width", type=int, default=1024, help=argparse.SUPPRESS
     )
     parser.add_argument("--max-train-samples", type=int, default=0)
+    parser.add_argument(
+        "--max-analysis-samples",
+        type=int,
+        default=0,
+        help="stop after this many canonical analysis rows; zero disables it",
+    )
     parser.add_argument("--max-validation-samples", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--checkpoint-every-samples", type=int, default=1_000_000)
@@ -896,14 +933,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_steps < 0:
         raise ValueError("max steps must be non-negative")
+    if args.max_analysis_samples < 0:
+        raise ValueError("maximum analysis samples must be non-negative")
     if args.checkpoint_every_samples < 0:
         raise ValueError("checkpoint interval must be non-negative")
     if args.keep_checkpoints < 0:
         raise ValueError("checkpoint retention must be non-negative")
     if args.gradient_diagnostics_every < 0:
         raise ValueError("gradient diagnostics interval must be non-negative")
-    if args.gradient_diagnostics_every and args.model_format not in {8, 9}:
-        raise ValueError("shared-gradient diagnostics require model format 8 or 9")
+    if args.gradient_diagnostics_every and args.model_format not in {8, 9, 10}:
+        raise ValueError("shared-gradient diagnostics require model format 8, 9, or 10")
     if args.validate_only and args.resume is None:
         raise ValueError("--validate-only requires --resume")
 
@@ -918,7 +957,7 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
     amp_dtype = torch.float16 if device.type == "cuda" else None
 
-    if args.model_format in {8, 9}:
+    if args.model_format in {8, 9, 10}:
         architecture: ModelArchitecture | StructuredModelArchitecture = (
             StructuredModelArchitecture(
                 shared_channels=args.shared_channels,
@@ -987,6 +1026,7 @@ def main() -> None:
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
     step = 0
     samples_seen = 0
+    analysis_samples_seen = 0
     datasets = {
         "train": dataset_metadata(args.train),
         "validation": dataset_metadata(args.validation),
@@ -1001,8 +1041,13 @@ def main() -> None:
             raise RuntimeError("resume checkpoint has an unsupported format")
         if checkpoint.get("modelArchitecture") != architecture.to_dict():
             raise RuntimeError("resume checkpoint uses a different model architecture")
-        if args.model_format == 9 and checkpoint.get("modelInput") != model_input_metadata():
-            raise RuntimeError("resume checkpoint uses a different model-input contract")
+        if (
+            args.model_format in {9, 10}
+            and checkpoint.get("modelInput") != model_input_metadata()
+        ):
+            raise RuntimeError(
+                "resume checkpoint uses a different model-input contract"
+            )
         if checkpoint.get("predictionValues") != {
             "dora": list(DORA_VALUES),
             "score": list(SCORE_VALUES),
@@ -1022,9 +1067,27 @@ def main() -> None:
             args.batch_size,
             allow_complete=args.validate_only,
         )
+        analysis_samples_seen = int(
+            checkpoint.get(
+                "analysisSamplesSeen",
+                samples_seen if args.model_format != 10 else -1,
+            )
+        )
+        if analysis_samples_seen < 0 or analysis_samples_seen > samples_seen:
+            raise RuntimeError(
+                "resume checkpoint has an invalid analysis-sample counter"
+            )
         if not args.validate_only and step_budget_reached(step, args.max_steps):
             raise RuntimeError(
                 "resume budget is already exhausted; increase --max-steps"
+            )
+        if (
+            not args.validate_only
+            and args.max_analysis_samples > 0
+            and analysis_samples_seen >= args.max_analysis_samples
+        ):
+            raise RuntimeError(
+                "resume budget is already exhausted; increase --max-analysis-samples"
             )
     # The order comes from the training manifest: one pass over globally mixed
     # packs, with no shuffling left for the loader to do.
@@ -1067,7 +1130,7 @@ def main() -> None:
         fixture = next(iter(validation_loader))
     except StopIteration:
         fixture = None
-    if args.model_format in {8, 9}:
+    if args.model_format in {8, 9, 10}:
         if args.validate_only:
             saved_contract = checkpoint.get("trainingContract")
             training_contract = (
@@ -1076,7 +1139,9 @@ def main() -> None:
                 else {
                     "train": None,
                     "validation": (
-                        validate_v8_training_batch(fixture)
+                        validate_v8_training_batch(
+                            fixture, require_analysis_active=args.model_format == 10
+                        )
                         if fixture is not None
                         else None
                     ),
@@ -1088,9 +1153,13 @@ def main() -> None:
             except StopIteration as error:
                 raise RuntimeError("training data contains no samples") from error
             training_contract = {
-                "train": validate_v8_training_batch(train_fixture),
+                "train": validate_v8_training_batch(
+                    train_fixture, require_analysis_active=args.model_format == 10
+                ),
                 "validation": (
-                    validate_v8_training_batch(fixture)
+                    validate_v8_training_batch(
+                        fixture, require_analysis_active=args.model_format == 10
+                    )
                     if fixture is not None
                     else None
                 ),
@@ -1115,6 +1184,8 @@ def main() -> None:
             "verified": datasets["train"].get("verified"),
             "startSample": samples_seen,
             "sampleLimit": sample_limit,
+            "analysisSamplesSeen": analysis_samples_seen,
+            "analysisSampleLimit": args.max_analysis_samples or None,
         },
         "environment": environment,
         "trainingContract": training_contract,
@@ -1150,6 +1221,7 @@ def main() -> None:
             architecture,
             step=step,
             samples_seen=samples_seen,
+            analysis_samples_seen=analysis_samples_seen,
             batch_size=args.batch_size,
             pass_complete=pass_complete,
             parameters=parameters,
@@ -1233,6 +1305,12 @@ def main() -> None:
         scaler.update()
         step += 1
         samples_seen += len(batch["policy"])
+        analysis_rows = batch.get("analysis_active")
+        analysis_samples_seen += (
+            len(batch["policy"])
+            if analysis_rows is None
+            else int(analysis_rows.bool().sum().item())
+        )
         if step == 1 or step % 100 == 0 or gradient_geometry:
             now = time.perf_counter()
             interval_seconds = max(now - last_log_time, 1e-9)
@@ -1241,6 +1319,7 @@ def main() -> None:
                 "phase": "train",
                 "step": step,
                 "samples": samples_seen,
+                "analysisSamples": analysis_samples_seen,
                 "elapsedSeconds": now - started,
                 "samplesPerSecond": interval_samples / interval_seconds,
                 "total": float(total.detach()),
@@ -1286,6 +1365,9 @@ def main() -> None:
                 writer.add_scalar("LR", optimizer.param_groups[0]["lr"], step)
                 writer.add_scalar("Progress/samples", samples_seen, step)
                 writer.add_scalar(
+                    "Progress/analysis_samples", analysis_samples_seen, step
+                )
+                writer.add_scalar(
                     "Progress/samples_per_second", record["samplesPerSecond"], step
                 )
                 if device.type == "cuda":
@@ -1303,6 +1385,10 @@ def main() -> None:
         # rolling cadence boundary.
         terminal_boundary = (
             samples_seen >= sample_limit
+            or (
+                args.max_analysis_samples > 0
+                and analysis_samples_seen >= args.max_analysis_samples
+            )
             or step_budget_reached(step, args.max_steps)
             or interrupt_requested
         )
@@ -1319,6 +1405,12 @@ def main() -> None:
                 next_checkpoint_sample += checkpoint_interval
         if step_budget_reached(step, args.max_steps):
             stop_reason = "max-steps"
+            break
+        if (
+            args.max_analysis_samples > 0
+            and analysis_samples_seen >= args.max_analysis_samples
+        ):
+            stop_reason = "max-analysis-samples"
             break
         if interrupt_requested:
             stop_reason = "interrupted"

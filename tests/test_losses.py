@@ -17,6 +17,7 @@ from riichi_analysis_engine.losses import (
     score_class_indices,
 )
 from riichi_analysis_engine.model import RiichiAnalysisModel
+from riichi_analysis_engine.model_input import MODEL_INPUT_CHANNELS
 from riichi_analysis_engine.observation_layout import JIKAZE_CHANNEL, WIND_TILE_START
 from riichi_analysis_engine.prediction_values import SCORE_VALUES, score_class_mask
 from riichi_analysis_engine.structured_outputs import (
@@ -24,6 +25,7 @@ from riichi_analysis_engine.structured_outputs import (
     fixed_total_values,
     zero_sum_accounts,
 )
+from riichi_analysis_engine.train import validate
 
 
 def test_masked_mean_does_not_multiply_non_finite_unselected_values() -> None:
@@ -275,3 +277,123 @@ def test_v8_structured_losses_backpropagate() -> None:
     assert not active["dora_tail"]
     total.backward()
     assert model.shared_trunk.input.weight.grad is not None
+
+
+def test_structured_analysis_losses_use_only_the_canonical_frame_rows() -> None:
+    architecture = StructuredModelArchitecture(
+        shared_channels=8,
+        shared_blocks=1,
+        family_latent_width=16,
+        opponent_latent_width=20,
+        policy_latent_width=24,
+        opponent_blocks=1,
+        hidden_blocks=1,
+        value_blocks=1,
+        kyoku_blocks=1,
+        match_blocks=1,
+        policy_blocks=1,
+        task_width=12,
+        tile_width=6,
+        policy_context_channels=4,
+        policy_context_blocks=1,
+        policy_context_width=8,
+        policy_width=16,
+    )
+    model = RiichiAnalysisModel(format_version=10, architecture=architecture)
+    batch = {
+        "obs": torch.zeros(2, MODEL_INPUT_CHANNELS, TILE_TYPES),
+        "action_mask": torch.ones(2, ACTION_SPACE, dtype=torch.bool),
+        "policy": torch.tensor([0, 1]),
+        "analysis_active": torch.tensor([True, False]),
+        "shanten": torch.tensor([[0, 1, 2], [6, 6, 6]]),
+        "furiten_no_yaku": torch.zeros(2, 3, dtype=torch.long),
+        "deal_in_tile": torch.zeros(2, 3, 34),
+        "concealed_count": torch.zeros(2, 3, 34, dtype=torch.long),
+        "concealed_red_count": torch.zeros(2, 3, 3, dtype=torch.long),
+        "wall_count": torch.zeros(2, 34, dtype=torch.long),
+        "wall_red_count": torch.zeros(2, 3, dtype=torch.long),
+        "dora": torch.zeros(2, 3, dtype=torch.long),
+        "score": torch.zeros(2, 3, dtype=torch.long),
+        "winner_mask": torch.zeros(2, 3, dtype=torch.bool),
+        "outcome": torch.tensor([0, 32]),
+        "kyoku_delta": torch.zeros(2, 4),
+        "placement": torch.tensor([0, 23]),
+        "match_score": torch.full((2, 4), 25_000),
+    }
+    outputs = model(batch["obs"])
+    _total, masked_losses, masked_active, _weights = multitask_loss(
+        outputs, batch, LearnedUncertaintyBalancer(LOSS_TERMS_V8)
+    )
+
+    first_batch = {
+        name: value[:1] for name, value in batch.items() if name != "analysis_active"
+    }
+    first_outputs = {name: value[:1] for name, value in outputs.items()}
+    _total, first_losses, _active, _weights = multitask_loss(
+        first_outputs, first_batch, LearnedUncertaintyBalancer(LOSS_TERMS_V8)
+    )
+
+    for name in LOSS_TERMS_V8[1:]:
+        assert masked_active[name] == _active[name]
+        assert torch.allclose(masked_losses[name], first_losses[name])
+
+
+def test_validation_metrics_use_only_the_canonical_analysis_rows() -> None:
+    architecture = StructuredModelArchitecture(
+        shared_channels=8,
+        shared_blocks=1,
+        family_latent_width=16,
+        opponent_latent_width=20,
+        policy_latent_width=24,
+        opponent_blocks=1,
+        hidden_blocks=1,
+        value_blocks=1,
+        kyoku_blocks=1,
+        match_blocks=1,
+        policy_blocks=1,
+        task_width=12,
+        tile_width=6,
+        policy_context_channels=4,
+        policy_context_blocks=1,
+        policy_context_width=8,
+        policy_width=16,
+    )
+    model = RiichiAnalysisModel(format_version=10, architecture=architecture)
+    batch = {
+        "obs": torch.zeros(2, MODEL_INPUT_CHANNELS, TILE_TYPES),
+        "action_mask": torch.ones(2, ACTION_SPACE, dtype=torch.bool),
+        "policy": torch.tensor([0, 1]),
+        "analysis_active": torch.tensor([True, False]),
+        "shanten": torch.tensor([[0, 1, 2], [6, 6, 6]]),
+        "furiten_no_yaku": torch.zeros(2, 3, dtype=torch.long),
+        "deal_in_tile": torch.zeros(2, 3, 34),
+        "concealed_count": torch.zeros(2, 3, 34, dtype=torch.long),
+        "concealed_red_count": torch.zeros(2, 3, 3, dtype=torch.long),
+        "wall_count": torch.zeros(2, 34, dtype=torch.long),
+        "wall_red_count": torch.zeros(2, 3, dtype=torch.long),
+        "dora": torch.zeros(2, 3, dtype=torch.long),
+        "score": torch.zeros(2, 3, dtype=torch.long),
+        "winner_mask": torch.zeros(2, 3, dtype=torch.bool),
+        "draw": torch.ones(2),
+        "win": torch.zeros(2, 4),
+        "deal_in_player": torch.zeros(2, 4),
+        "outcome": torch.tensor([0, 32]),
+        "kyoku_delta": torch.zeros(2, 4),
+        "placement": torch.tensor([0, 23]),
+        "match_score": torch.full((2, 4), 25_000),
+    }
+    model.eval()
+    with torch.no_grad():
+        expected = torch.nn.functional.cross_entropy(
+            model(batch["obs"])["shanten"][:1].reshape(-1, 7),
+            batch["shanten"][:1].reshape(-1),
+        )
+
+    metrics = validate(
+        model,
+        LearnedUncertaintyBalancer(LOSS_TERMS_V8),
+        [batch],
+        torch.device("cpu"),
+    )
+
+    assert metrics["metric/shantenNll"] == pytest.approx(float(expected))

@@ -104,13 +104,24 @@ class ResidualEncoder(nn.Module):
 class SpatialTrunk(nn.Module):
     """Shared low-level encoder that keeps the 34-tile axis intact."""
 
-    def __init__(self, input_channels: int, *, channels: int, blocks: int) -> None:
+    def __init__(
+        self,
+        input_channels: int,
+        *,
+        channels: int,
+        blocks: int,
+        finalize: bool = True,
+    ) -> None:
         super().__init__()
         self.input = nn.Conv1d(input_channels, channels, 3, padding=1, bias=False)
         self.blocks = nn.Sequential(*(ResidualBlock(channels) for _ in range(blocks)))
-        self.output = nn.Sequential(
-            nn.BatchNorm1d(channels, momentum=0.01, eps=1e-3),
-            nn.Mish(inplace=True),
+        self.output = (
+            nn.Sequential(
+                nn.BatchNorm1d(channels, momentum=0.01, eps=1e-3),
+                nn.Mish(inplace=True),
+            )
+            if finalize
+            else nn.Identity()
         )
 
     def forward(self, observation: Tensor) -> Tensor:
@@ -317,15 +328,15 @@ class RiichiAnalysisModel(nn.Module):
         architecture: ModelArchitecture | StructuredModelArchitecture | None = None,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
+        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
             raise ValueError(f"unsupported model format version: {format_version}")
-        if architecture is not None and format_version not in {6, 7, 8, 9}:
+        if architecture is not None and format_version not in {6, 7, 8, 9, 10}:
             raise ValueError(
                 "only model formats v6 and later accept architecture metadata"
             )
         self.format_version = format_version
         self.architecture: ModelArchitecture | StructuredModelArchitecture | None = None
-        if format_version in {8, 9}:
+        if format_version in {8, 9, 10}:
             if any(
                 value is not None
                 for value in (channels, blocks, state_width, future_width)
@@ -336,21 +347,29 @@ class RiichiAnalysisModel(nn.Module):
             configured = architecture or StructuredModelArchitecture()
             if not isinstance(configured, StructuredModelArchitecture):
                 raise TypeError(
-                    "model format v8/v9 requires StructuredModelArchitecture"
+                    "model format v8/v9/v10 requires StructuredModelArchitecture"
                 )
             self._init_v8(
                 configured,
                 analysis_channels=(
                     V9_ANALYSIS_CHANNELS
-                    if format_version == 9
+                    if format_version in {9, 10}
                     else LEGACY_ANALYSIS_CHANNELS
                 ),
                 policy_context_channels=(
                     V9_POLICY_CONTEXT_CHANNELS
-                    if format_version == 9
+                    if format_version in {9, 10}
                     else LEGACY_POLICY_CONTEXT_CHANNELS
                 ),
+                preserve_residual_boundary=format_version == 10,
+                shanten_hidden_width=(
+                    configured.opponent_latent_width
+                    if format_version == 10
+                    else configured.task_width
+                ),
             )
+            if format_version == 10:
+                self._init_reference_weights()
             return
         self.dimensions = (
             HeadDimensionsV1()
@@ -434,6 +453,8 @@ class RiichiAnalysisModel(nn.Module):
         *,
         analysis_channels: int,
         policy_context_channels: int,
+        preserve_residual_boundary: bool = False,
+        shanten_hidden_width: int | None = None,
     ) -> None:
         self.architecture = architecture
         channels = architecture.shared_channels
@@ -445,6 +466,7 @@ class RiichiAnalysisModel(nn.Module):
             analysis_channels,
             channels=channels,
             blocks=architecture.shared_blocks,
+            finalize=not preserve_residual_boundary,
         )
         self.opponent_tower = FamilyTower(
             channels,
@@ -475,7 +497,9 @@ class RiichiAnalysisModel(nn.Module):
             latent_width=architecture.policy_context_width,
         )
 
-        self.shanten_head = DensePredictionHead(opponent_latent, task, 3 * 7)
+        self.shanten_head = DensePredictionHead(
+            opponent_latent, shanten_hidden_width or task, 3 * 7
+        )
         self.furiten_head = DensePredictionHead(opponent_latent, task, 3)
         # The successful shanten/deal-in model decoded every wait from one
         # complete Mortal-style state.  A tile-local output shortcut regressed
@@ -488,9 +512,7 @@ class RiichiAnalysisModel(nn.Module):
             channels, architecture.tile_width, 4
         )
         self.hidden_red_head = DensePredictionHead(family_latent, task, 3 * 4)
-        self.dora_head = DensePredictionHead(
-            family_latent, task, 3 * len(DORA_VALUES)
-        )
+        self.dora_head = DensePredictionHead(family_latent, task, 3 * len(DORA_VALUES))
         self.dora_tail_head = DensePredictionHead(family_latent, task, 3)
         self.score_head = DensePredictionHead(
             family_latent, task, 3 * len(SCORE_VALUES)
@@ -505,12 +527,28 @@ class RiichiAnalysisModel(nn.Module):
             ACTION_SPACE,
         )
 
+    def _init_reference_weights(self) -> None:
+        """Match the explicit initialization used by the proven reference model."""
+
+        for module in self.modules():
+            if isinstance(module, nn.Conv1d):
+                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm1d):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
     @staticmethod
     def _split(value: Tensor, dimensions: tuple[int, ...]) -> tuple[Tensor, ...]:
         return value.split(dimensions, dim=-1)
 
     def forward(self, observation: Tensor) -> dict[str, Tensor]:
-        if self.format_version == 9:
+        if self.format_version in {9, 10}:
             return self._forward_v9(observation)
         if self.format_version == 8:
             return self._forward_v8(observation)
@@ -780,16 +818,14 @@ class RiichiAnalysisModel(nn.Module):
     def _forward_v9(self, observation: Tensor) -> dict[str, Tensor]:
         analysis, policy = split_model_input(observation)
         shared = self.shared_trunk(analysis)
-        return self._forward_structured_from_shared(
-            shared, self.policy_context(policy)
-        )
+        return self._forward_structured_from_shared(shared, self.policy_context(policy))
 
     def forward_with_shared(
         self, observation: Tensor
     ) -> tuple[dict[str, Tensor], Tensor]:
         """Return v8 outputs and the shared feature boundary for diagnostics."""
 
-        if self.format_version == 9:
+        if self.format_version in {9, 10}:
             analysis, policy = split_model_input(observation)
             shared = self.shared_trunk(analysis)
             return (
@@ -799,7 +835,9 @@ class RiichiAnalysisModel(nn.Module):
                 shared,
             )
         if self.format_version != 8:
-            raise RuntimeError("shared-feature diagnostics require model format v8 or v9")
+            raise RuntimeError(
+                "shared-feature diagnostics require model format v8, v9, or v10"
+            )
         if observation.shape[1:] != (OBS_CHANNELS, TILE_TYPES):
             raise ValueError(f"wrong observation shape: {tuple(observation.shape)}")
         shared = self.shared_trunk(observation[:, :LEGACY_ANALYSIS_CHANNELS])
@@ -847,7 +885,7 @@ class RiichiAnalysisModel(nn.Module):
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
-    if model.format_version in {8, 9}:
+    if model.format_version in {8, 9, 10}:
         groups: dict[str, nn.Module] = {
             "shared": model.shared_trunk,
             "opponent": nn.ModuleList(

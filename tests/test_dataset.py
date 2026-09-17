@@ -72,7 +72,7 @@ def pack_directory(
             count,
             kyoku=game,
             observation_channels=(
-                MODEL_INPUT_CHANNELS if model_format == 9 else OBS_CHANNELS
+                MODEL_INPUT_CHANNELS if model_format in {9, 10} else OBS_CHANNELS
             ),
         )
         arrays["event_index"] = np.arange(count, dtype=np.int32) + game * 1000
@@ -84,19 +84,19 @@ def pack_directory(
             # and one current-rank plane for each of four players.  The
             # generic storage fixture deliberately omits semantics, so add the
             # minimum coherent observation contract for training tests here.
-            jikaze = channel_index("jikaze") if model_format == 9 else JIKAZE_CHANNEL
+            jikaze = (
+                channel_index("jikaze") if model_format in {9, 10} else JIKAZE_CHANNEL
+            )
             rank_start = (
                 channel_index("rank_p0_r0")
-                if model_format == 9
+                if model_format in {9, 10}
                 else MORTAL_ANALYSIS_CHANNELS
             )
             arrays["obs"][:, jikaze, WIND_TILE_START : WIND_TILE_START + 4] = 0
             arrays["obs"][:, jikaze, WIND_TILE_START] = 1
             arrays["obs"][:, rank_start : rank_start + 16] = 0
             for player in range(4):
-                arrays["obs"][
-                    :, rank_start + player * 4 + player, :TILE_TYPES
-                ] = 1
+                arrays["obs"][:, rank_start + player * 4 + player, :TILE_TYPES] = 1
             arrays.update(
                 {
                     "policy": np.zeros(count, dtype=np.int8),
@@ -119,6 +119,8 @@ def pack_directory(
                     "match_score": np.zeros((count, 4), dtype=np.float32),
                 }
             )
+            if model_format == 10:
+                arrays["analysis_active"] = np.ones(count, dtype=bool)
         save_chunk_archive(stage / f"game-{game:06d}.zip", arrays, samples)
 
     output = root / "packs"

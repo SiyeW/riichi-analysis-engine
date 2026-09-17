@@ -279,11 +279,12 @@ class AnalysisRuntime:
             "riichi-analysis-model-v7": 7,
             "riichi-analysis-model-v8": 8,
             "riichi-analysis-model-v9": 9,
+            "riichi-analysis-model-v10": 10,
         }
         if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
         self.format_version = formats[model_format]
-        if self.format_version == 9:
+        if self.format_version in {9, 10}:
             architecture = payload.get("architecture")
             if (
                 not isinstance(architecture, dict)
@@ -301,14 +302,14 @@ class AnalysisRuntime:
                 or architecture.get("predictionValues") != expected_values
             ):
                 raise RuntimeError("weight file uses different prediction values")
-        if self.format_version in {6, 7, 8, 9}:
+        if self.format_version in {6, 7, 8, 9, 10}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict):
                 raise RuntimeError("weight file has no architecture metadata")
             try:
                 architecture_type = (
                     StructuredModelArchitecture
-                    if self.format_version in {8, 9}
+                    if self.format_version in {8, 9, 10}
                     else ModelArchitecture
                 )
                 model_architecture = architecture_type.from_dict(
@@ -328,7 +329,7 @@ class AnalysisRuntime:
         self.player_state_type = _load_player_state()
         observation_channels = (
             MODEL_INPUT_CHANNELS
-            if self.format_version == 9
+            if self.format_version in {9, 10}
             else OBS_CHANNELS
             if self.format_version in {6, 7, 8}
             else MORTAL_OBS_CHANNELS
@@ -364,9 +365,11 @@ class AnalysisRuntime:
         analysis_observation: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         observation, mask = state.encode_obs(4, at_kan_select)
-        if self.format_version == 9:
+        if self.format_version in {9, 10}:
             if analysis_observation is None:
-                raise ValueError("model format v9 requires the public-history observation")
+                raise ValueError(
+                    "model formats v9 and v10 require the public-history observation"
+                )
             observation = compose_model_input(
                 analysis_observation, extract_policy_context(observation)
             )
@@ -401,7 +404,7 @@ class AnalysisRuntime:
             score_state.process(event)
         analysis_observation = (
             self._analysis_observation(events, controlled_seat)
-            if self.format_version == 9
+            if self.format_version in {9, 10}
             else None
         )
         observation, _mask = self._encode_observation(
@@ -426,7 +429,7 @@ class AnalysisRuntime:
             score_state.process(event)
         analysis_observation = (
             self._analysis_observation(events, controlled_seat)
-            if self.format_version == 9
+            if self.format_version in {9, 10}
             else None
         )
         observation, _primary_mask = self._encode_observation(

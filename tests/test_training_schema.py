@@ -46,3 +46,15 @@ def test_v8_training_schema_rejects_missing_seat_wind(scratch) -> None:
         assert "seat wind" in str(error)
     else:
         raise AssertionError("missing seat wind was accepted")
+
+
+def test_v10_training_schema_requires_the_analysis_row_mask(scratch) -> None:
+    packs = pack_directory(scratch, training_targets=True, model_format=9)
+    batch = next(iter(PackDataset(packs, batch_size=4)))
+
+    with pytest.raises(ValueError, match="analysis_active"):
+        validate_v8_training_batch(batch, require_analysis_active=True)
+
+    batch["analysis_active"] = batch["policy"] >= 0
+    result = validate_v8_training_batch(batch, require_analysis_active=True)
+    assert result["analysisSamples"] == int(batch["analysis_active"].sum())

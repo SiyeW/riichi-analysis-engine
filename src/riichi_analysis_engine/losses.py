@@ -129,6 +129,37 @@ def _structured_multitask_losses(
         losses["policy"] = outputs["policy"].sum() * 0
         active["policy"] = False
 
+    analysis_rows = batch.get("analysis_active")
+    if analysis_rows is None:
+        analysis_rows = torch.ones(
+            len(batch["policy"]), dtype=torch.bool, device=batch["policy"].device
+        )
+    else:
+        analysis_rows = analysis_rows.bool()
+    if not analysis_rows.any():
+        zero = (
+            sum(value.sum() for name, value in outputs.items() if name != "policy") * 0
+        )
+        for name in LOSS_TERMS_V8[1:]:
+            losses[name] = zero
+            active[name] = False
+        return losses, active
+
+    row_count = len(analysis_rows)
+    outputs = {
+        name: value[analysis_rows]
+        for name, value in outputs.items()
+        if name != "policy"
+    }
+    batch = {
+        name: (
+            value[analysis_rows]
+            if value.ndim > 0 and len(value) == row_count
+            else value
+        )
+        for name, value in batch.items()
+    }
+
     losses["shanten"] = F.cross_entropy(
         outputs["shanten"].reshape(-1, 7), batch["shanten"].reshape(-1).long()
     )
