@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 from test_storage import sample_arrays
 
 from riichi_analysis_engine import dataset
@@ -160,6 +161,18 @@ def stored_tags(root: Path) -> np.ndarray:
 
 def collect(dataset: PackDataset) -> list[dict[str, np.ndarray]]:
     return [{name: value.numpy() for name, value in batch.items()} for batch in dataset]
+
+
+def test_multibyte_unsigned_targets_are_promoted_at_the_torch_boundary() -> None:
+    batch = PackDataset._torch(
+        {
+            "score": np.asarray([[1_000, 2_000]], dtype=np.uint32),
+            "shanten": np.asarray([[0, 1]], dtype=np.uint8),
+        }
+    )
+
+    assert batch["score"].dtype == torch.int64
+    assert batch["shanten"].dtype == torch.uint8
 
 
 def test_legacy_terminal_score_migration_awards_pool_to_absolute_first_place() -> None:
