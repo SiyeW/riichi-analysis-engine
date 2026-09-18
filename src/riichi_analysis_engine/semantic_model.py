@@ -16,7 +16,9 @@ from .model_input import POLICY_CONTEXT_CHANNELS, POLICY_CONTEXT_START
 from .physical_tile_features import (
     PHYSICAL_TILE_TYPES,
     RED_BASE_TILE_INDICES,
+    RED_ENTITY_FEATURE_NAMES,
     physical_dora_features,
+    physical_red_features,
 )
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 from .semantic_input import (
@@ -54,6 +56,9 @@ class SemanticInputStem(nn.Module):
         )
         self.tile_identity = nn.Embedding(PHYSICAL_TILE_TYPES, width)
         self.dora_attributes = nn.Linear(4, width, bias=False)
+        self.red_attributes = nn.Linear(
+            len(RED_ENTITY_FEATURE_NAMES), width, bias=False
+        )
         event_width = architecture.event_width
         self.event_type = nn.Embedding(len(PUBLIC_EVENT_TYPES) + 1, event_width)
         self.event_actor = nn.Embedding(5, event_width)
@@ -94,6 +99,7 @@ class SemanticInputStem(nn.Module):
         tile_state = tile_state + self.dora_attributes(
             physical_dora_features(analysis).stacked()
         )
+        tile_state = tile_state + self.red_attributes(physical_red_features(analysis))
 
         fields = event_tokens.long()
         event_state = (
@@ -204,33 +210,20 @@ class DualStreamTransformerBlock(nn.Module):
     def __init__(self, width: int, heads: int) -> None:
         super().__init__()
         self.state_norm = nn.LayerNorm(width)
-        self.event_norm = nn.LayerNorm(width)
         self.state_attention = nn.MultiheadAttention(width, heads, batch_first=True)
-        self.event_attention = nn.MultiheadAttention(width, heads, batch_first=True)
         self.cross_attention = nn.MultiheadAttention(width, heads, batch_first=True)
         self.state_ff = nn.Sequential(
             nn.LayerNorm(width), nn.Linear(width, width * 4), nn.GELU(), nn.Linear(width * 4, width)
         )
-        self.event_ff = nn.Sequential(
-            nn.LayerNorm(width), nn.Linear(width, width * 4), nn.GELU(), nn.Linear(width * 4, width)
-        )
+        self.event_norm = nn.LayerNorm(width)
 
     def forward(
         self, state: Tensor, events: Tensor, event_mask: Tensor
-    ) -> tuple[Tensor, Tensor]:
+    ) -> Tensor:
         state_norm = self.state_norm(state)
         state = state + self.state_attention(
             state_norm, state_norm, state_norm, need_weights=False
         )[0]
-        event_norm = self.event_norm(events)
-        events = events + self.event_attention(
-            event_norm,
-            event_norm,
-            event_norm,
-            key_padding_mask=~event_mask.bool(),
-            need_weights=False,
-        )[0]
-        events = (events + self.event_ff(events)) * event_mask.unsqueeze(-1)
         state = state + self.cross_attention(
             self.state_norm(state),
             self.event_norm(events),
@@ -238,7 +231,7 @@ class DualStreamTransformerBlock(nn.Module):
             key_padding_mask=~event_mask.bool(),
             need_weights=False,
         )[0]
-        return state + self.state_ff(state), events
+        return state + self.state_ff(state)
 
 
 class TransformerBackbone(nn.Module):
@@ -247,10 +240,19 @@ class TransformerBackbone(nn.Module):
         width = architecture.width
         self.player_tokens = nn.Parameter(torch.empty(4, width))
         self.global_token = nn.Parameter(torch.empty(1, width))
-        blocks = max(architecture.backbone_blocks, architecture.event_blocks)
+        event_layer = nn.TransformerEncoderLayer(
+            width,
+            architecture.attention_heads,
+            dim_feedforward=width * 4,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.event_encoder = nn.TransformerEncoder(
+            event_layer, architecture.event_blocks, enable_nested_tensor=False
+        )
         self.blocks = nn.ModuleList(
             DualStreamTransformerBlock(width, architecture.attention_heads)
-            for _ in range(blocks)
+            for _ in range(architecture.backbone_blocks)
         )
         nn.init.normal_(self.player_tokens, std=width**-0.5)
         nn.init.normal_(self.global_token, std=width**-0.5)
@@ -267,8 +269,11 @@ class TransformerBackbone(nn.Module):
             ),
             dim=1,
         )
+        events = self.event_encoder(
+            events, src_key_padding_mask=~event_mask.bool()
+        ) * event_mask.unsqueeze(-1)
         for block in self.blocks:
-            state, events = block(state, events, event_mask)
+            state = block(state, events, event_mask)
         return (
             state[:, :PHYSICAL_TILE_TYPES],
             state[:, PHYSICAL_TILE_TYPES : PHYSICAL_TILE_TYPES + 4],

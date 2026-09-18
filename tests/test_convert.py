@@ -1,13 +1,15 @@
+import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from riichi_analysis_engine.constants import (
     ACTION_SPACE,
     MORTAL_OBS_CHANNELS,
     TILE_TYPES,
 )
-from riichi_analysis_engine.convert import convert_game
+from riichi_analysis_engine.convert import convert_game, preflight_conversion
 from riichi_analysis_engine.semantic_input import (
     EVENT_TILE,
     PUBLIC_EVENT_TYPE_TO_ID,
@@ -77,3 +79,59 @@ def test_conversion_references_one_shared_full_event_catalog() -> None:
     np.testing.assert_array_equal(converted.arrays["history_start"], [0])
     np.testing.assert_array_equal(converted.arrays["history_length"], [1])
     np.testing.assert_array_equal(converted.arrays["analysis_active"], [True])
+
+
+def test_conversion_preflight_performs_no_writes(tmp_path) -> None:
+    sources = []
+    records = []
+    for index in range(2):
+        source = tmp_path / f"game-{index}.mjson"
+        source.write_text("", encoding="utf-8")
+        sources.append(source)
+        records.append({"sourceId": f"game-{index}", "path": str(source)})
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        "\n".join(
+            [json.dumps({"manifest": {"split": "synthetic"}})]
+            + [json.dumps(record) for record in records]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "not-created" / "stage"
+
+    metadata, selected, report = preflight_conversion(
+        manifest,
+        output,
+        start_game=0,
+        end_game=0,
+        max_games=1,
+    )
+
+    assert metadata["split"] == "synthetic"
+    assert selected == records
+    assert report["selectedGames"] == 1
+    assert report["writesPerformed"] is False
+    assert not output.exists()
+
+
+def test_conversion_preflight_rejects_duplicate_source_identity(tmp_path) -> None:
+    source = tmp_path / "game.mjson"
+    source.write_text("", encoding="utf-8")
+    manifest = tmp_path / "manifest.jsonl"
+    duplicate = {"sourceId": "same", "path": str(source)}
+    manifest.write_text(
+        "\n".join(
+            [json.dumps({"manifest": {}}), json.dumps(duplicate), json.dumps(duplicate)]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="repeats sourceId"):
+        preflight_conversion(
+            manifest,
+            tmp_path / "stage",
+            start_game=0,
+            end_game=0,
+            max_games=0,
+        )
