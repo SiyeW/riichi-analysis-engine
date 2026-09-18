@@ -46,10 +46,10 @@ from .model_input import (
 from .observations import add_all_player_ranks
 from .prediction_values import DORA_VALUES, SCORE_VALUES, score_class_mask
 from .rule_certainties import (
-    PublicRuleState,
     apply_opponent_rule_certainties,
     constrain_distribution,
 )
+from .runtime_session import RuntimeSession, canonical_event
 from .score_state import PublicScoreState
 from .semantic_input import (
     EVENT_FIELDS,
@@ -348,6 +348,7 @@ class AnalysisRuntime:
         self.model.load_state_dict(payload["model"], strict=True)
         self.model.to(self.device).eval()
         self.player_state_type = _load_player_state()
+        self._sessions: dict[str, RuntimeSession] = {}
         observation_channels = (
             MODEL_INPUT_CHANNELS
             if self.format_version in {9, 10, 11, 12}
@@ -388,6 +389,38 @@ class AnalysisRuntime:
         for event in events:
             state.update(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
         return state
+
+    def clear_session(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
+
+    def _prepare_session(
+        self,
+        events: list[dict[str, Any]],
+        controlled_seat: int,
+        session_id: str | None,
+    ) -> RuntimeSession:
+        event_keys = [canonical_event(event) for event in events]
+        session = self._sessions.get(session_id) if session_id is not None else None
+        prefix_matches = (
+            session is not None
+            and session.controlled_seat == controlled_seat
+            and len(event_keys) >= len(session.event_keys)
+            and event_keys[: len(session.event_keys)] == session.event_keys
+        )
+        if not prefix_matches:
+            session = RuntimeSession.create(self.player_state_type, controlled_seat)
+            if session_id is not None:
+                self._sessions[session_id] = session
+            suffix_start = 0
+        else:
+            suffix_start = len(session.event_keys)
+        if suffix_start < len(events):
+            session.result_cache.clear()
+            for event, event_key in zip(
+                events[suffix_start:], event_keys[suffix_start:], strict=True
+            ):
+                session.append(event, event_key)
+        return session
 
     def _encode_observation(
         self,
@@ -474,14 +507,23 @@ class AnalysisRuntime:
         controlled_seat: int,
         requested: list[dict[str, Any]],
         protocol_minor: int = 1,
+        session_id: str | None = None,
     ) -> tuple[dict[str, dict[str, Any]], float]:
         started = time.perf_counter()
-        state = self._state(events, controlled_seat)
-        score_state = PublicScoreState()
-        for event in events:
-            score_state.process(event)
+        session = self._prepare_session(events, controlled_seat, session_id)
+        request_key = json.dumps(
+            [protocol_minor, requested],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        cached = session.result_cache.get(request_key)
+        if cached is not None:
+            return cached, (time.perf_counter() - started) * 1000.0
+        state = session.player_state
+        score_state = session.score_state
         analysis_observation = (
-            self._analysis_observation(events, controlled_seat)
+            session.analysis_observation()
             if self.format_version in {9, 10, 11, 12}
             else None
         )
@@ -494,9 +536,7 @@ class AnalysisRuntime:
         tensor = torch.from_numpy(observation).unsqueeze(0).to(self.device)
         semantic_memory: tuple[torch.Tensor, torch.Tensor] | None = None
         if self.format_version == 12:
-            event_tokens, event_mask = self._semantic_event_memory(
-                events, controlled_seat
-            )
+            event_tokens, event_mask = session.semantic_event_memory()
             semantic_memory = (
                 event_tokens.to(self.device),
                 event_mask.to(self.device),
@@ -511,13 +551,10 @@ class AnalysisRuntime:
             else:
                 raw = self.model(tensor)
         outputs = {name: value[0].float().cpu() for name, value in raw.items()}
-        rule_state = PublicRuleState.from_events(events)
+        rule_state = session.rule_state
         order = [(controlled_seat + offset) % 4 for offset in range(4)]
         opponents = relative_players(controlled_seat)
-        start_kyoku = next(
-            (event for event in reversed(events) if event.get("type") == "start_kyoku"),
-            None,
-        )
+        start_kyoku = session.start_kyoku
         if start_kyoku is None:
             raise ValueError("history has no start_kyoku event")
         dealer_seat = int(start_kyoku["oya"])
@@ -943,4 +980,5 @@ class AnalysisRuntime:
                     for candidate in candidates
                 ],
             }
+        session.result_cache[request_key] = results
         return results, (time.perf_counter() - started) * 1000.0

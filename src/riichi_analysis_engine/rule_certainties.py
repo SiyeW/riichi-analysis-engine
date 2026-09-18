@@ -78,7 +78,6 @@ class PublicRuleState:
         state = cls()
         for event in events:
             state.process(event)
-        state._refresh_forbidden_tiles()
         return state
 
     def _reset(self, event: dict[str, Any]) -> None:
@@ -148,6 +147,7 @@ class PublicRuleState:
         kind = str(event.get("type") or "")
         if kind == "start_kyoku":
             self._reset(event)
+            self._refresh_forbidden_tiles()
             return
 
         self._resolve_pending_discard(event)
@@ -193,6 +193,7 @@ class PublicRuleState:
                 self.exposed[marker] += 1
         elif kind in {"reach", "reach_accepted"} and actor is not None:
             self.riichi[actor] = True
+        self._refresh_forbidden_tiles()
 
     def _refresh_forbidden_tiles(self) -> None:
         self.forbidden_tiles = [

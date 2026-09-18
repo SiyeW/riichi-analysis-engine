@@ -31,6 +31,120 @@ from riichi_analysis_engine.score_state import PublicScoreState
 from riichi_analysis_engine.semantic_input import semantic_input_metadata
 
 
+def _start_kyoku_event() -> dict:
+    return {
+        "type": "start_kyoku",
+        "bakaze": "E",
+        "kyoku": 1,
+        "honba": 0,
+        "kyotaku": 0,
+        "oya": 0,
+        "dora_marker": "1p",
+        "scores": [25_000] * 4,
+        "tehais": [
+            [
+                "1m",
+                "2m",
+                "3m",
+                "4m",
+                "5mr",
+                "6m",
+                "7m",
+                "8m",
+                "9m",
+                "1s",
+                "2s",
+                "3s",
+                "4s",
+            ],
+            ["?"] * 13,
+            ["?"] * 13,
+            ["?"] * 13,
+        ],
+    }
+
+
+def test_runtime_session_replays_only_an_appended_suffix() -> None:
+    instances: list[object] = []
+
+    class CountingPlayerState:
+        def __init__(self, player_id: int) -> None:
+            self.player_id = player_id
+            self.updates: list[str] = []
+            instances.append(self)
+
+        def update(self, event: str) -> SimpleNamespace:
+            self.updates.append(event)
+            return SimpleNamespace()
+
+    runtime = AnalysisRuntime.__new__(AnalysisRuntime)
+    runtime.player_state_type = CountingPlayerState
+    runtime._sessions = {}
+    start = _start_kyoku_event()
+    draw = {"type": "tsumo", "actor": 0, "pai": "2m"}
+
+    first = runtime._prepare_session([start], 0, "game")
+    first.result_cache["cached"] = {}
+    extended = runtime._prepare_session([start, draw], 0, "game")
+    unchanged = runtime._prepare_session([start, draw], 0, "game")
+
+    assert first is extended is unchanged
+    assert len(instances) == 1
+    assert len(first.player_state.updates) == 2
+    assert first.result_cache == {}
+
+
+def test_runtime_session_rebuilds_after_rollback_or_rewrite() -> None:
+    class CountingPlayerState:
+        def __init__(self, player_id: int) -> None:
+            self.player_id = player_id
+            self.updates: list[str] = []
+
+        def update(self, event: str) -> SimpleNamespace:
+            self.updates.append(event)
+            return SimpleNamespace()
+
+    runtime = AnalysisRuntime.__new__(AnalysisRuntime)
+    runtime.player_state_type = CountingPlayerState
+    runtime._sessions = {}
+    start = _start_kyoku_event()
+    first = runtime._prepare_session(
+        [start, {"type": "tsumo", "actor": 0, "pai": "2m"}], 0, "game"
+    )
+
+    rewritten = runtime._prepare_session(
+        [start, {"type": "tsumo", "actor": 0, "pai": "3m"}], 0, "game"
+    )
+    rolled_back = runtime._prepare_session([start], 0, "game")
+
+    assert rewritten is not first
+    assert rolled_back is not rewritten
+    assert len(rolled_back.player_state.updates) == 1
+    assert len(rewritten.player_state.updates) == 2
+
+
+def test_runtime_sessions_are_independent_and_clearable() -> None:
+    class FakePlayerState:
+        def __init__(self, player_id: int) -> None:
+            self.player_id = player_id
+
+        def update(self, _event: str) -> SimpleNamespace:
+            return SimpleNamespace()
+
+    runtime = AnalysisRuntime.__new__(AnalysisRuntime)
+    runtime.player_state_type = FakePlayerState
+    runtime._sessions = {}
+    start = _start_kyoku_event()
+
+    left = runtime._prepare_session([start], 0, "left")
+    right = runtime._prepare_session([start], 1, "right")
+    runtime.clear_session("left")
+
+    assert left is not right
+    assert "left" not in runtime._sessions
+    assert runtime._sessions["right"] is right
+
+
 def test_candidate_action_mapping() -> None:
     assert candidate_action_index({"type": "dahai", "pai": "5mr"}) == 34
     assert candidate_action_index({"type": "reach"}) == 37
@@ -475,8 +589,11 @@ def test_v8_runtime_emits_constrained_probabilities_and_score_totals() -> None:
             )
 
     class FakeModel:
-        @staticmethod
-        def __call__(observation: torch.Tensor) -> dict[str, torch.Tensor]:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, observation: torch.Tensor) -> dict[str, torch.Tensor]:
+            self.calls += 1
             batch = len(observation)
             return {
                 "shanten": torch.zeros(batch, 3, 7),
@@ -529,8 +646,14 @@ def test_v8_runtime_emits_constrained_probabilities_and_score_totals() -> None:
     runtime.format_version = 8
     runtime.model = FakeModel()
     runtime.player_state_type = FakePlayerState
+    runtime._sessions = {}
 
-    results, _elapsed = runtime.predict(events, 0, [], protocol_minor=2)
+    results, _elapsed = runtime.predict(
+        events, 0, [], protocol_minor=2, session_id="game"
+    )
+    repeated, _repeated_elapsed = runtime.predict(
+        events, 0, [], protocol_minor=2, session_id="game"
+    )
 
     opponent_totals = [
         sum(tile["expectedValue"] for tile in player["tiles"].values())
@@ -551,3 +674,5 @@ def test_v8_runtime_emits_constrained_probabilities_and_score_totals() -> None:
         for player in results["opponent-deal-in-probability"]["players"]
         for probability in player["tiles"].values()
     )
+    assert repeated is results
+    assert runtime.model.calls == 1

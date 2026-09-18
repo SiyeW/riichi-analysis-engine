@@ -85,3 +85,21 @@ def test_hello_only_declares_features_from_the_negotiated_minor() -> None:
 def test_hello_rejects_incompatible_or_invalid_protocols(protocol: dict) -> None:
     with pytest.raises(ProtocolError, match="not compatible"):
         Engine().hello({"protocol": protocol})
+
+
+def test_session_reset_clears_only_the_requested_runtime_session() -> None:
+    runtime = mock.Mock()
+    engine = Engine()
+    engine.runtime = runtime
+
+    assert engine.clear_session({"sessionId": "game-a"}) == {"ok": True}
+
+    runtime.clear_session.assert_called_once_with("game-a")
+
+
+@pytest.mark.parametrize("session_id", [None, "", 1, True])
+def test_session_reset_rejects_invalid_session_ids(session_id: object) -> None:
+    engine = Engine()
+
+    with pytest.raises(ProtocolError, match="sessionId"):
+        engine.clear_session({"sessionId": session_id})
