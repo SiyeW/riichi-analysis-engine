@@ -78,3 +78,49 @@ def test_v12_rejects_missing_event_memory() -> None:
 
     with pytest.raises(ValueError, match="requires semantic event memory"):
         model(observation)
+
+
+def test_cnn_event_padding_cannot_change_a_short_history() -> None:
+    torch.manual_seed(7)
+    model = RiichiAnalysisModel(format_version=12, architecture=_architecture("cnn"))
+    model.eval()
+    observation, events, mask = _inputs()
+
+    alone = model(observation[1:2], events[1:2, :2], mask[1:2, :2])
+    batched = model(observation, events, mask)
+
+    for name in alone:
+        torch.testing.assert_close(alone[name][0], batched[name][1])
+
+
+def test_transformer_event_order_changes_the_prediction() -> None:
+    torch.manual_seed(11)
+    model = RiichiAnalysisModel(
+        format_version=12, architecture=_architecture("transformer")
+    )
+    model.eval()
+    observation, events, mask = _inputs()
+    reordered = events[0:1].clone()
+    reordered[:, [1, 2]] = reordered[:, [2, 1]]
+
+    original = model(observation[0:1], events[0:1], mask[0:1])
+    changed = model(observation[0:1], reordered, mask[0:1])
+
+    assert not torch.allclose(original["outcome"], changed["outcome"])
+
+
+def test_policy_context_can_change_without_recomputing_semantic_state() -> None:
+    torch.manual_seed(13)
+    model = RiichiAnalysisModel(format_version=12, architecture=_architecture("cnn"))
+    model.eval()
+    observation, events, mask = _inputs()
+    selection_observation = observation[0:1].clone()
+    selection_observation[:, -1] = 1.0
+
+    state = model.semantic_model.encode(
+        observation[0:1], events[0:1], mask[0:1]
+    )
+    reused = model.semantic_model.decode_policy(state, selection_observation)
+    full = model(selection_observation, events[0:1], mask[0:1])["policy"]
+
+    torch.testing.assert_close(reused, full)

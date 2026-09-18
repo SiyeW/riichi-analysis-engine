@@ -502,11 +502,14 @@ class AnalysisRuntime:
                 event_mask.to(self.device),
             )
         with torch.inference_mode():
-            raw = (
-                self.model(tensor, *semantic_memory)
-                if semantic_memory is not None
-                else self.model(tensor)
-            )
+            semantic_state = None
+            if semantic_memory is not None:
+                semantic_state = self.model.semantic_model.encode(
+                    tensor, *semantic_memory
+                )
+                raw = self.model.semantic_model.decode(semantic_state)
+            else:
+                raw = self.model(tensor)
         outputs = {name: value[0].float().cpu() for name, value in raw.items()}
         rule_state = PublicRuleState.from_events(events)
         order = [(controlled_seat + offset) % 4 for offset in range(4)]
@@ -913,15 +916,15 @@ class AnalysisRuntime:
                     torch.from_numpy(selection_observation).unsqueeze(0).to(self.device)
                 )
                 with torch.inference_mode():
+                    selection_policy = (
+                        self.model.semantic_model.decode_policy(
+                            semantic_state, selection_tensor
+                        )
+                        if semantic_state is not None
+                        else self.model(selection_tensor)["policy"]
+                    )
                     kan_selection_logits = (
-                        (
-                            self.model(selection_tensor, *semantic_memory)
-                            if semantic_memory is not None
-                            else self.model(selection_tensor)
-                        )["policy"][0]
-                        .float()
-                        .cpu()
-                        .numpy()
+                        selection_policy[0].float().cpu().numpy()
                     )
             values = complete_candidate_policy(
                 outputs["policy"].numpy(),

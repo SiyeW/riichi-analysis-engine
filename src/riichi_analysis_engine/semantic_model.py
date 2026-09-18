@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import sqrt
+from math import log, sqrt
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from .analysis_observation import PLANE_CHANNELS
 from .architecture import SemanticModelArchitecture
@@ -115,8 +116,13 @@ class SemanticInputStem(nn.Module):
             )
         event_state = self.event_output(event_state)
         event_state = event_state * event_mask.unsqueeze(-1)
+        return tile_state, event_state, self.encode_policy_context(observation)
+
+    def encode_policy_context(self, observation: Tensor) -> Tensor:
+        if observation.ndim != 3 or observation.shape[1] < POLICY_CONTEXT_START:
+            raise ValueError("semantic policy context received a malformed observation")
         policy = observation[:, POLICY_CONTEXT_START:].mean(dim=-1)
-        return tile_state, event_state, self.policy_context(policy)
+        return self.policy_context(policy)
 
 
 class TileGraphBlock(nn.Module):
@@ -155,6 +161,26 @@ class TileGraphBlock(nn.Module):
         return value + self.feed_forward(value)
 
 
+class MaskedCausalEventBlock(nn.Module):
+    """Append-safe event convolution that never reads padded or future tokens."""
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.first = nn.Conv1d(width, width, 3)
+        self.second = nn.Conv1d(width, width, 3)
+
+    @staticmethod
+    def _causal(convolution: nn.Conv1d, value: Tensor) -> Tensor:
+        return convolution(F.pad(value, (2, 0)))
+
+    def forward(self, value: Tensor, mask: Tensor) -> Tensor:
+        channel_mask = mask.unsqueeze(1)
+        update = self._causal(self.first, value * channel_mask)
+        update = F.gelu(update) * channel_mask
+        update = self._causal(self.second, update)
+        return (value + update) * channel_mask
+
+
 class CNNBackbone(nn.Module):
     def __init__(self, architecture: SemanticModelArchitecture) -> None:
         super().__init__()
@@ -162,15 +188,9 @@ class CNNBackbone(nn.Module):
         self.tile_blocks = nn.Sequential(
             *(TileGraphBlock(width) for _ in range(architecture.backbone_blocks))
         )
-        self.event_blocks = nn.Sequential(
-            *(
-                nn.Sequential(
-                    nn.Conv1d(width, width, 3, padding=1),
-                    nn.GELU(),
-                    nn.Conv1d(width, width, 3, padding=1),
-                )
-                for _ in range(architecture.event_blocks)
-            )
+        self.event_blocks = nn.ModuleList(
+            MaskedCausalEventBlock(width)
+            for _ in range(architecture.event_blocks)
         )
         self.player_queries = nn.Parameter(torch.empty(4, width))
         self.global_query = nn.Parameter(torch.empty(1, width))
@@ -189,7 +209,7 @@ class CNNBackbone(nn.Module):
         tiles = self.tile_blocks(tiles)
         event_sequence = events.transpose(1, 2)
         for block in self.event_blocks:
-            event_sequence = event_sequence + block(event_sequence)
+            event_sequence = block(event_sequence, event_mask)
         events = event_sequence.transpose(1, 2) * event_mask.unsqueeze(-1)
         batch = len(tiles)
         queries = torch.cat((self.player_queries, self.global_query), dim=0)
@@ -257,6 +277,22 @@ class TransformerBackbone(nn.Module):
         nn.init.normal_(self.player_tokens, std=width**-0.5)
         nn.init.normal_(self.global_token, std=width**-0.5)
 
+    @staticmethod
+    def _positions(length: int, width: int, reference: Tensor) -> Tensor:
+        """Generate deterministic absolute positions without a fixed length limit."""
+
+        position = torch.arange(length, device=reference.device, dtype=torch.float32)
+        frequency = torch.exp(
+            torch.arange(0, width, 2, device=reference.device, dtype=torch.float32)
+            * (-log(10_000.0) / width)
+        )
+        encoding = torch.zeros(length, width, device=reference.device, dtype=torch.float32)
+        encoding[:, 0::2] = torch.sin(position[:, None] * frequency)
+        encoding[:, 1::2] = torch.cos(
+            position[:, None] * frequency[: encoding[:, 1::2].shape[1]]
+        )
+        return encoding.to(dtype=reference.dtype)
+
     def forward(
         self, tiles: Tensor, events: Tensor, event_mask: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -269,8 +305,21 @@ class TransformerBackbone(nn.Module):
             ),
             dim=1,
         )
+        event_mask = event_mask.bool()
+        event_length = events.shape[1]
+        events = events + self._positions(
+            event_length, events.shape[-1], events
+        ).unsqueeze(0) * event_mask.unsqueeze(-1)
+        causal_mask = torch.ones(
+            event_length,
+            event_length,
+            dtype=torch.bool,
+            device=events.device,
+        ).triu(1)
         events = self.event_encoder(
-            events, src_key_padding_mask=~event_mask.bool()
+            events,
+            mask=causal_mask,
+            src_key_padding_mask=~event_mask,
         ) * event_mask.unsqueeze(-1)
         for block in self.blocks:
             state = block(state, events, event_mask)
@@ -319,12 +368,6 @@ class StructuredSemanticDecoder(nn.Module):
         opponents = state.players[:, 1:]
         base_tiles = state.tiles[:, :TILE_TYPES]
         red_tiles = state.tiles[:, TILE_TYPES:]
-        policy_query = self.policy_query(
-            torch.cat((state.global_state, state.policy_context), dim=-1)
-        )
-        policy = torch.einsum("bd,ad->ba", policy_query, self.action_keys.weight) / sqrt(
-            state.global_state.shape[-1]
-        )
         return {
             "shanten": self.shanten(opponents),
             "furiten_no_yaku": self.furiten(opponents).squeeze(-1),
@@ -338,8 +381,16 @@ class StructuredSemanticDecoder(nn.Module):
             "kyoku_accounts": self.kyoku_accounts(state.global_state),
             "placement": self.placement(state.global_state),
             "match_score": self.match_score(state.global_state),
-            "policy": policy,
+            "policy": self.policy(state.global_state, state.policy_context),
         }
+
+    def policy(self, global_state: Tensor, policy_context: Tensor) -> Tensor:
+        policy_query = self.policy_query(
+            torch.cat((global_state, policy_context), dim=-1)
+        )
+        return torch.einsum(
+            "bd,ad->ba", policy_query, self.action_keys.weight
+        ) / sqrt(global_state.shape[-1])
 
 
 class SemanticRiichiModel(nn.Module):
@@ -359,13 +410,25 @@ class SemanticRiichiModel(nn.Module):
     def forward(
         self, observation: Tensor, event_tokens: Tensor, event_mask: Tensor
     ) -> dict[str, Tensor]:
+        return self.decode(self.encode(observation, event_tokens, event_mask))
+
+    def encode(
+        self, observation: Tensor, event_tokens: Tensor, event_mask: Tensor
+    ) -> SemanticState:
         tiles, events, policy = self.input(observation, event_tokens, event_mask)
         tiles, players, global_state = self.backbone(tiles, events, event_mask)
-        return self.decoder(
-            SemanticState(
-                tiles=tiles,
-                players=players,
-                global_state=global_state,
-                policy_context=policy,
-            )
+        return SemanticState(
+            tiles=tiles,
+            players=players,
+            global_state=global_state,
+            policy_context=policy,
+        )
+
+    def decode(self, state: SemanticState) -> dict[str, Tensor]:
+        return self.decoder(state)
+
+    def decode_policy(self, state: SemanticState, observation: Tensor) -> Tensor:
+        return self.decoder.policy(
+            state.global_state,
+            self.input.encode_policy_context(observation),
         )
