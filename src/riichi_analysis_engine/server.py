@@ -221,11 +221,14 @@ class Engine:
     def analyze(self, params: dict[str, Any]) -> dict[str, Any]:
         if self.runtime is None:
             raise ProtocolError("engine is not initialized", "ENGINE_NOT_INITIALIZED")
+        session_id = params.get("sessionId")
         seat = params.get("controlledSeat")
         events = params.get("events")
         requested = params.get("outputs")
         if isinstance(seat, bool) or not isinstance(seat, int) or not 0 <= seat <= 3:
             raise ProtocolError("controlledSeat must be 0..3", "INVALID_HISTORY")
+        if not isinstance(session_id, str) or not session_id:
+            raise ProtocolError("sessionId must be a non-empty string", "INVALID_HISTORY")
         if params.get("inputMode") != "standard" or not isinstance(events, list) or not events:
             raise ProtocolError("standard non-empty history is required", "INVALID_HISTORY")
         if not isinstance(requested, list) or not requested:
@@ -235,7 +238,11 @@ class Engine:
             raise ProtocolError("outputs contains an unavailable output", "UNSUPPORTED_OUTPUT")
         try:
             data, elapsed = self.runtime.predict(
-                events, seat, requested, self.protocol_minor or 0
+                events,
+                seat,
+                requested,
+                self.protocol_minor or 0,
+                session_id=session_id,
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ProtocolError(str(error), "INVALID_HISTORY") from error
@@ -249,6 +256,14 @@ class Engine:
             ],
             "timing": {"totalMs": elapsed},
         }
+
+    def clear_session(self, params: dict[str, Any]) -> dict[str, bool]:
+        session_id = params.get("sessionId")
+        if not isinstance(session_id, str) or not session_id:
+            raise ProtocolError("sessionId must be a non-empty string", "INVALID_HISTORY")
+        if self.runtime is not None:
+            self.runtime.clear_session(session_id)
+        return {"ok": True}
 
 
 def log_path() -> Path:
@@ -316,7 +331,7 @@ def main() -> None:
         log(f"stopping ({exited_by})")
 
 
-def _serve(engine: "Engine") -> None:
+def _serve(engine: Engine) -> None:
     for line in sys.stdin:
         request: Any = None
         try:
@@ -335,7 +350,9 @@ def _serve(engine: "Engine") -> None:
                     result = engine.analyze(params)
                 elif method == "engine.getStatus":
                     result = {"state": engine.state, "activeTasks": 0, "queuedTasks": 0, "lastError": None}
-                elif method in {"session.reset", "session.close"} or method == "engine.shutdown":
+                elif method in {"session.reset", "session.close"}:
+                    result = engine.clear_session(params)
+                elif method == "engine.shutdown":
                     result = {"ok": True}
                 else:
                     raise ProtocolError("method not found", "METHOD_NOT_FOUND", -32601)
