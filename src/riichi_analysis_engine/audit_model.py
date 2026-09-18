@@ -3,14 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 
-from .architecture import ModelArchitecture, StructuredModelArchitecture
+from .architecture import (
+    ModelArchitecture,
+    SemanticModelArchitecture,
+    StructuredModelArchitecture,
+)
 from .model import RiichiAnalysisModel, count_parameters
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Print the model parameter budget.")
     parser.add_argument(
-        "--model-format", type=int, choices=(7, 8, 9, 10, 11), default=11
+        "--model-format", type=int, choices=(7, 8, 9, 10, 11, 12), default=11
     )
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
@@ -34,13 +38,32 @@ def main() -> None:
     parser.add_argument("--policy-context-blocks", type=int, default=6)
     parser.add_argument("--policy-context-width", type=int, default=384)
     parser.add_argument("--policy-width", type=int, default=1024)
+    parser.add_argument("--semantic-backbone", choices=("cnn", "transformer"), default="cnn")
+    parser.add_argument("--semantic-width", type=int, default=256)
+    parser.add_argument("--semantic-stem-width", type=int, default=384)
+    parser.add_argument("--semantic-event-width", type=int, default=192)
+    parser.add_argument("--semantic-backbone-blocks", type=int, default=8)
+    parser.add_argument("--semantic-event-blocks", type=int, default=4)
+    parser.add_argument("--semantic-decoder-width", type=int, default=512)
+    parser.add_argument("--semantic-attention-heads", type=int, default=8)
     args = parser.parse_args()
-    if args.model_format >= 8:
+    if args.model_format == 12:
+        architecture = SemanticModelArchitecture(
+            backbone=args.semantic_backbone,
+            width=args.semantic_width,
+            stem_width=args.semantic_stem_width,
+            event_width=args.semantic_event_width,
+            backbone_blocks=args.semantic_backbone_blocks,
+            event_blocks=args.semantic_event_blocks,
+            decoder_width=args.semantic_decoder_width,
+            attention_heads=args.semantic_attention_heads,
+        )
+    elif args.model_format >= 8:
         family_latent_width = args.family_latent_width or (
             1024 if args.model_format == 11 else 768
         )
         task_width = args.task_width or (1024 if args.model_format == 11 else 512)
-        architecture: ModelArchitecture | StructuredModelArchitecture = (
+        architecture = (
             StructuredModelArchitecture(
                 shared_channels=args.shared_channels,
                 shared_blocks=args.shared_blocks,

@@ -382,6 +382,8 @@ def build_pack(
         "modelInputSchema": permuted["model_input_schema"].item(),
         "observationChannels": int(permuted["obs_channels"].item()),
     }
+    if "event_memory_schema" in permuted:
+        meta["eventMemorySchema"] = permuted["event_memory_schema"].item()
     return meta, int(permuted["source_game"][-1])
 
 
@@ -472,6 +474,8 @@ def audit_packs(
     previous_game: int | None = None
     input_schema: str | None = None
     observation_channels: int | None = None
+    event_memory_schema: str | None = None
+    event_schema_initialized = False
     for entry in entries:
         assert isinstance(entry, dict)
         name = str(entry["pack"])
@@ -534,6 +538,16 @@ def audit_packs(
             observation_channels = pack_channels
         elif (pack_schema, pack_channels) != (input_schema, observation_channels):
             raise ValueError("packs do not share one model-input contract")
+        pack_event_schema = (
+            str(entry["eventMemorySchema"])
+            if "eventMemorySchema" in entry
+            else None
+        )
+        if not event_schema_initialized:
+            event_memory_schema = pack_event_schema
+            event_schema_initialized = True
+        elif pack_event_schema != event_memory_schema:
+            raise ValueError("packs do not share one event-memory contract")
         if len(games) != int(entry["samples"]):
             raise ValueError(f"{name} holds {len(games)} samples, manifest says {entry['samples']}")
         if len(games) == 0:
@@ -562,4 +576,5 @@ def audit_packs(
         "adjacentSameGamePairs": 0,
         "modelInputSchema": input_schema,
         "observationChannels": observation_channels,
+        "eventMemorySchema": event_memory_schema,
     }

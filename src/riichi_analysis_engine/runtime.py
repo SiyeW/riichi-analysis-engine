@@ -16,7 +16,11 @@ from torch.nn import functional as F
 
 from .analysis_observation import IncrementalTilePlaneEncoder
 from .analysis_state import FRAME_EVENTS, PublicHistoryState
-from .architecture import ModelArchitecture, StructuredModelArchitecture
+from .architecture import (
+    ModelArchitecture,
+    SemanticModelArchitecture,
+    StructuredModelArchitecture,
+)
 from .constants import (
     MORTAL_OBS_CHANNELS,
     OBS_CHANNELS,
@@ -47,6 +51,12 @@ from .rule_certainties import (
     constrain_distribution,
 )
 from .score_state import PublicScoreState
+from .semantic_input import (
+    EVENT_FIELDS,
+    PublicEventHistoryEncoder,
+    materialize_event_memory,
+    semantic_input_metadata,
+)
 from .structured_outputs import (
     conditional_deal_in_probabilities,
     fixed_total_values,
@@ -191,7 +201,7 @@ def complete_candidate_policy(
         candidate_id = candidate.get("candidateId")
         action = candidate.get("action")
         if not isinstance(candidate_id, str) or not isinstance(action, dict):
-            raise ValueError("action candidates require candidateId and action")
+            raise TypeError("action candidates require candidateId and action")
         grouped[candidate_action_index(action)].append(candidate)
 
     primary = _selected_softmax(primary_logits, sorted(grouped))
@@ -281,17 +291,25 @@ class AnalysisRuntime:
             "riichi-analysis-model-v9": 9,
             "riichi-analysis-model-v10": 10,
             "riichi-analysis-model-v11": 11,
+            "riichi-analysis-model-v12": 12,
         }
         if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
         self.format_version = formats[model_format]
-        if self.format_version in {9, 10, 11}:
+        if self.format_version in {9, 10, 11, 12}:
             architecture = payload.get("architecture")
             if (
                 not isinstance(architecture, dict)
                 or architecture.get("modelInput") != model_input_metadata()
             ):
                 raise RuntimeError("weight file uses a different model-input contract")
+        if self.format_version == 12:
+            architecture = payload.get("architecture")
+            if (
+                not isinstance(architecture, dict)
+                or architecture.get("semanticInput") != semantic_input_metadata()
+            ):
+                raise RuntimeError("weight file uses a different semantic-input contract")
         if self.format_version >= 2:
             expected_values = {
                 "dora": list(DORA_VALUES),
@@ -303,20 +321,22 @@ class AnalysisRuntime:
                 or architecture.get("predictionValues") != expected_values
             ):
                 raise RuntimeError("weight file uses different prediction values")
-        if self.format_version in {6, 7, 8, 9, 10, 11}:
+        if self.format_version in {6, 7, 8, 9, 10, 11, 12}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict):
                 raise RuntimeError("weight file has no architecture metadata")
             try:
                 architecture_type = (
-                    StructuredModelArchitecture
+                    SemanticModelArchitecture
+                    if self.format_version == 12
+                    else StructuredModelArchitecture
                     if self.format_version in {8, 9, 10, 11}
                     else ModelArchitecture
                 )
                 model_architecture = architecture_type.from_dict(
                     architecture.get("model")
                 )
-            except ValueError as error:
+            except (TypeError, ValueError) as error:
                 raise RuntimeError(
                     f"weight file has invalid architecture metadata: {error}"
                 ) from error
@@ -330,13 +350,25 @@ class AnalysisRuntime:
         self.player_state_type = _load_player_state()
         observation_channels = (
             MODEL_INPUT_CHANNELS
-            if self.format_version in {9, 10, 11}
+            if self.format_version in {9, 10, 11, 12}
             else OBS_CHANNELS
             if self.format_version in {6, 7, 8}
             else MORTAL_OBS_CHANNELS
         )
         with torch.inference_mode():
-            self.model(torch.zeros(1, observation_channels, 34, device=self.device))
+            observation = torch.zeros(
+                1, observation_channels, 34, device=self.device
+            )
+            if self.format_version == 12:
+                self.model(
+                    observation,
+                    torch.zeros(
+                        1, 1, EVENT_FIELDS, dtype=torch.uint8, device=self.device
+                    ),
+                    torch.ones(1, 1, dtype=torch.bool, device=self.device),
+                )
+            else:
+                self.model(observation)
 
     def representations(self, output_id: str, protocol_minor: int) -> list[str]:
         if output_id not in {"opponent-dora-count", "opponent-score"}:
@@ -366,10 +398,10 @@ class AnalysisRuntime:
         analysis_observation: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         observation, mask = state.encode_obs(4, at_kan_select)
-        if self.format_version in {9, 10, 11}:
+        if self.format_version in {9, 10, 11, 12}:
             if analysis_observation is None:
                 raise ValueError(
-                    "model formats v9 through v11 require the public-history observation"
+                    "model formats v9 through v12 require the public-history observation"
                 )
             observation = compose_model_input(
                 analysis_observation, extract_policy_context(observation)
@@ -405,7 +437,7 @@ class AnalysisRuntime:
             score_state.process(event)
         analysis_observation = (
             self._analysis_observation(events, controlled_seat)
-            if self.format_version in {9, 10, 11}
+            if self.format_version in {9, 10, 11, 12}
             else None
         )
         observation, _mask = self._encode_observation(
@@ -415,6 +447,26 @@ class AnalysisRuntime:
             analysis_observation=analysis_observation,
         )
         return observation
+
+    @staticmethod
+    def _semantic_event_memory(
+        events: list[dict[str, Any]], controlled_seat: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        encoder = PublicEventHistoryEncoder()
+        reference: tuple[int, int] | None = None
+        for event in events:
+            if event.get("type") in FRAME_EVENTS:
+                reference = encoder.advance(event)
+        if reference is None:
+            raise ValueError("history has no semantic frame event")
+        start, length = reference
+        memory, mask = materialize_event_memory(
+            encoder.array(),
+            np.asarray([start]),
+            np.asarray([length]),
+            np.asarray([controlled_seat]),
+        )
+        return torch.from_numpy(memory), torch.from_numpy(mask)
 
     def predict(
         self,
@@ -430,7 +482,7 @@ class AnalysisRuntime:
             score_state.process(event)
         analysis_observation = (
             self._analysis_observation(events, controlled_seat)
-            if self.format_version in {9, 10, 11}
+            if self.format_version in {9, 10, 11, 12}
             else None
         )
         observation, _primary_mask = self._encode_observation(
@@ -440,8 +492,21 @@ class AnalysisRuntime:
             analysis_observation=analysis_observation,
         )
         tensor = torch.from_numpy(observation).unsqueeze(0).to(self.device)
+        semantic_memory: tuple[torch.Tensor, torch.Tensor] | None = None
+        if self.format_version == 12:
+            event_tokens, event_mask = self._semantic_event_memory(
+                events, controlled_seat
+            )
+            semantic_memory = (
+                event_tokens.to(self.device),
+                event_mask.to(self.device),
+            )
         with torch.inference_mode():
-            raw = self.model(tensor)
+            raw = (
+                self.model(tensor, *semantic_memory)
+                if semantic_memory is not None
+                else self.model(tensor)
+            )
         outputs = {name: value[0].float().cpu() for name, value in raw.items()}
         rule_state = PublicRuleState.from_events(events)
         order = [(controlled_seat + offset) % 4 for offset in range(4)]
@@ -849,7 +914,14 @@ class AnalysisRuntime:
                 )
                 with torch.inference_mode():
                     kan_selection_logits = (
-                        self.model(selection_tensor)["policy"][0].float().cpu().numpy()
+                        (
+                            self.model(selection_tensor, *semantic_memory)
+                            if semantic_memory is not None
+                            else self.model(selection_tensor)
+                        )["policy"][0]
+                        .float()
+                        .cpu()
+                        .numpy()
                     )
             values = complete_candidate_policy(
                 outputs["policy"].numpy(),

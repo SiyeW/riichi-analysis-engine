@@ -177,6 +177,7 @@ def main() -> None:
         "packs": entries,
         "modelInputSchema": entries[0]["modelInputSchema"],
         "observationChannels": entries[0]["observationChannels"],
+        "eventMemorySchema": entries[0].get("eventMemorySchema"),
     }
     write_manifest(arguments.output / "manifest.json", manifest)
     report = audit_packs(arguments.output, manifest, plan)
