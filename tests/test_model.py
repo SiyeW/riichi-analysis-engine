@@ -213,3 +213,54 @@ def test_v10_preserves_the_continuous_opponent_residual_path() -> None:
     assert torch.all(v10.opponent_tower.summary[0].weight == 1)
     outputs = v10(torch.zeros(2, MODEL_INPUT_CHANNELS, 34))
     assert outputs["shanten"].shape == (2, 3, 7)
+
+
+def test_v11_secondary_analysis_families_read_the_complete_state() -> None:
+    architecture = StructuredModelArchitecture(
+        shared_channels=8,
+        shared_blocks=2,
+        family_latent_width=16,
+        opponent_latent_width=20,
+        policy_latent_width=24,
+        opponent_blocks=3,
+        hidden_blocks=1,
+        value_blocks=1,
+        kyoku_blocks=1,
+        match_blocks=1,
+        policy_blocks=1,
+        task_width=12,
+        tile_width=6,
+        policy_context_channels=4,
+        policy_context_blocks=1,
+        policy_context_width=8,
+        policy_width=16,
+    )
+    model = RiichiAnalysisModel(format_version=11, architecture=architecture).eval()
+    seen: dict[str, torch.Tensor] = {}
+
+    model.shared_trunk.register_forward_hook(
+        lambda _module, _inputs, output: seen.__setitem__("shared", output)
+    )
+    model.opponent_tower.register_forward_hook(
+        lambda _module, _inputs, output: seen.__setitem__("complete", output[0])
+    )
+    for name, tower in {
+        "hidden": model.hidden_tower,
+        "value": model.value_tower,
+        "kyoku": model.kyoku_tower,
+        "match": model.match_tower,
+        "policy": model.policy_tower,
+    }.items():
+        tower.register_forward_pre_hook(
+            lambda _module, inputs, name=name: seen.__setitem__(name, inputs[0])
+        )
+
+    outputs = model(torch.zeros(2, MODEL_INPUT_CHANNELS, 34))
+
+    for name in ("hidden", "value", "kyoku", "match"):
+        assert seen[name] is seen["complete"]
+    assert seen["policy"] is seen["shared"]
+    assert outputs["hidden_source_affinity"].shape == (2, 4, 34)
+    assert outputs["score_distribution"].shape == (2, 3, 59)
+    assert outputs["outcome"].shape == (2, 33)
+    assert outputs["placement"].shape == (2, 24)

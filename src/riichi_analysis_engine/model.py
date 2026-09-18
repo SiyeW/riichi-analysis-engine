@@ -328,15 +328,15 @@ class RiichiAnalysisModel(nn.Module):
         architecture: ModelArchitecture | StructuredModelArchitecture | None = None,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
+        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
             raise ValueError(f"unsupported model format version: {format_version}")
-        if architecture is not None and format_version not in {6, 7, 8, 9, 10}:
+        if architecture is not None and format_version not in {6, 7, 8, 9, 10, 11}:
             raise ValueError(
                 "only model formats v6 and later accept architecture metadata"
             )
         self.format_version = format_version
         self.architecture: ModelArchitecture | StructuredModelArchitecture | None = None
-        if format_version in {8, 9, 10}:
+        if format_version in {8, 9, 10, 11}:
             if any(
                 value is not None
                 for value in (channels, blocks, state_width, future_width)
@@ -347,28 +347,28 @@ class RiichiAnalysisModel(nn.Module):
             configured = architecture or StructuredModelArchitecture()
             if not isinstance(configured, StructuredModelArchitecture):
                 raise TypeError(
-                    "model format v8/v9/v10 requires StructuredModelArchitecture"
+                    "model formats v8 through v11 require StructuredModelArchitecture"
                 )
             self._init_v8(
                 configured,
                 analysis_channels=(
                     V9_ANALYSIS_CHANNELS
-                    if format_version in {9, 10}
+                    if format_version in {9, 10, 11}
                     else LEGACY_ANALYSIS_CHANNELS
                 ),
                 policy_context_channels=(
                     V9_POLICY_CONTEXT_CHANNELS
-                    if format_version in {9, 10}
+                    if format_version in {9, 10, 11}
                     else LEGACY_POLICY_CONTEXT_CHANNELS
                 ),
-                preserve_residual_boundary=format_version == 10,
+                preserve_residual_boundary=format_version in {10, 11},
                 shanten_hidden_width=(
                     configured.opponent_latent_width
-                    if format_version == 10
+                    if format_version in {10, 11}
                     else configured.task_width
                 ),
             )
-            if format_version == 10:
+            if format_version in {10, 11}:
                 self._init_reference_weights()
             return
         self.dimensions = (
@@ -548,7 +548,7 @@ class RiichiAnalysisModel(nn.Module):
         return value.split(dimensions, dim=-1)
 
     def forward(self, observation: Tensor) -> dict[str, Tensor]:
-        if self.format_version in {9, 10}:
+        if self.format_version in {9, 10, 11}:
             return self._forward_v9(observation)
         if self.format_version == 8:
             return self._forward_v8(observation)
@@ -825,7 +825,7 @@ class RiichiAnalysisModel(nn.Module):
     ) -> tuple[dict[str, Tensor], Tensor]:
         """Return v8 outputs and the shared feature boundary for diagnostics."""
 
-        if self.format_version in {9, 10}:
+        if self.format_version in {9, 10, 11}:
             analysis, policy = split_model_input(observation)
             shared = self.shared_trunk(analysis)
             return (
@@ -836,7 +836,7 @@ class RiichiAnalysisModel(nn.Module):
             )
         if self.format_version != 8:
             raise RuntimeError(
-                "shared-feature diagnostics require model format v8, v9, or v10"
+                "shared-feature diagnostics require model formats v8 through v11"
             )
         if observation.shape[1:] != (OBS_CHANNELS, TILE_TYPES):
             raise ValueError(f"wrong observation shape: {tuple(observation.shape)}")
@@ -855,11 +855,12 @@ class RiichiAnalysisModel(nn.Module):
         self, shared: Tensor, policy_context: Tensor
     ) -> dict[str, Tensor]:
         batch = len(shared)
-        _opponent_spatial, opponent = self.opponent_tower(shared)
-        hidden_spatial, hidden = self.hidden_tower(shared)
-        _value_spatial, value = self.value_tower(shared)
-        _kyoku_spatial, kyoku = self.kyoku_tower(shared)
-        _match_spatial, match = self.match_tower(shared)
+        opponent_spatial, opponent = self.opponent_tower(shared)
+        analysis = opponent_spatial if self.format_version == 11 else shared
+        hidden_spatial, hidden = self.hidden_tower(analysis)
+        _value_spatial, value = self.value_tower(analysis)
+        _kyoku_spatial, kyoku = self.kyoku_tower(analysis)
+        _match_spatial, match = self.match_tower(analysis)
         _policy_spatial, policy_analysis = self.policy_tower(shared)
         wait = self.wait_head(opponent)
         hidden_source = self.hidden_source_head(hidden_spatial)
@@ -885,7 +886,7 @@ class RiichiAnalysisModel(nn.Module):
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
-    if model.format_version in {8, 9, 10}:
+    if model.format_version in {8, 9, 10, 11}:
         groups: dict[str, nn.Module] = {
             "shared": model.shared_trunk,
             "opponent": nn.ModuleList(

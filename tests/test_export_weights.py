@@ -115,6 +115,28 @@ def test_exported_provenance_omits_local_paths() -> None:
                 policy_width=16,
             ),
         ),
+        (
+            11,
+            StructuredModelArchitecture(
+                shared_channels=8,
+                shared_blocks=1,
+                family_latent_width=16,
+                opponent_latent_width=20,
+                policy_latent_width=24,
+                opponent_blocks=1,
+                hidden_blocks=1,
+                value_blocks=1,
+                kyoku_blocks=1,
+                match_blocks=1,
+                policy_blocks=1,
+                task_width=12,
+                tile_width=6,
+                policy_context_channels=4,
+                policy_context_blocks=1,
+                policy_context_width=8,
+                policy_width=16,
+            ),
+        ),
     ],
 )
 def test_export_preserves_model_architecture(
@@ -141,7 +163,7 @@ def test_export_preserves_model_architecture(
             "complete": False,
         },
     }
-    if format_version in {9, 10}:
+    if format_version in {9, 10, 11}:
         checkpoint["modelInput"] = model_input_metadata()
     torch.save(checkpoint, source)
     monkeypatch.setattr(sys, "argv", ["export_weights", str(source), str(destination)])
@@ -151,7 +173,7 @@ def test_export_preserves_model_architecture(
     exported = torch.load(destination, map_location="cpu", weights_only=True)
     assert exported["format"] == f"riichi-analysis-model-v{format_version}"
     assert exported["architecture"]["model"] == architecture.to_dict()
-    if format_version in {9, 10}:
+    if format_version in {9, 10, 11}:
         assert exported["architecture"]["modelInput"] == model_input_metadata()
     assert exported["training"]["step"] == 10
     assert exported["training"]["samplesSeen"] == 320

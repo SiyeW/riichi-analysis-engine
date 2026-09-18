@@ -200,18 +200,18 @@ def validate_dataset_input_contract(
 
     expected_schema = (
         MODEL_INPUT_SCHEMA_ID
-        if model_format in {9, 10}
+        if model_format in {9, 10, 11}
         else LEGACY_MODEL_INPUT_SCHEMA_ID
     )
     expected_channels = (
-        MODEL_INPUT_CHANNELS if model_format in {9, 10} else OBS_CHANNELS
+        MODEL_INPUT_CHANNELS if model_format in {9, 10, 11} else OBS_CHANNELS
     )
     for split, metadata in datasets.items():
         schema = metadata.get("modelInputSchema")
         channels = metadata.get("observationChannels")
         # Manifests written before the explicit metadata fields are v8 by
         # construction. They remain readable only by legacy model formats.
-        if schema is None and channels is None and model_format not in {9, 10}:
+        if schema is None and channels is None and model_format not in {9, 10, 11}:
             continue
         if schema != expected_schema or channels != expected_channels:
             raise RuntimeError(f"{split} dataset uses a different model-input contract")
@@ -822,7 +822,7 @@ def save_checkpoint(
             "modelArchitecture": architecture.to_dict(),
             **(
                 {"modelInput": model_input_metadata()}
-                if model.format_version in {9, 10}
+                if model.format_version in {9, 10, 11}
                 else {}
             ),
             "optimizer": optimizer.state_dict(),
@@ -855,10 +855,12 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--model-format", type=int, choices=(7, 8, 9, 10), default=10)
+    parser.add_argument(
+        "--model-format", type=int, choices=(7, 8, 9, 10, 11), default=11
+    )
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
-    parser.add_argument("--family-latent-width", type=int, default=768)
+    parser.add_argument("--family-latent-width", type=int)
     parser.add_argument("--opponent-latent-width", type=int, default=1024)
     parser.add_argument("--policy-latent-width", type=int, default=1024)
     parser.add_argument("--opponent-blocks", type=int, default=24)
@@ -867,7 +869,7 @@ def main() -> None:
     parser.add_argument("--kyoku-blocks", type=int, default=6)
     parser.add_argument("--match-blocks", type=int, default=4)
     parser.add_argument("--policy-blocks", type=int, default=24)
-    parser.add_argument("--task-width", type=int, default=512)
+    parser.add_argument("--task-width", type=int)
     parser.add_argument("--tile-width", type=int, default=128)
     parser.add_argument("--policy-context-channels", type=int, default=144)
     parser.add_argument("--policy-context-blocks", type=int, default=6)
@@ -941,8 +943,8 @@ def main() -> None:
         raise ValueError("checkpoint retention must be non-negative")
     if args.gradient_diagnostics_every < 0:
         raise ValueError("gradient diagnostics interval must be non-negative")
-    if args.gradient_diagnostics_every and args.model_format not in {8, 9, 10}:
-        raise ValueError("shared-gradient diagnostics require model format 8, 9, or 10")
+    if args.gradient_diagnostics_every and args.model_format not in {8, 9, 10, 11}:
+        raise ValueError("shared-gradient diagnostics require model formats 8 through 11")
     if args.validate_only and args.resume is None:
         raise ValueError("--validate-only requires --resume")
 
@@ -957,12 +959,16 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
     amp_dtype = torch.float16 if device.type == "cuda" else None
 
-    if args.model_format in {8, 9, 10}:
+    if args.model_format in {8, 9, 10, 11}:
+        family_latent_width = args.family_latent_width or (
+            1024 if args.model_format == 11 else 768
+        )
+        task_width = args.task_width or (1024 if args.model_format == 11 else 512)
         architecture: ModelArchitecture | StructuredModelArchitecture = (
             StructuredModelArchitecture(
                 shared_channels=args.shared_channels,
                 shared_blocks=args.shared_blocks,
-                family_latent_width=args.family_latent_width,
+                family_latent_width=family_latent_width,
                 opponent_latent_width=args.opponent_latent_width,
                 policy_latent_width=args.policy_latent_width,
                 opponent_blocks=args.opponent_blocks,
@@ -971,7 +977,7 @@ def main() -> None:
                 kyoku_blocks=args.kyoku_blocks,
                 match_blocks=args.match_blocks,
                 policy_blocks=args.policy_blocks,
-                task_width=args.task_width,
+                task_width=task_width,
                 tile_width=args.tile_width,
                 policy_context_channels=args.policy_context_channels,
                 policy_context_blocks=args.policy_context_blocks,
@@ -1042,7 +1048,7 @@ def main() -> None:
         if checkpoint.get("modelArchitecture") != architecture.to_dict():
             raise RuntimeError("resume checkpoint uses a different model architecture")
         if (
-            args.model_format in {9, 10}
+            args.model_format in {9, 10, 11}
             and checkpoint.get("modelInput") != model_input_metadata()
         ):
             raise RuntimeError(
@@ -1070,7 +1076,7 @@ def main() -> None:
         analysis_samples_seen = int(
             checkpoint.get(
                 "analysisSamplesSeen",
-                samples_seen if args.model_format != 10 else -1,
+                samples_seen if args.model_format < 10 else -1,
             )
         )
         if analysis_samples_seen < 0 or analysis_samples_seen > samples_seen:
@@ -1130,7 +1136,7 @@ def main() -> None:
         fixture = next(iter(validation_loader))
     except StopIteration:
         fixture = None
-    if args.model_format in {8, 9, 10}:
+    if args.model_format in {8, 9, 10, 11}:
         if args.validate_only:
             saved_contract = checkpoint.get("trainingContract")
             training_contract = (
@@ -1140,7 +1146,7 @@ def main() -> None:
                     "train": None,
                     "validation": (
                         validate_v8_training_batch(
-                            fixture, require_analysis_active=args.model_format == 10
+                            fixture, require_analysis_active=args.model_format >= 10
                         )
                         if fixture is not None
                         else None
@@ -1154,11 +1160,11 @@ def main() -> None:
                 raise RuntimeError("training data contains no samples") from error
             training_contract = {
                 "train": validate_v8_training_batch(
-                    train_fixture, require_analysis_active=args.model_format == 10
+                    train_fixture, require_analysis_active=args.model_format >= 10
                 ),
                 "validation": (
                     validate_v8_training_batch(
-                        fixture, require_analysis_active=args.model_format == 10
+                        fixture, require_analysis_active=args.model_format >= 10
                     )
                     if fixture is not None
                     else None
