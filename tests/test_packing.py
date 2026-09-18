@@ -27,6 +27,7 @@ from riichi_analysis_engine.packing import (
     write_manifest,
     write_plan,
 )
+from riichi_analysis_engine.semantic_input import encode_public_event
 from riichi_analysis_engine.storage import (
     LEGACY_STAGED_GAME_FORMATS,
     PACKED_METADATA_FIELDS,
@@ -160,6 +161,58 @@ def test_load_slot_attaches_input_contract_to_legacy_staged_chunks(
 
     assert int(packed["obs_channels"].item()) == 1028
     assert packed["model_input_schema"].item().endswith("legacy-v8")
+
+
+def test_pack_deduplicates_and_rebases_per_game_event_catalogs(scratch: Path) -> None:
+    stage = scratch / "stage"
+    expected_catalogs = []
+    for game, tile in enumerate(("1m", "2p")):
+        arrays = sample_arrays(3, kyoku=game)
+        arrays["history_start"] = np.zeros(3, dtype=np.uint32)
+        arrays["history_length"] = np.asarray([1, 2, 3], dtype=np.uint16)
+        catalog = np.stack(
+            [
+                encode_public_event({"type": "start_kyoku", "dora_marker": tile}),
+                encode_public_event({"type": "tsumo", "actor": game, "pai": tile}),
+                encode_public_event({"type": "dahai", "actor": game, "pai": tile}),
+            ]
+        )
+        expected_catalogs.append(catalog)
+        save_chunk_archive(
+            stage / f"game-{game:06d}.zip",
+            arrays,
+            2,
+            event_catalog=catalog,
+        )
+    paths = staged_games(stage)
+    plan = plan_corpus(paths, 17)
+    output = scratch / "packs"
+
+    meta, _ = build_pack(
+        paths,
+        output,
+        plan,
+        PackSlot(0, 0, len(plan["length"])),
+        17,
+        None,
+    )
+
+    packed = read_packed_shard(output / str(meta["pack"]))
+    np.testing.assert_array_equal(
+        packed["event_catalog"], np.concatenate(expected_catalogs, axis=0)
+    )
+    np.testing.assert_array_equal(packed["event_catalog_games"], [0, 1])
+    np.testing.assert_array_equal(packed["event_catalog_offsets"], [0, 3, 6])
+    for game, lower in ((0, 0), (1, 3)):
+        selected = packed["source_game"] == game
+        assert (packed["history_start"][selected] >= lower).all()
+        assert (packed["history_start"][selected] < lower + 3).all()
+    audit = audit_packs(
+        output,
+        {"format": MANIFEST_FORMAT, "packs": [meta]},
+        plan,
+    )
+    assert audit["verified"] is True
 
 
 def test_plan_round_trips_through_disk(scratch: Path) -> None:

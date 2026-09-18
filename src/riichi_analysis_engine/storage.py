@@ -17,20 +17,35 @@ from .model_input import (
     MODEL_INPUT_CHANNELS,
     MODEL_INPUT_SCHEMA_ID,
 )
+from .semantic_input import EVENT_FIELDS, EVENT_MEMORY_SCHEMA_ID
 
 ACTION_BYTES = (ACTION_SPACE + 7) // 8
 # v4 adds the kyoku index, so a corpus can later be resampled a whole kyoku at
 # a time instead of a sample at a time.  The marker prevents a run from mixing
 # earlier shards silently.
-STORAGE_FORMAT = "dual-bitpack-sparse-float16-v5"
-LEGACY_STORAGE_FORMATS = frozenset({"dual-bitpack-sparse-float16-v4"})
-SUPPORTED_STORAGE_FORMATS = frozenset({STORAGE_FORMAT, *LEGACY_STORAGE_FORMATS})
-STAGED_GAME_FORMAT = "riichi-analysis-staged-game-v2"
-LEGACY_STAGED_GAME_FORMATS = frozenset({"riichi-analysis-staged-game-v1"})
-PACK_FORMAT = "riichi-analysis-global-pack-v2"
-PACKED_METADATA_FIELDS = frozenset(
-    {"storage_format", "obs_channels", "model_input_schema"}
+STORAGE_FORMAT = "dual-bitpack-sparse-float16-v6"
+LEGACY_STORAGE_FORMATS = frozenset(
+    {"dual-bitpack-sparse-float16-v5", "dual-bitpack-sparse-float16-v4"}
 )
+SUPPORTED_STORAGE_FORMATS = frozenset({STORAGE_FORMAT, *LEGACY_STORAGE_FORMATS})
+STAGED_GAME_FORMAT = "riichi-analysis-staged-game-v3"
+LEGACY_STAGED_GAME_FORMATS = frozenset(
+    {"riichi-analysis-staged-game-v2", "riichi-analysis-staged-game-v1"}
+)
+PACK_FORMAT = "riichi-analysis-global-pack-v3"
+PACKED_METADATA_FIELDS = frozenset(
+    {
+        "storage_format",
+        "obs_channels",
+        "model_input_schema",
+        "event_memory_schema",
+    }
+)
+PACK_CATALOG_FIELDS = frozenset(
+    {"event_catalog", "event_catalog_games", "event_catalog_offsets"}
+)
+EVENT_CATALOG_MEMBER = "event_catalog.npy"
+EVENT_REFERENCE_FIELDS = frozenset({"history_start", "history_length"})
 
 
 @dataclass
@@ -140,6 +155,7 @@ def unpack_shard_arrays(packed: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     arrays.pop("storage_format", None)
     channels = int(arrays.pop("obs_channels", np.asarray(OBS_CHANNELS)).item())
     arrays.pop("model_input_schema", None)
+    arrays.pop("event_memory_schema", None)
     arrays["obs"] = unpack_observations(
         PackedObservations(
             arrays.pop("obs_nonzero"),
@@ -234,6 +250,8 @@ def concatenate_packed(parts: list[dict[str, np.ndarray]]) -> dict[str, np.ndarr
 
     if not parts:
         raise ValueError("nothing to concatenate")
+    if any(PACK_CATALOG_FIELDS.intersection(part) for part in parts):
+        raise ValueError("event catalogs must be deduplicated explicitly")
     names = set(parts[0])
     if any(set(part) != names for part in parts):
         raise ValueError("packed shard schemas differ")
@@ -293,6 +311,9 @@ def permute_packed(packed: dict[str, np.ndarray], order: np.ndarray) -> dict[str
     for name, value in packed.items():
         if name in result or name in PACKED_METADATA_FIELDS:
             continue
+        if name in PACK_CATALOG_FIELDS:
+            result[name] = value
+            continue
         result[name] = value[order]
     return result
 
@@ -320,17 +341,55 @@ def slice_packed(packed: dict[str, np.ndarray], start: int, stop: int) -> dict[s
     for name, value in packed.items():
         if name in result or name in PACKED_METADATA_FIELDS:
             continue
+        if name in PACK_CATALOG_FIELDS:
+            result[name] = value
+            continue
         result[name] = value[start:stop]
     return result
 
 
+def validate_event_references(
+    catalog: np.ndarray, starts: np.ndarray, lengths: np.ndarray
+) -> None:
+    """Validate sample references into one deduplicated public-event catalog."""
+
+    catalog = np.asarray(catalog)
+    starts = np.asarray(starts, dtype=np.int64).reshape(-1)
+    lengths = np.asarray(lengths, dtype=np.int64).reshape(-1)
+    if catalog.ndim != 2 or catalog.shape[1] != EVENT_FIELDS:
+        raise ValueError("event catalog has the wrong shape")
+    if catalog.dtype != np.uint8:
+        raise ValueError("event catalog must use uint8 tokens")
+    if len(starts) != len(lengths):
+        raise ValueError("event-history references do not share one sample count")
+    if (starts < 0).any() or (lengths <= 0).any():
+        raise ValueError("event-history references must be positive in-bounds ranges")
+    if (starts + lengths > len(catalog)).any():
+        raise ValueError("event-history reference lies outside the catalog")
+
+
 def save_chunk_archive(
-    path: str | Path, arrays: dict[str, np.ndarray], chunk_samples: int
+    path: str | Path,
+    arrays: dict[str, np.ndarray],
+    chunk_samples: int,
+    *,
+    event_catalog: np.ndarray | None = None,
 ) -> dict[str, object]:
     """Stage one game as independently compressed sample chunks."""
 
     if chunk_samples <= 0:
         raise ValueError("chunk size must be positive")
+    reference_fields = EVENT_REFERENCE_FIELDS.intersection(arrays)
+    if reference_fields and reference_fields != EVENT_REFERENCE_FIELDS:
+        raise ValueError("event histories require both start and length")
+    if reference_fields:
+        if event_catalog is None:
+            raise ValueError("semantic samples require one event catalog")
+        validate_event_references(
+            event_catalog, arrays["history_start"], arrays["history_length"]
+        )
+    elif event_catalog is not None:
+        raise ValueError("event catalog was supplied without sample references")
     packed = pack_shard_arrays(arrays)
     total = _sample_count(packed)
     destinations = Path(path)
@@ -339,6 +398,10 @@ def save_chunk_archive(
     lengths: list[int] = []
     try:
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
+            if event_catalog is not None:
+                event_buffer = io.BytesIO()
+                np.save(event_buffer, np.asarray(event_catalog, dtype=np.uint8))
+                archive.writestr(EVENT_CATALOG_MEMBER, event_buffer.getvalue())
             for member_index, start in enumerate(range(0, total, chunk_samples)):
                 stop = min(total, start + chunk_samples)
                 chunk = {
@@ -368,6 +431,13 @@ def save_chunk_archive(
                 "chunkSamples": chunk_samples,
                 "chunkLengths": lengths,
             }
+            if event_catalog is not None:
+                meta.update(
+                    {
+                        "eventMemorySchema": EVENT_MEMORY_SCHEMA_ID,
+                        "eventCount": len(event_catalog),
+                    }
+                )
             archive.writestr("meta.json", json.dumps(meta, separators=(",", ":")))
         _replace_atomically(temporary, destinations)
     finally:
@@ -386,3 +456,27 @@ def read_chunk_archive_meta(path: str | Path) -> dict[str, object]:
 def read_chunk_payload(path: str | Path, member_index: int) -> bytes:
     with zipfile.ZipFile(Path(path), "r") as archive:
         return archive.read(f"chunk_{member_index:05d}.npz")
+
+
+def read_chunk_event_catalog(path: str | Path) -> np.ndarray | None:
+    """Read a staged game's shared event catalog, or ``None`` for legacy games."""
+
+    meta = read_chunk_archive_meta(path)
+    schema = meta.get("eventMemorySchema")
+    if schema is None:
+        return None
+    if schema != EVENT_MEMORY_SCHEMA_ID:
+        raise ValueError(f"unsupported event-memory schema in {path}")
+    with (
+        zipfile.ZipFile(Path(path), "r") as archive,
+        archive.open(EVENT_CATALOG_MEMBER) as handle,
+    ):
+        catalog = np.load(handle, allow_pickle=False)
+    if len(catalog) != int(meta.get("eventCount", -1)):
+        raise ValueError(f"event catalog count does not match metadata in {path}")
+    validate_event_references(
+        catalog,
+        np.zeros(0, dtype=np.int64),
+        np.zeros(0, dtype=np.int64),
+    )
+    return catalog

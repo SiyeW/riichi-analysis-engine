@@ -23,7 +23,13 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
 from .packing import SUPPORTED_MANIFEST_FORMATS
-from .storage import read_packed_shard, slice_packed, unpack_shard_arrays
+from .semantic_input import materialize_event_memory
+from .storage import (
+    PACK_CATALOG_FIELDS,
+    read_packed_shard,
+    slice_packed,
+    unpack_shard_arrays,
+)
 
 # Provenance the packer records alongside every sample. It stays out of the
 # batches: the model sees observations and targets, nothing else.
@@ -35,6 +41,9 @@ METADATA_FIELDS = frozenset(
         "pack_index",
         "kyoku_index",
         "system_total",
+        "history_start",
+        "history_length",
+        *PACK_CATALOG_FIELDS,
     }
 )
 
@@ -193,6 +202,18 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
     ) -> dict[str, np.ndarray]:
         arrays = unpack_shard_arrays(slice_packed(packed, start, stop))
         _settle_legacy_terminal_scores(arrays)
+        if {"history_start", "history_length"}.issubset(arrays):
+            missing = PACK_CATALOG_FIELDS.difference(arrays)
+            if missing:
+                raise ValueError(f"semantic pack is missing catalog fields: {sorted(missing)}")
+            event_tokens, event_mask = materialize_event_memory(
+                arrays["event_catalog"],
+                arrays["history_start"],
+                arrays["history_length"],
+                arrays["perspective"],
+            )
+            arrays["event_tokens"] = event_tokens
+            arrays["event_mask"] = event_mask
         return {
             name: value for name, value in arrays.items() if name not in METADATA_FIELDS
         }
@@ -201,10 +222,26 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
     def _merge(
         parts: list[dict[str, np.ndarray]],
     ) -> dict[str, np.ndarray]:
-        return {
-            name: np.concatenate([part[name] for part in parts], axis=0)
-            for name in parts[0]
-        }
+        if any(set(part) != set(parts[0]) for part in parts[1:]):
+            raise ValueError("batch fragments do not share one schema")
+        result: dict[str, np.ndarray] = {}
+        event_width = max(
+            (part["event_tokens"].shape[1] for part in parts if "event_tokens" in part),
+            default=0,
+        )
+        for name in parts[0]:
+            values = [part[name] for part in parts]
+            if name in {"event_tokens", "event_mask"}:
+                padded = []
+                for value in values:
+                    width = event_width - value.shape[1]
+                    padding = [(0, 0), (0, width)]
+                    if value.ndim == 3:
+                        padding.append((0, 0))
+                    padded.append(np.pad(value, padding, mode="constant"))
+                values = padded
+            result[name] = np.concatenate(values, axis=0)
+        return result
 
     @staticmethod
     def _torch(arrays: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
