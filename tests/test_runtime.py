@@ -378,6 +378,85 @@ def test_v12_runtime_reconstructs_semantic_contract(tmp_path, monkeypatch) -> No
     assert runtime.model.architecture == architecture
 
 
+def test_v12_kan_selection_reuses_primary_semantic_state() -> None:
+    class FakePlayerState:
+        def __init__(self, player_id: int) -> None:
+            self.player_id = player_id
+
+        def update(self, _event: str) -> SimpleNamespace:
+            return SimpleNamespace()
+
+        @staticmethod
+        def encode_obs(
+            _version: int, at_kan_select: bool
+        ) -> tuple[np.ndarray, np.ndarray]:
+            mask = np.ones(ACTION_SPACE, dtype=bool)
+            if at_kan_select:
+                mask[:] = False
+                mask[0] = True
+            return (
+                np.zeros((MORTAL_OBS_CHANNELS, TILE_TYPES), dtype=np.float32),
+                mask,
+            )
+
+    architecture = SemanticModelArchitecture(
+        backbone="cnn",
+        width=16,
+        stem_width=16,
+        event_width=8,
+        backbone_blocks=1,
+        event_blocks=1,
+        decoder_width=16,
+        attention_heads=4,
+    )
+    runtime = AnalysisRuntime.__new__(AnalysisRuntime)
+    runtime.device = torch.device("cpu")
+    runtime.format_version = 12
+    runtime.model = RiichiAnalysisModel(format_version=12, architecture=architecture)
+    runtime.model.eval()
+    runtime.player_state_type = FakePlayerState
+    backbone_calls = 0
+
+    def count_backbone(_module, _inputs, _output) -> None:
+        nonlocal backbone_calls
+        backbone_calls += 1
+
+    handle = runtime.model.semantic_model.backbone.register_forward_hook(
+        count_backbone
+    )
+    events = [
+        {
+            "type": "start_kyoku",
+            "bakaze": "E",
+            "kyoku": 1,
+            "honba": 0,
+            "kyotaku": 0,
+            "oya": 0,
+            "dora_marker": "1p",
+            "scores": [25_000] * 4,
+            "tehais": [
+                ["1m"] * 4 + ["2m"] * 4 + ["3m"] * 4 + ["4m"],
+                ["?"] * 13,
+                ["?"] * 13,
+                ["?"] * 13,
+            ],
+        }
+    ]
+    requested = [
+        {
+            "id": "action-recommendation",
+            "parameters": {"candidates": [_ankan("kan-1m", "1m")]},
+        }
+    ]
+
+    try:
+        runtime.predict(events, 0, requested, protocol_minor=2)
+    finally:
+        handle.remove()
+
+    assert backbone_calls == 1
+
+
 def test_v8_runtime_emits_constrained_probabilities_and_score_totals() -> None:
     class FakePlayerState:
         def __init__(self, player_id: int) -> None:
