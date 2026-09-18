@@ -1,0 +1,366 @@
+"""Semantic v12 backbones and vectorized structured decoders."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import sqrt
+
+import torch
+from torch import Tensor, nn
+
+from .analysis_observation import PLANE_CHANNELS
+from .architecture import SemanticModelArchitecture
+from .constants import ACTION_SPACE, TILE_TYPES
+from .kyoku_outcome import OUTCOME_COUNT
+from .model_input import POLICY_CONTEXT_CHANNELS, POLICY_CONTEXT_START
+from .physical_tile_features import (
+    PHYSICAL_TILE_TYPES,
+    RED_BASE_TILE_INDICES,
+    physical_dora_features,
+)
+from .prediction_values import DORA_VALUES, SCORE_VALUES
+from .semantic_input import (
+    EVENT_ACTOR,
+    EVENT_CONSUMED_START,
+    EVENT_FIELDS,
+    EVENT_FLAGS,
+    EVENT_TARGET,
+    EVENT_TILE,
+    EVENT_TYPE,
+    MAX_EVENT_CONSUMED,
+    PUBLIC_EVENT_TYPES,
+)
+
+
+@dataclass(frozen=True)
+class SemanticState:
+    tiles: Tensor
+    players: Tensor
+    global_state: Tensor
+    policy_context: Tensor
+
+
+class SemanticInputStem(nn.Module):
+    """Turn audited planes and event fields into entity-aligned tokens."""
+
+    def __init__(self, architecture: SemanticModelArchitecture) -> None:
+        super().__init__()
+        width = architecture.width
+        self.tile_stem = nn.Sequential(
+            nn.Linear(PLANE_CHANNELS, architecture.stem_width),
+            nn.LayerNorm(architecture.stem_width),
+            nn.GELU(),
+            nn.Linear(architecture.stem_width, width),
+        )
+        self.tile_identity = nn.Embedding(PHYSICAL_TILE_TYPES, width)
+        self.dora_attributes = nn.Linear(4, width, bias=False)
+        event_width = architecture.event_width
+        self.event_type = nn.Embedding(len(PUBLIC_EVENT_TYPES) + 1, event_width)
+        self.event_actor = nn.Embedding(5, event_width)
+        self.event_target = nn.Embedding(5, event_width)
+        self.event_tile = nn.Embedding(PHYSICAL_TILE_TYPES + 1, event_width)
+        self.event_flags = nn.Embedding(256, event_width)
+        self.event_output = nn.Sequential(
+            nn.LayerNorm(event_width),
+            nn.Linear(event_width, width),
+        )
+        self.policy_context = nn.Sequential(
+            nn.Linear(POLICY_CONTEXT_CHANNELS, architecture.stem_width),
+            nn.GELU(),
+            nn.Linear(architecture.stem_width, width),
+        )
+
+    def forward(
+        self, observation: Tensor, event_tokens: Tensor, event_mask: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if observation.ndim != 3 or observation.shape[2] != TILE_TYPES:
+            raise ValueError("semantic model received a malformed observation")
+        if observation.shape[1] < POLICY_CONTEXT_START + POLICY_CONTEXT_CHANNELS:
+            raise ValueError("semantic model requires the separated v9 observation")
+        if event_tokens.ndim != 3 or event_tokens.shape[2] != EVENT_FIELDS:
+            raise ValueError("semantic model received malformed event tokens")
+        if event_mask.shape != event_tokens.shape[:2]:
+            raise ValueError("semantic event mask does not match event tokens")
+        if event_tokens.shape[0] != observation.shape[0]:
+            raise ValueError("semantic inputs do not share one batch size")
+
+        analysis = observation[:, :PLANE_CHANNELS]
+        base_tiles = analysis.transpose(1, 2)
+        red_tiles = base_tiles[:, RED_BASE_TILE_INDICES]
+        physical_tiles = torch.cat((base_tiles, red_tiles), dim=1)
+        tile_state = self.tile_stem(physical_tiles)
+        identities = torch.arange(PHYSICAL_TILE_TYPES, device=observation.device)
+        tile_state = tile_state + self.tile_identity(identities).unsqueeze(0)
+        tile_state = tile_state + self.dora_attributes(
+            physical_dora_features(analysis).stacked()
+        )
+
+        fields = event_tokens.long()
+        event_state = (
+            self.event_type(fields[..., EVENT_TYPE])
+            + self.event_actor(fields[..., EVENT_ACTOR])
+            + self.event_target(fields[..., EVENT_TARGET])
+            + self.event_tile(fields[..., EVENT_TILE])
+            + self.event_flags(fields[..., EVENT_FLAGS])
+        )
+        for offset in range(MAX_EVENT_CONSUMED):
+            event_state = event_state + self.event_tile(
+                fields[..., EVENT_CONSUMED_START + offset]
+            )
+        event_state = self.event_output(event_state)
+        event_state = event_state * event_mask.unsqueeze(-1)
+        policy = observation[:, POLICY_CONTEXT_START:].mean(dim=-1)
+        return tile_state, event_state, self.policy_context(policy)
+
+
+class TileGraphBlock(nn.Module):
+    """Relation-aware CNN block without crossing suit and honor boundaries."""
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(width)
+        self.self_projection = nn.Linear(width, width, bias=False)
+        self.neighbor_projection = nn.Linear(width, width, bias=False)
+        self.feed_forward = nn.Sequential(
+            nn.LayerNorm(width),
+            nn.Linear(width, width * 2),
+            nn.GELU(),
+            nn.Linear(width * 2, width),
+        )
+        adjacency = torch.eye(PHYSICAL_TILE_TYPES)
+        for start, stop in ((0, 9), (9, 18), (18, 27), (27, 31), (31, 34)):
+            for tile in range(start, stop):
+                if tile > start:
+                    adjacency[tile, tile - 1] = 1
+                if tile + 1 < stop:
+                    adjacency[tile, tile + 1] = 1
+        for red, base in enumerate(RED_BASE_TILE_INDICES, start=TILE_TYPES):
+            adjacency[red, base] = 1
+            adjacency[base, red] = 1
+        adjacency /= adjacency.sum(dim=-1, keepdim=True)
+        self.register_buffer("adjacency", adjacency)
+
+    def forward(self, value: Tensor) -> Tensor:
+        normalized = self.norm(value)
+        neighbors = torch.einsum("ij,bjd->bid", self.adjacency, normalized)
+        value = value + self.self_projection(normalized) + self.neighbor_projection(
+            neighbors
+        )
+        return value + self.feed_forward(value)
+
+
+class CNNBackbone(nn.Module):
+    def __init__(self, architecture: SemanticModelArchitecture) -> None:
+        super().__init__()
+        width = architecture.width
+        self.tile_blocks = nn.Sequential(
+            *(TileGraphBlock(width) for _ in range(architecture.backbone_blocks))
+        )
+        self.event_blocks = nn.Sequential(
+            *(
+                nn.Sequential(
+                    nn.Conv1d(width, width, 3, padding=1),
+                    nn.GELU(),
+                    nn.Conv1d(width, width, 3, padding=1),
+                )
+                for _ in range(architecture.event_blocks)
+            )
+        )
+        self.player_queries = nn.Parameter(torch.empty(4, width))
+        self.global_query = nn.Parameter(torch.empty(1, width))
+        self.readout = nn.MultiheadAttention(
+            width, architecture.attention_heads, batch_first=True
+        )
+        self.event_fusion = nn.MultiheadAttention(
+            width, architecture.attention_heads, batch_first=True
+        )
+        nn.init.normal_(self.player_queries, std=width**-0.5)
+        nn.init.normal_(self.global_query, std=width**-0.5)
+
+    def forward(
+        self, tiles: Tensor, events: Tensor, event_mask: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        tiles = self.tile_blocks(tiles)
+        event_sequence = events.transpose(1, 2)
+        for block in self.event_blocks:
+            event_sequence = event_sequence + block(event_sequence)
+        events = event_sequence.transpose(1, 2) * event_mask.unsqueeze(-1)
+        batch = len(tiles)
+        queries = torch.cat((self.player_queries, self.global_query), dim=0)
+        queries = queries.unsqueeze(0).expand(batch, -1, -1)
+        entities, _ = self.readout(queries, tiles, tiles, need_weights=False)
+        entities_from_events, _ = self.event_fusion(
+            entities,
+            events,
+            events,
+            key_padding_mask=~event_mask.bool(),
+            need_weights=False,
+        )
+        entities = entities + entities_from_events
+        return tiles, entities[:, :4], entities[:, 4]
+
+
+class DualStreamTransformerBlock(nn.Module):
+    def __init__(self, width: int, heads: int) -> None:
+        super().__init__()
+        self.state_norm = nn.LayerNorm(width)
+        self.event_norm = nn.LayerNorm(width)
+        self.state_attention = nn.MultiheadAttention(width, heads, batch_first=True)
+        self.event_attention = nn.MultiheadAttention(width, heads, batch_first=True)
+        self.cross_attention = nn.MultiheadAttention(width, heads, batch_first=True)
+        self.state_ff = nn.Sequential(
+            nn.LayerNorm(width), nn.Linear(width, width * 4), nn.GELU(), nn.Linear(width * 4, width)
+        )
+        self.event_ff = nn.Sequential(
+            nn.LayerNorm(width), nn.Linear(width, width * 4), nn.GELU(), nn.Linear(width * 4, width)
+        )
+
+    def forward(
+        self, state: Tensor, events: Tensor, event_mask: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        state_norm = self.state_norm(state)
+        state = state + self.state_attention(
+            state_norm, state_norm, state_norm, need_weights=False
+        )[0]
+        event_norm = self.event_norm(events)
+        events = events + self.event_attention(
+            event_norm,
+            event_norm,
+            event_norm,
+            key_padding_mask=~event_mask.bool(),
+            need_weights=False,
+        )[0]
+        events = (events + self.event_ff(events)) * event_mask.unsqueeze(-1)
+        state = state + self.cross_attention(
+            self.state_norm(state),
+            self.event_norm(events),
+            self.event_norm(events),
+            key_padding_mask=~event_mask.bool(),
+            need_weights=False,
+        )[0]
+        return state + self.state_ff(state), events
+
+
+class TransformerBackbone(nn.Module):
+    def __init__(self, architecture: SemanticModelArchitecture) -> None:
+        super().__init__()
+        width = architecture.width
+        self.player_tokens = nn.Parameter(torch.empty(4, width))
+        self.global_token = nn.Parameter(torch.empty(1, width))
+        blocks = max(architecture.backbone_blocks, architecture.event_blocks)
+        self.blocks = nn.ModuleList(
+            DualStreamTransformerBlock(width, architecture.attention_heads)
+            for _ in range(blocks)
+        )
+        nn.init.normal_(self.player_tokens, std=width**-0.5)
+        nn.init.normal_(self.global_token, std=width**-0.5)
+
+    def forward(
+        self, tiles: Tensor, events: Tensor, event_mask: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        batch = len(tiles)
+        state = torch.cat(
+            (
+                tiles,
+                self.player_tokens.unsqueeze(0).expand(batch, -1, -1),
+                self.global_token.unsqueeze(0).expand(batch, -1, -1),
+            ),
+            dim=1,
+        )
+        for block in self.blocks:
+            state, events = block(state, events, event_mask)
+        return (
+            state[:, :PHYSICAL_TILE_TYPES],
+            state[:, PHYSICAL_TILE_TYPES : PHYSICAL_TILE_TYPES + 4],
+            state[:, -1],
+        )
+
+
+class PairwiseLogits(nn.Module):
+    def __init__(self, width: int, hidden: int) -> None:
+        super().__init__()
+        self.left = nn.Linear(width, hidden)
+        self.right = nn.Linear(width, hidden)
+        self.output = nn.Linear(hidden, 1)
+
+    def forward(self, left: Tensor, right: Tensor) -> Tensor:
+        pair = self.left(left).unsqueeze(2) + self.right(right).unsqueeze(1)
+        return self.output(torch.nn.functional.gelu(pair)).squeeze(-1)
+
+
+class StructuredSemanticDecoder(nn.Module):
+    def __init__(self, architecture: SemanticModelArchitecture) -> None:
+        super().__init__()
+        width = architecture.width
+        hidden = architecture.decoder_width
+        self.shanten = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, 7))
+        self.furiten = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, 1))
+        self.wait = PairwiseLogits(width, hidden)
+        self.hidden = PairwiseLogits(width, hidden)
+        self.hidden_red = PairwiseLogits(width, hidden)
+        self.dora = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, len(DORA_VALUES)))
+        self.dora_tail = nn.Linear(width, 1)
+        self.score = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, len(SCORE_VALUES)))
+        self.outcome = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, OUTCOME_COUNT))
+        self.kyoku_accounts = nn.Linear(width, 5)
+        self.placement = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, 24))
+        self.match_score = nn.Linear(width, 4)
+        self.policy_query = nn.Sequential(
+            nn.Linear(width * 2, hidden), nn.GELU(), nn.Linear(hidden, width)
+        )
+        self.action_keys = nn.Embedding(ACTION_SPACE, width)
+
+    def forward(self, state: SemanticState) -> dict[str, Tensor]:
+        opponents = state.players[:, 1:]
+        base_tiles = state.tiles[:, :TILE_TYPES]
+        red_tiles = state.tiles[:, TILE_TYPES:]
+        policy_query = self.policy_query(
+            torch.cat((state.global_state, state.policy_context), dim=-1)
+        )
+        policy = torch.einsum("bd,ad->ba", policy_query, self.action_keys.weight) / sqrt(
+            state.global_state.shape[-1]
+        )
+        return {
+            "shanten": self.shanten(opponents),
+            "furiten_no_yaku": self.furiten(opponents).squeeze(-1),
+            "deal_in_tile": self.wait(opponents, base_tiles),
+            "hidden_source_affinity": self.hidden(state.players, base_tiles),
+            "hidden_red_source": self.hidden_red(red_tiles, state.players),
+            "dora_distribution": self.dora(opponents),
+            "dora_tail": self.dora_tail(opponents).squeeze(-1),
+            "score_distribution": self.score(opponents),
+            "outcome": self.outcome(state.global_state),
+            "kyoku_accounts": self.kyoku_accounts(state.global_state),
+            "placement": self.placement(state.global_state),
+            "match_score": self.match_score(state.global_state),
+            "policy": policy,
+        }
+
+
+class SemanticRiichiModel(nn.Module):
+    """One v12 model contract with interchangeable CNN/Transformer backbones."""
+
+    def __init__(self, architecture: SemanticModelArchitecture) -> None:
+        super().__init__()
+        self.architecture = architecture
+        self.input = SemanticInputStem(architecture)
+        self.backbone: CNNBackbone | TransformerBackbone = (
+            CNNBackbone(architecture)
+            if architecture.backbone == "cnn"
+            else TransformerBackbone(architecture)
+        )
+        self.decoder = StructuredSemanticDecoder(architecture)
+
+    def forward(
+        self, observation: Tensor, event_tokens: Tensor, event_mask: Tensor
+    ) -> dict[str, Tensor]:
+        tiles, events, policy = self.input(observation, event_tokens, event_mask)
+        tiles, players, global_state = self.backbone(tiles, events, event_mask)
+        return self.decoder(
+            SemanticState(
+                tiles=tiles,
+                players=players,
+                global_state=global_state,
+                policy_context=policy,
+            )
+        )

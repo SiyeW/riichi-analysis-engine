@@ -51,7 +51,7 @@ class ModelArchitecture:
     @classmethod
     def from_dict(cls, value: Any) -> ModelArchitecture:
         if not isinstance(value, dict):
-            raise ValueError("model architecture must be an object")
+            raise TypeError("model architecture must be an object")
         expected = set(cls.__dataclass_fields__)
         if set(value) != expected:
             missing = sorted(expected - set(value))
@@ -114,7 +114,7 @@ class StructuredModelArchitecture:
     @classmethod
     def from_dict(cls, value: Any) -> StructuredModelArchitecture:
         if not isinstance(value, dict):
-            raise ValueError("model architecture must be an object")
+            raise TypeError("model architecture must be an object")
         expected = set(cls.__dataclass_fields__)
         if set(value) != expected:
             missing = sorted(expected - set(value))
@@ -125,4 +125,65 @@ class StructuredModelArchitecture:
             )
         if not all(type(item) is int for item in value.values()):
             raise ValueError("model architecture values must be integers")
+        return cls(**value)
+
+
+@dataclass(frozen=True)
+class SemanticModelArchitecture:
+    """Shape of the shared semantic contract used by the v12 candidates.
+
+    CNN and Transformer candidates deliberately share every field except the
+    backbone name. This keeps comparisons on one input, decoder and target
+    contract instead of accidentally comparing two data pipelines.
+    """
+
+    backbone: str = "cnn"
+    observation_version: int = 4
+    width: int = 256
+    stem_width: int = 384
+    event_width: int = 192
+    backbone_blocks: int = 8
+    event_blocks: int = 4
+    decoder_width: int = 512
+    attention_heads: int = 8
+
+    def __post_init__(self) -> None:
+        if self.backbone not in {"cnn", "transformer"}:
+            raise ValueError("semantic backbone must be cnn or transformer")
+        if self.observation_version != 4:
+            raise ValueError("only observation version 4 is supported")
+        positive = {
+            name: value
+            for name, value in asdict(self).items()
+            if name not in {"backbone", "observation_version"}
+        }
+        invalid = [name for name, value in positive.items() if value <= 0]
+        if invalid:
+            raise ValueError(
+                f"architecture dimensions must be positive: {', '.join(invalid)}"
+            )
+        if self.width % self.attention_heads:
+            raise ValueError("semantic width must be divisible by attention heads")
+
+    def to_dict(self) -> dict[str, str | int]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Any) -> SemanticModelArchitecture:
+        if not isinstance(value, dict):
+            raise TypeError("model architecture must be an object")
+        expected = set(cls.__dataclass_fields__)
+        if set(value) != expected:
+            missing = sorted(expected - set(value))
+            extra = sorted(set(value) - expected)
+            raise ValueError(
+                "model architecture fields do not match "
+                f"(missing={missing}, extra={extra})"
+            )
+        if type(value["backbone"]) is not str or not all(
+            type(item) is int
+            for name, item in value.items()
+            if name != "backbone"
+        ):
+            raise ValueError("model architecture values have invalid types")
         return cls(**value)
