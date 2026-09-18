@@ -6,7 +6,11 @@ from functools import partial
 import torch
 from torch import Tensor, nn
 
-from .architecture import ModelArchitecture, StructuredModelArchitecture
+from .architecture import (
+    ModelArchitecture,
+    SemanticModelArchitecture,
+    StructuredModelArchitecture,
+)
 from .constants import ACTION_SPACE, MORTAL_OBS_CHANNELS, OBS_CHANNELS, TILE_TYPES
 from .kyoku_outcome import OUTCOME_COUNT
 from .model_input import (
@@ -28,6 +32,7 @@ from .observation_layout import (
     POLICY_CONTEXT_START as LEGACY_POLICY_CONTEXT_START,
 )
 from .prediction_values import DORA_VALUES, SCORE_VALUES
+from .semantic_model import SemanticRiichiModel
 
 
 class ChannelAttention(nn.Module):
@@ -325,17 +330,46 @@ class RiichiAnalysisModel(nn.Module):
         state_width: int | None = None,
         future_width: int | None = None,
         format_version: int = 8,
-        architecture: ModelArchitecture | StructuredModelArchitecture | None = None,
+        architecture: (
+            ModelArchitecture
+            | StructuredModelArchitecture
+            | SemanticModelArchitecture
+            | None
+        ) = None,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
+        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
             raise ValueError(f"unsupported model format version: {format_version}")
-        if architecture is not None and format_version not in {6, 7, 8, 9, 10, 11}:
+        if architecture is not None and format_version not in {
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+        }:
             raise ValueError(
                 "only model formats v6 and later accept architecture metadata"
             )
         self.format_version = format_version
-        self.architecture: ModelArchitecture | StructuredModelArchitecture | None = None
+        self.architecture: (
+            ModelArchitecture | StructuredModelArchitecture | SemanticModelArchitecture | None
+        ) = None
+        if format_version == 12:
+            if any(
+                value is not None
+                for value in (channels, blocks, state_width, future_width)
+            ):
+                raise ValueError(
+                    "semantic architecture must be configured through its metadata"
+                )
+            configured = architecture or SemanticModelArchitecture()
+            if not isinstance(configured, SemanticModelArchitecture):
+                raise TypeError("model format v12 requires SemanticModelArchitecture")
+            self.architecture = configured
+            self.semantic_model = SemanticRiichiModel(configured)
+            return
         if format_version in {8, 9, 10, 11}:
             if any(
                 value is not None
@@ -547,7 +581,16 @@ class RiichiAnalysisModel(nn.Module):
     def _split(value: Tensor, dimensions: tuple[int, ...]) -> tuple[Tensor, ...]:
         return value.split(dimensions, dim=-1)
 
-    def forward(self, observation: Tensor) -> dict[str, Tensor]:
+    def forward(
+        self,
+        observation: Tensor,
+        event_tokens: Tensor | None = None,
+        event_mask: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        if self.format_version == 12:
+            if event_tokens is None or event_mask is None:
+                raise ValueError("model format v12 requires semantic event memory")
+            return self.semantic_model(observation, event_tokens, event_mask)
         if self.format_version in {9, 10, 11}:
             return self._forward_v9(observation)
         if self.format_version == 8:
@@ -886,6 +929,18 @@ class RiichiAnalysisModel(nn.Module):
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
+    if model.format_version == 12:
+        groups = {
+            "input": model.semantic_model.input,
+            "backbone": model.semantic_model.backbone,
+            "decoder": model.semantic_model.decoder,
+        }
+        counts = {
+            name: sum(parameter.numel() for parameter in module.parameters())
+            for name, module in groups.items()
+        }
+        counts["total"] = sum(parameter.numel() for parameter in model.parameters())
+        return counts
     if model.format_version in {8, 9, 10, 11}:
         groups: dict[str, nn.Module] = {
             "shared": model.shared_trunk,
