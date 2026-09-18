@@ -49,6 +49,14 @@ class _PassivePlayerState:
         )
 
 
+class _CountingPlayerState(_PassivePlayerState):
+    encode_calls = 0
+
+    def encode_obs(self, version: int, kan_select: bool) -> tuple[np.ndarray, np.ndarray]:
+        type(self).encode_calls += 1
+        return super().encode_obs(version, kan_select)
+
+
 def test_conversion_references_one_shared_full_event_catalog() -> None:
     events = [
         {
@@ -79,6 +87,30 @@ def test_conversion_references_one_shared_full_event_catalog() -> None:
     np.testing.assert_array_equal(converted.arrays["history_start"], [0])
     np.testing.assert_array_equal(converted.arrays["history_length"], [1])
     np.testing.assert_array_equal(converted.arrays["analysis_active"], [True])
+
+
+def test_conversion_reuses_each_frame_observation() -> None:
+    events = [
+        {
+            "type": "start_kyoku",
+            "bakaze": "E",
+            "kyoku": 1,
+            "honba": 0,
+            "kyotaku": 0,
+            "oya": 0,
+            "dora_marker": "1m",
+            "scores": [25_000] * 4,
+            "tehais": [[], [], [], []],
+        },
+        {"type": "ryukyoku", "deltas": [0, 0, 0, 0]},
+        {"type": "end_kyoku"},
+        {"type": "end_game"},
+    ]
+    _CountingPlayerState.encode_calls = 0
+
+    convert_game(events, "count-observations", player_state_type=_CountingPlayerState)
+
+    assert _CountingPlayerState.encode_calls == 4
 
 
 def test_conversion_preflight_performs_no_writes(tmp_path) -> None:
