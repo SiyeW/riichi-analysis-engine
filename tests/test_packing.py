@@ -215,6 +215,53 @@ def test_pack_deduplicates_and_rebases_per_game_event_catalogs(scratch: Path) ->
     assert audit["verified"] is True
 
 
+def test_external_storage_check_accepts_deduplicated_event_catalogs(
+    scratch: Path,
+) -> None:
+    """The independent pack checker must understand non-sample catalog arrays."""
+
+    stage = scratch / "stage"
+    for game, tile in enumerate(("1m", "2p")):
+        arrays = sample_arrays(3, kyoku=game)
+        arrays["history_start"] = np.zeros(3, dtype=np.uint32)
+        arrays["history_length"] = np.asarray([1, 2, 3], dtype=np.uint16)
+        catalog = np.stack(
+            [
+                encode_public_event({"type": "start_kyoku", "dora_marker": tile}),
+                encode_public_event({"type": "tsumo", "actor": game, "pai": tile}),
+                encode_public_event({"type": "dahai", "actor": game, "pai": tile}),
+            ]
+        )
+        save_chunk_archive(
+            stage / f"game-{game:06d}.zip",
+            arrays,
+            2,
+            event_catalog=catalog,
+        )
+    paths = staged_games(stage)
+    plan = plan_corpus(paths, 17)
+    output = scratch / "packs"
+    meta, _ = build_pack(
+        paths,
+        output,
+        plan,
+        PackSlot(0, 0, len(plan["length"])),
+        17,
+        None,
+    )
+
+    import importlib.util
+
+    checker_path = Path(__file__).parents[1] / "scripts" / "check_packs.py"
+    spec = importlib.util.spec_from_file_location("check_packs", checker_path)
+    assert spec is not None and spec.loader is not None
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+
+    report = checker.check_one_pack(output / str(meta["pack"]))
+    assert report["samples"] == 6
+
+
 def test_plan_round_trips_through_disk(scratch: Path) -> None:
     plan = plan_corpus(staged_games(stage_corpus(scratch)), 7)
     path = scratch / "nested" / "plan.npz"

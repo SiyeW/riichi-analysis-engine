@@ -25,6 +25,7 @@ import numpy as np
 from riichi_analysis_engine.dataset import PackDataset, read_manifest
 from riichi_analysis_engine.packing import audit_packs, read_plan, staged_games
 from riichi_analysis_engine.storage import (
+    PACK_CATALOG_FIELDS,
     read_chunk_archive_meta,
     read_chunk_payload,
     read_packed_shard,
@@ -86,7 +87,12 @@ def check_one_pack(path: Path) -> dict[str, object]:
                 f"{path.name} holds {len(packed[name])} {name} for {samples} samples"
             )
     for name, value in packed.items():
-        if name.startswith("obs_") or value.ndim == 0 or len(value) == samples:
+        if (
+            name.startswith("obs_")
+            or name in PACK_CATALOG_FIELDS
+            or value.ndim == 0
+            or len(value) == samples
+        ):
             continue
         raise SystemExit(
             f"{path.name} holds {name} with {len(value)} rows for {samples} samples"
