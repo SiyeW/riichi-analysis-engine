@@ -285,7 +285,7 @@ def test_v8_runtime_reconstructs_structured_architecture(tmp_path, monkeypatch) 
     assert runtime.model.architecture == architecture
 
 
-@pytest.mark.parametrize("format_version", [9, 10])
+@pytest.mark.parametrize("format_version", [9, 10, 11])
 def test_runtime_reconstructs_versioned_input_contract(
     tmp_path, monkeypatch, format_version
 ) -> None:
