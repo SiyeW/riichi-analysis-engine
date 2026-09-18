@@ -177,6 +177,7 @@ def pack_directory(
             "packs": entries,
             "modelInputSchema": entries[0]["modelInputSchema"],
             "observationChannels": entries[0]["observationChannels"],
+            "eventMemorySchema": entries[0].get("eventMemorySchema"),
         },
     )
     return output

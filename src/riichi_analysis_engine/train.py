@@ -4,6 +4,7 @@ import argparse
 import atexit
 import hashlib
 import json
+import math
 import os
 import platform
 import random
@@ -19,7 +20,11 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from .architecture import ModelArchitecture, StructuredModelArchitecture
+from .architecture import (
+    ModelArchitecture,
+    SemanticModelArchitecture,
+    StructuredModelArchitecture,
+)
 from .constants import OBS_CHANNELS
 from .dataset import PackDataset
 from .hidden_transport import (
@@ -45,12 +50,16 @@ from .model_input import (
     model_input_metadata,
 )
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
+from .semantic_input import EVENT_MEMORY_SCHEMA_ID, semantic_input_metadata
 from .structured_outputs import (
     conditional_deal_in_probabilities,
     fixed_total_values,
     zero_sum_accounts,
 )
-from .training_schema import validate_v8_training_batch
+from .training_schema import (
+    validate_semantic_training_batch,
+    validate_v8_training_batch,
+)
 
 
 class TrainingInterrupted(Exception):
@@ -188,6 +197,7 @@ def dataset_metadata(root: Path) -> dict[str, object]:
         "sourceGames": manifest.get("sourceGames"),
         "modelInputSchema": manifest.get("modelInputSchema"),
         "observationChannels": manifest.get("observationChannels"),
+        "eventMemorySchema": manifest.get("eventMemorySchema"),
         "verified": audit.get("verified") if isinstance(audit, dict) else None,
         "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
     }
@@ -200,21 +210,33 @@ def validate_dataset_input_contract(
 
     expected_schema = (
         MODEL_INPUT_SCHEMA_ID
-        if model_format in {9, 10, 11}
+        if model_format in {9, 10, 11, 12}
         else LEGACY_MODEL_INPUT_SCHEMA_ID
     )
     expected_channels = (
-        MODEL_INPUT_CHANNELS if model_format in {9, 10, 11} else OBS_CHANNELS
+        MODEL_INPUT_CHANNELS if model_format in {9, 10, 11, 12} else OBS_CHANNELS
     )
     for split, metadata in datasets.items():
         schema = metadata.get("modelInputSchema")
         channels = metadata.get("observationChannels")
         # Manifests written before the explicit metadata fields are v8 by
         # construction. They remain readable only by legacy model formats.
-        if schema is None and channels is None and model_format not in {9, 10, 11}:
+        if schema is None and channels is None and model_format not in {9, 10, 11, 12}:
             continue
         if schema != expected_schema or channels != expected_channels:
             raise RuntimeError(f"{split} dataset uses a different model-input contract")
+        event_schema = metadata.get("eventMemorySchema")
+        if model_format == 12 and event_schema != EVENT_MEMORY_SCHEMA_ID:
+            raise RuntimeError(f"{split} dataset has no compatible event memory")
+
+
+def forward_batch(
+    model: RiichiAnalysisModel, batch: Mapping[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    observation = batch["obs"].float()
+    if model.format_version == 12:
+        return model(observation, batch["event_tokens"], batch["event_mask"])
+    return model(observation)
 
 
 def move_batch(
@@ -277,12 +299,12 @@ def resume_training_cursor(
 
     saved_datasets = checkpoint.get("datasets")
     if not isinstance(saved_datasets, dict):
-        raise RuntimeError("resume checkpoint has no dataset identity")
+        raise TypeError("resume checkpoint has no dataset identity")
     for split in ("train", "validation"):
         saved = saved_datasets.get(split)
         current = datasets.get(split)
         if not isinstance(saved, dict) or not isinstance(current, dict):
-            raise RuntimeError(f"resume checkpoint has no {split} dataset identity")
+            raise TypeError(f"resume checkpoint has no {split} dataset identity")
         saved_digest = saved.get("manifestSha256")
         if not saved_digest or saved_digest != current.get("manifestSha256"):
             raise RuntimeError(f"resume checkpoint uses a different {split} manifest")
@@ -335,7 +357,7 @@ def validate(
         if should_stop is not None and should_stop():
             raise TrainingInterrupted
         batch = move_batch(batch, device)
-        outputs = model(batch["obs"].float())
+        outputs = forward_batch(model, batch)
         total, losses, _active, weights = multitask_loss(outputs, batch, balancer)
         totals["total"] += float(total)
         for name, value in losses.items():
@@ -733,7 +755,7 @@ def write_dashboard(
             tag = name
         else:
             tag = "Validation/" + name
-        if not isinstance(value, float) or value != value:
+        if not isinstance(value, float) or math.isnan(value):
             continue
         writer.add_scalar(tag, value, step)
 
@@ -763,12 +785,12 @@ def capture_random_state() -> dict[str, object]:
 
 def restore_random_state(state: object) -> None:
     if not isinstance(state, dict):
-        raise RuntimeError("resume checkpoint has no random-number state")
+        raise TypeError("resume checkpoint has no random-number state")
     numpy_state = state.get("numpy")
     if not isinstance(numpy_state, dict) or not isinstance(
         numpy_state.get("keys"), torch.Tensor
     ):
-        raise RuntimeError("resume checkpoint has incompatible NumPy random state")
+        raise TypeError("resume checkpoint has incompatible NumPy random state")
     random.setstate(state["python"])
     np.random.set_state(
         (
@@ -791,7 +813,9 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     balancer: LearnedUncertaintyBalancer,
-    architecture: ModelArchitecture | StructuredModelArchitecture,
+    architecture: (
+        ModelArchitecture | StructuredModelArchitecture | SemanticModelArchitecture
+    ),
     *,
     step: int,
     samples_seen: int,
@@ -822,7 +846,12 @@ def save_checkpoint(
             "modelArchitecture": architecture.to_dict(),
             **(
                 {"modelInput": model_input_metadata()}
-                if model.format_version in {9, 10, 11}
+                if model.format_version in {9, 10, 11, 12}
+                else {}
+            ),
+            **(
+                {"semanticInput": semantic_input_metadata()}
+                if model.format_version == 12
                 else {}
             ),
             "optimizer": optimizer.state_dict(),
@@ -856,7 +885,7 @@ def main() -> None:
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(
-        "--model-format", type=int, choices=(7, 8, 9, 10, 11), default=11
+        "--model-format", type=int, choices=(7, 8, 9, 10, 11, 12), default=11
     )
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
@@ -875,6 +904,14 @@ def main() -> None:
     parser.add_argument("--policy-context-blocks", type=int, default=6)
     parser.add_argument("--policy-context-width", type=int, default=384)
     parser.add_argument("--policy-width", type=int, default=1024)
+    parser.add_argument("--semantic-backbone", choices=("cnn", "transformer"), default="cnn")
+    parser.add_argument("--semantic-width", type=int, default=256)
+    parser.add_argument("--semantic-stem-width", type=int, default=384)
+    parser.add_argument("--semantic-event-width", type=int, default=192)
+    parser.add_argument("--semantic-backbone-blocks", type=int, default=8)
+    parser.add_argument("--semantic-event-blocks", type=int, default=4)
+    parser.add_argument("--semantic-decoder-width", type=int, default=512)
+    parser.add_argument("--semantic-attention-heads", type=int, default=8)
     parser.add_argument(
         "--analysis-channels", type=int, default=288, help=argparse.SUPPRESS
     )
@@ -959,12 +996,24 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
     amp_dtype = torch.float16 if device.type == "cuda" else None
 
-    if args.model_format in {8, 9, 10, 11}:
+    if args.model_format == 12:
+        architecture = SemanticModelArchitecture(
+            backbone=args.semantic_backbone,
+            width=args.semantic_width,
+            stem_width=args.semantic_stem_width,
+            event_width=args.semantic_event_width,
+            backbone_blocks=args.semantic_backbone_blocks,
+            event_blocks=args.semantic_event_blocks,
+            decoder_width=args.semantic_decoder_width,
+            attention_heads=args.semantic_attention_heads,
+        )
+        available_loss_terms = LOSS_TERMS_V8
+    elif args.model_format in {8, 9, 10, 11}:
         family_latent_width = args.family_latent_width or (
             1024 if args.model_format == 11 else 768
         )
         task_width = args.task_width or (1024 if args.model_format == 11 else 512)
-        architecture: ModelArchitecture | StructuredModelArchitecture = (
+        architecture = (
             StructuredModelArchitecture(
                 shared_channels=args.shared_channels,
                 shared_blocks=args.shared_blocks,
@@ -1048,12 +1097,17 @@ def main() -> None:
         if checkpoint.get("modelArchitecture") != architecture.to_dict():
             raise RuntimeError("resume checkpoint uses a different model architecture")
         if (
-            args.model_format in {9, 10, 11}
+            args.model_format in {9, 10, 11, 12}
             and checkpoint.get("modelInput") != model_input_metadata()
         ):
             raise RuntimeError(
                 "resume checkpoint uses a different model-input contract"
             )
+        if (
+            args.model_format == 12
+            and checkpoint.get("semanticInput") != semantic_input_metadata()
+        ):
+            raise RuntimeError("resume checkpoint uses a different semantic-input contract")
         if checkpoint.get("predictionValues") != {
             "dora": list(DORA_VALUES),
             "score": list(SCORE_VALUES),
@@ -1136,7 +1190,12 @@ def main() -> None:
         fixture = next(iter(validation_loader))
     except StopIteration:
         fixture = None
-    if args.model_format in {8, 9, 10, 11}:
+    if args.model_format in {8, 9, 10, 11, 12}:
+        validate_fixture = (
+            validate_semantic_training_batch
+            if args.model_format == 12
+            else validate_v8_training_batch
+        )
         if args.validate_only:
             saved_contract = checkpoint.get("trainingContract")
             training_contract = (
@@ -1145,7 +1204,7 @@ def main() -> None:
                 else {
                     "train": None,
                     "validation": (
-                        validate_v8_training_batch(
+                        validate_fixture(
                             fixture, require_analysis_active=args.model_format >= 10
                         )
                         if fixture is not None
@@ -1159,11 +1218,11 @@ def main() -> None:
             except StopIteration as error:
                 raise RuntimeError("training data contains no samples") from error
             training_contract = {
-                "train": validate_v8_training_batch(
+                "train": validate_fixture(
                     train_fixture, require_analysis_active=args.model_format >= 10
                 ),
                 "validation": (
-                    validate_v8_training_batch(
+                    validate_fixture(
                         fixture, require_analysis_active=args.model_format >= 10
                     )
                     if fixture is not None
@@ -1281,7 +1340,7 @@ def main() -> None:
                 if diagnose_gradients:
                     outputs, shared = model.forward_with_shared(batch["obs"].float())
                 else:
-                    outputs = model(batch["obs"].float())
+                    outputs = forward_batch(model, batch)
                 total, losses, active, weights = multitask_loss(
                     outputs, batch, balancer
                 )
@@ -1491,7 +1550,7 @@ def main() -> None:
         # One fixed input, probed every validation: a metric can look steady
         # while the behaviour behind it drifts.
         with torch.no_grad():
-            probe = model(fixture["obs"].float().to(device))
+            probe = forward_batch(model, move_batch(fixture, device))
             policy = probe["policy"][0].softmax(-1)
             top = policy.topk(3)
             for rank, (value, action) in enumerate(

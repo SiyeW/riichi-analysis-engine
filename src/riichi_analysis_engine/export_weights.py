@@ -9,10 +9,15 @@ from pathlib import Path
 
 import torch
 
-from .architecture import ModelArchitecture, StructuredModelArchitecture
+from .architecture import (
+    ModelArchitecture,
+    SemanticModelArchitecture,
+    StructuredModelArchitecture,
+)
 from .model import RiichiAnalysisModel, count_parameters
 from .model_input import model_input_metadata
 from .prediction_values import DORA_VALUES, SCORE_VALUES
+from .semantic_input import semantic_input_metadata
 
 
 def sha256(path: Path) -> str:
@@ -79,14 +84,19 @@ def main() -> None:
         "riichi-analysis-model-v9": 9,
         "riichi-analysis-model-v10": 10,
         "riichi-analysis-model-v11": 11,
+        "riichi-analysis-model-v12": 12,
     }
     if model_format not in formats:
         raise RuntimeError("checkpoint has an unsupported format")
     format_version = formats[model_format]
-    architecture: ModelArchitecture | StructuredModelArchitecture | None = None
-    if format_version in {6, 7, 8, 9, 10, 11}:
+    architecture: (
+        ModelArchitecture | StructuredModelArchitecture | SemanticModelArchitecture | None
+    ) = None
+    if format_version in {6, 7, 8, 9, 10, 11, 12}:
         architecture_type = (
-            StructuredModelArchitecture
+            SemanticModelArchitecture
+            if format_version == 12
+            else StructuredModelArchitecture
             if format_version in {8, 9, 10, 11}
             else ModelArchitecture
         )
@@ -141,11 +151,16 @@ def main() -> None:
         },
         "training": training,
     }
-    if format_version in {9, 10, 11}:
+    if format_version in {9, 10, 11, 12}:
         expected_input = model_input_metadata()
         if checkpoint.get("modelInput") != expected_input:
             raise RuntimeError("checkpoint uses a different model-input contract")
         payload["architecture"]["modelInput"] = expected_input
+    if format_version == 12:
+        expected_semantic_input = semantic_input_metadata()
+        if checkpoint.get("semanticInput") != expected_semantic_input:
+            raise RuntimeError("checkpoint uses a different semantic-input contract")
+        payload["architecture"]["semanticInput"] = expected_semantic_input
     if format_version >= 2:
         prediction_values = {
             "dora": list(DORA_VALUES),

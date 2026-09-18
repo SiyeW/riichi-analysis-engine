@@ -10,7 +10,20 @@ from test_dataset import pack_directory
 
 from riichi_analysis_engine.dataset import PackDataset
 from riichi_analysis_engine.observation_layout import JIKAZE_CHANNEL, WIND_TILE_START
-from riichi_analysis_engine.training_schema import validate_v8_training_batch
+from riichi_analysis_engine.semantic_input import (
+    EVENT_ACTOR,
+    EVENT_TILE,
+    EVENT_TYPE,
+    PUBLIC_EVENT_TYPE_TO_ID,
+)
+from riichi_analysis_engine.train import (
+    dataset_metadata,
+    validate_dataset_input_contract,
+)
+from riichi_analysis_engine.training_schema import (
+    validate_semantic_training_batch,
+    validate_v8_training_batch,
+)
 
 
 @pytest.fixture()
@@ -58,3 +71,31 @@ def test_v10_training_schema_requires_the_analysis_row_mask(scratch) -> None:
     batch["analysis_active"] = batch["policy"] >= 0
     result = validate_v8_training_batch(batch, require_analysis_active=True)
     assert result["analysisSamples"] == int(batch["analysis_active"].sum())
+
+
+def test_v12_training_schema_validates_masked_event_memory(scratch) -> None:
+    packs = pack_directory(
+        scratch,
+        training_targets=True,
+        model_format=11,
+        semantic_history=True,
+    )
+    batch = next(iter(PackDataset(packs, batch_size=4)))
+
+    result = validate_semantic_training_batch(batch)
+    metadata = dataset_metadata(packs)
+    validate_dataset_input_contract({"validation": metadata}, 12)
+
+    assert result["samples"] == 4
+    assert result["eventTokens"] == int(batch["event_mask"].sum())
+    assert 1 <= result["maxEventHistory"] <= 3
+
+    opponent_draw = (
+        (batch["event_tokens"][..., EVENT_TYPE] == PUBLIC_EVENT_TYPE_TO_ID["tsumo"])
+        & (batch["event_tokens"][..., EVENT_ACTOR] != 1)
+        & batch["event_mask"]
+    )
+    if opponent_draw.any():
+        batch["event_tokens"][..., EVENT_TILE][opponent_draw] = 2
+        with pytest.raises(ValueError, match="leaked"):
+            validate_semantic_training_batch(batch)

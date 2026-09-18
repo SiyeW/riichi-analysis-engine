@@ -6,6 +6,7 @@ import torch
 
 from riichi_analysis_engine.architecture import (
     ModelArchitecture,
+    SemanticModelArchitecture,
     StructuredModelArchitecture,
 )
 from riichi_analysis_engine.constants import (
@@ -27,6 +28,7 @@ from riichi_analysis_engine.runtime import (
     complete_candidate_policy,
 )
 from riichi_analysis_engine.score_state import PublicScoreState
+from riichi_analysis_engine.semantic_input import semantic_input_metadata
 
 
 def test_candidate_action_mapping() -> None:
@@ -333,6 +335,46 @@ def test_runtime_reconstructs_versioned_input_contract(
     runtime = AnalysisRuntime(checkpoint, "cpu")
 
     assert runtime.format_version == format_version
+    assert runtime.model.architecture == architecture
+
+
+def test_v12_runtime_reconstructs_semantic_contract(tmp_path, monkeypatch) -> None:
+    architecture = SemanticModelArchitecture(
+        backbone="transformer",
+        width=16,
+        stem_width=24,
+        event_width=12,
+        backbone_blocks=1,
+        event_blocks=1,
+        decoder_width=20,
+        attention_heads=4,
+    )
+    checkpoint = tmp_path / "weights-v12.pt"
+    torch.save(
+        {
+            "format": "riichi-analysis-model-v12",
+            "model": RiichiAnalysisModel(
+                format_version=12, architecture=architecture
+            ).state_dict(),
+            "architecture": {
+                "model": architecture.to_dict(),
+                "modelInput": model_input_metadata(),
+                "semanticInput": semantic_input_metadata(),
+                "predictionValues": {
+                    "dora": list(DORA_VALUES),
+                    "score": list(SCORE_VALUES),
+                },
+            },
+        },
+        checkpoint,
+    )
+    monkeypatch.setattr(
+        "riichi_analysis_engine.runtime._load_player_state", lambda: object
+    )
+
+    runtime = AnalysisRuntime(checkpoint, "cpu")
+
+    assert runtime.format_version == 12
     assert runtime.model.architecture == architecture
 
 

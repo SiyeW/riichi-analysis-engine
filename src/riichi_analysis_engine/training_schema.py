@@ -28,6 +28,15 @@ from .prediction_values import (
     NON_DEALER_SCORE_VALUE_SET,
     SCORE_VALUE_SET,
 )
+from .semantic_input import (
+    EVENT_ACTOR,
+    EVENT_FIELDS,
+    EVENT_TARGET,
+    EVENT_TILE,
+    EVENT_TYPE,
+    PUBLIC_EVENT_TYPE_TO_ID,
+    PUBLIC_EVENT_TYPES,
+)
 
 V8_TRAINING_FIELDS = frozenset(
     {
@@ -50,6 +59,7 @@ V8_TRAINING_FIELDS = frozenset(
         "match_score",
     }
 )
+SEMANTIC_TRAINING_FIELDS = frozenset({"event_tokens", "event_mask"})
 
 
 def _fail(message: str) -> None:
@@ -233,4 +243,50 @@ def validate_v8_training_batch(
             if analysis_active is not None
             else {}
         ),
+    }
+
+
+def validate_semantic_training_batch(
+    batch: Mapping[str, Tensor], *, require_analysis_active: bool = True
+) -> dict[str, int]:
+    """Validate the v12 event-memory extension without weakening v8 targets."""
+
+    result = validate_v8_training_batch(
+        batch, require_analysis_active=require_analysis_active
+    )
+    missing = sorted(SEMANTIC_TRAINING_FIELDS.difference(batch))
+    if missing:
+        _fail(f"missing fields: {', '.join(missing)}")
+    tokens = _shape(batch, "event_tokens", (batch["event_tokens"].shape[1], EVENT_FIELDS))
+    mask = _shape(batch, "event_mask", (tokens.shape[1],))
+    if len(tokens) != result["samples"]:
+        _fail("event memory batch length differs from obs")
+    if not ((mask == 0) | (mask == 1)).all():
+        _fail("event_mask must be binary")
+    mask = mask.bool()
+    if not mask.any(dim=1).all():
+        _fail("every semantic sample must retain at least one public event")
+    if (tokens[~mask] != 0).any():
+        _fail("padded event tokens must be zero")
+    valid = tokens[mask].long()
+    if ((valid[:, EVENT_TYPE] < 1) | (valid[:, EVENT_TYPE] > len(PUBLIC_EVENT_TYPES))).any():
+        _fail("event memory contains an unsupported event type")
+    for field in (EVENT_ACTOR, EVENT_TARGET):
+        if ((valid[:, field] < 0) | (valid[:, field] > 4)).any():
+            _fail("event memory contains an invalid player reference")
+    if ((valid[:, EVENT_TILE] < 0) | (valid[:, EVENT_TILE] > 37)).any():
+        _fail("event memory contains an invalid physical tile reference")
+    if not (
+        tokens[:, 0, EVENT_TYPE] == PUBLIC_EVENT_TYPE_TO_ID["start_kyoku"]
+    ).all():
+        _fail("event memory must begin at start_kyoku")
+    opponent_draw = (
+        tokens[..., EVENT_TYPE] == PUBLIC_EVENT_TYPE_TO_ID["tsumo"]
+    ) & (tokens[..., EVENT_ACTOR] != 1) & mask
+    if (tokens[..., EVENT_TILE][opponent_draw] != 0).any():
+        _fail("opponent draw identity leaked into semantic event memory")
+    return {
+        **result,
+        "eventTokens": int(mask.sum()),
+        "maxEventHistory": int(mask.sum(dim=1).max()),
     }
