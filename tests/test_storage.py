@@ -180,6 +180,7 @@ def test_chunk_archive_round_trip(scratch: Path) -> None:
 
     assert meta["samples"] == 20
     assert meta["chunkLengths"] == [16, 4]
+    assert meta["compressionLevel"] == 1
     assert read_chunk_archive_meta(path)["chunkLengths"] == [16, 4]
 
     parts = []
@@ -192,6 +193,17 @@ def test_chunk_archive_round_trip(scratch: Path) -> None:
     np.testing.assert_allclose(restored["obs"], arrays["obs"], rtol=0, atol=5e-4)
     for name in ("action_mask", "policy", "perspective", "event_index", "kyoku_index"):
         np.testing.assert_array_equal(restored[name], arrays[name])
+
+
+def test_chunk_archive_uses_requested_compression_level(scratch: Path) -> None:
+    arrays = sample_arrays(4)
+    path = scratch / "game-000000.zip"
+
+    meta = save_chunk_archive(path, arrays, 2, compression_level=0)
+
+    assert meta["compressionLevel"] == 0
+    with pytest.raises(ValueError, match="compression level"):
+        save_chunk_archive(scratch / "invalid.zip", arrays, 2, compression_level=10)
 
 
 def test_chunk_archive_stores_one_shared_event_catalog(scratch: Path) -> None:

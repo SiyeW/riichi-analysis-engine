@@ -217,14 +217,12 @@ def convert_game(
         event: dict[str, Any],
         perspective: int,
         exact_targets: np.ndarray,
+        mortal_observation: Any,
+        action_mask: Any,
         *,
         policy: int,
-        kan_select: bool,
         analysis_active: bool,
     ) -> None:
-        mortal_observation, action_mask = states[perspective].encode_obs(
-            OBS_VERSION, kan_select
-        )
         observation = compose_model_input(
             analysis_encoder.encode(event, perspective),
             extract_policy_context(mortal_observation),
@@ -270,9 +268,13 @@ def convert_game(
             raise RuntimeError(f"missing exact targets at {source_id}:{index}")
 
         sampled: set[int] = set()
+        encoded: dict[int, tuple[Any, Any]] = {}
         analysis_perspective = passive_perspective(source_id, index)
         for perspective, cans in enumerate(candidates):
-            _obs, mask = states[perspective].encode_obs(OBS_VERSION, False)
+            mortal_observation, mask = states[perspective].encode_obs(
+                OBS_VERSION, False
+            )
+            encoded[perspective] = (mortal_observation, mask)
             if not bool(mask.any()):
                 continue
             policy, kan_tile = action_label(
@@ -285,30 +287,37 @@ def convert_game(
                 event,
                 perspective,
                 exact_targets,
+                mortal_observation,
+                mask,
                 policy=policy,
-                kan_select=False,
                 analysis_active=perspective == analysis_perspective,
             )
             sampled.add(perspective)
             if kan_tile is not None:
+                kan_observation, kan_mask = states[perspective].encode_obs(
+                    OBS_VERSION, True
+                )
                 append_sample(
                     index,
                     event,
                     perspective,
                     exact_targets,
+                    kan_observation,
+                    kan_mask,
                     policy=kan_tile,
-                    kan_select=True,
                     analysis_active=False,
                 )
 
         if analysis_perspective not in sampled:
+            mortal_observation, mask = encoded[analysis_perspective]
             append_sample(
                 index,
                 event,
                 analysis_perspective,
                 exact_targets,
+                mortal_observation,
+                mask,
                 policy=-1,
-                kan_select=False,
                 analysis_active=True,
             )
 
@@ -333,6 +342,7 @@ def convert_record_to_archive(
     mortal_python_root: str,
     overwrite: bool,
     chunk_samples: int,
+    compression_level: int,
 ) -> tuple[int, str, int, str | None]:
     """Stage one game as independently compressed sample chunks."""
 
@@ -365,6 +375,7 @@ def convert_record_to_archive(
             converted.arrays,
             chunk_samples,
             event_catalog=converted.event_catalog,
+            compression_level=compression_level,
         )
         return record_index, record["sourceId"], int(meta["samples"]), None
     except Exception as error:  # noqa: BLE001 -- one malformed game must not stop a batch
@@ -385,6 +396,7 @@ def main() -> None:
     )
     parser.add_argument("--label-source-root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--chunk-samples", type=int, default=16)
+    parser.add_argument("--compression-level", type=int, choices=range(10), default=1)
     parser.add_argument("--max-games", type=int, default=0)
     parser.add_argument("--start-game", type=int, default=0)
     parser.add_argument("--end-game", type=int, default=0)
@@ -428,9 +440,47 @@ def main() -> None:
     start = time.perf_counter()
     output_root = str(args.output.resolve())
     jobs = [
-        (index, record, output_root, mortal_root, args.overwrite, args.chunk_samples)
+        (
+            index,
+            record,
+            output_root,
+            mortal_root,
+            args.overwrite,
+            args.chunk_samples,
+            args.compression_level,
+        )
         for index, record in indexed_records
     ]
+
+    summary_path = args.output / args.summary_name
+
+    def write_summary(status: str, completed: int) -> dict[str, Any]:
+        summary = {
+            "format": "riichi-analysis-staged-games-v1",
+            "status": status,
+            "manifest": metadata,
+            "requestedGames": len(indexed_records),
+            "completedGames": completed,
+            "convertedGames": converted_games,
+            "convertedSamples": converted_samples,
+            "chunkSamples": args.chunk_samples,
+            "compressionLevel": args.compression_level,
+            "workers": args.workers,
+            "failures": failures,
+            "elapsedSeconds": time.perf_counter() - start,
+        }
+        temporary = summary_path.with_name(
+            f".{summary_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, summary_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return summary
 
     def collect(result: tuple[int, str, int, str | None]) -> None:
         nonlocal converted_games, converted_samples
@@ -447,40 +497,51 @@ def main() -> None:
             f"converted {completed}/{len(indexed_records)} games; "
             f"samples={converted_samples}; failures={len(failures)}"
         )
+        write_summary("running", completed)
 
-    if args.workers > 1:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as pool:
-            futures = [pool.submit(convert_record_to_archive, *job) for job in jobs]
-            for completed, future in enumerate(
-                concurrent.futures.as_completed(futures), start=1
-            ):
-                collect(future.result())
-                if (
-                    completed == 1
-                    or completed % 25 == 0
-                    or completed == len(indexed_records)
-                ):
+    completed = 0
+    try:
+        if args.workers > 1:
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=args.workers
+            ) as pool:
+                job_iter = iter(jobs)
+                pending: set[
+                    concurrent.futures.Future[tuple[int, str, int, str | None]]
+                ] = set()
+
+                def fill_pending() -> None:
+                    while len(pending) < args.workers * 2:
+                        try:
+                            job = next(job_iter)
+                        except StopIteration:
+                            break
+                        pending.add(pool.submit(convert_record_to_archive, *job))
+
+                fill_pending()
+                while pending:
+                    done, pending = concurrent.futures.wait(
+                        pending,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    for future in done:
+                        collect(future.result())
+                        completed += 1
+                        if completed == 1 or completed % 25 == 0:
+                            report(completed)
+                    fill_pending()
+                if completed and completed % 25:
                     report(completed)
-    else:
-        for completed, job in enumerate(jobs, start=1):
-            collect(convert_record_to_archive(*job))
-            if completed % 25 == 0 or completed == len(indexed_records):
-                report(completed)
+        else:
+            for completed, job in enumerate(jobs, start=1):
+                collect(convert_record_to_archive(*job))
+                if completed % 25 == 0 or completed == len(indexed_records):
+                    report(completed)
+    except KeyboardInterrupt:
+        write_summary("interrupted", completed)
+        raise
 
-    summary = {
-        "format": "riichi-analysis-staged-games-v1",
-        "manifest": metadata,
-        "requestedGames": len(indexed_records),
-        "convertedGames": converted_games,
-        "convertedSamples": converted_samples,
-        "chunkSamples": args.chunk_samples,
-        "workers": args.workers,
-        "failures": failures,
-        "elapsedSeconds": time.perf_counter() - start,
-    }
-    (args.output / args.summary_name).write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    summary = write_summary("failed" if failures else "complete", completed)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if failures:
         raise SystemExit(1)

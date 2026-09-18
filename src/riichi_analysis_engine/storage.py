@@ -193,6 +193,27 @@ def _temporary_sibling(destination: Path) -> Path:
     )
 
 
+def _compressed_npz_bytes(
+    arrays: dict[str, np.ndarray], compression_level: int
+) -> bytes:
+    """Serialize an NPZ with an explicit, reproducible zlib level."""
+
+    if not 0 <= compression_level <= 9:
+        raise ValueError("compression level must be in 0..9")
+    payload = io.BytesIO()
+    with zipfile.ZipFile(
+        payload,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=compression_level,
+    ) as archive:
+        for name, value in arrays.items():
+            member = io.BytesIO()
+            np.save(member, np.asarray(value), allow_pickle=False)
+            archive.writestr(f"{name}.npy", member.getvalue())
+    return payload.getvalue()
+
+
 def _replace_atomically(source: Path, destination: Path, attempts: int = 8) -> None:
     """Replace a file despite brief Windows sharing violations at the destination."""
 
@@ -374,11 +395,14 @@ def save_chunk_archive(
     chunk_samples: int,
     *,
     event_catalog: np.ndarray | None = None,
+    compression_level: int = 1,
 ) -> dict[str, object]:
     """Stage one game as independently compressed sample chunks."""
 
     if chunk_samples <= 0:
         raise ValueError("chunk size must be positive")
+    if not 0 <= compression_level <= 9:
+        raise ValueError("compression level must be in 0..9")
     reference_fields = EVENT_REFERENCE_FIELDS.intersection(arrays)
     if reference_fields and reference_fields != EVENT_REFERENCE_FIELDS:
         raise ValueError("event histories require both start and length")
@@ -419,9 +443,10 @@ def save_chunk_archive(
                 offsets = packed["obs_offsets"][start : stop + 1]
                 chunk["obs_offsets"] = offsets - offsets[0]
                 chunk["obs_values"] = packed["obs_values"][int(offsets[0]) : int(offsets[-1])]
-                buffer = io.BytesIO()
-                np.savez_compressed(buffer, **chunk)
-                archive.writestr(f"chunk_{member_index:05d}.npz", buffer.getvalue())
+                archive.writestr(
+                    f"chunk_{member_index:05d}.npz",
+                    _compressed_npz_bytes(chunk, compression_level),
+                )
                 lengths.append(stop - start)
             meta: dict[str, object] = {
                 "format": STAGED_GAME_FORMAT,
@@ -430,6 +455,7 @@ def save_chunk_archive(
                 "samples": total,
                 "chunkSamples": chunk_samples,
                 "chunkLengths": lengths,
+                "compressionLevel": compression_level,
             }
             if event_catalog is not None:
                 meta.update(
