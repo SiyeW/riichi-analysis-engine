@@ -33,6 +33,7 @@ from riichi_analysis_engine.packing import (
     staged_games,
     write_manifest,
 )
+from riichi_analysis_engine.semantic_input import encode_public_event
 from riichi_analysis_engine.storage import save_chunk_archive
 
 
@@ -63,6 +64,7 @@ def pack_directory(
     pack_samples: int = 32,
     training_targets: bool = False,
     model_format: int = 8,
+    semantic_history: bool = False,
 ) -> Path:
     """Stage a corpus, pack it, and return the pack directory."""
 
@@ -124,7 +126,37 @@ def pack_directory(
             )
             if model_format >= 10:
                 arrays["analysis_active"] = np.ones(count, dtype=bool)
-        save_chunk_archive(stage / f"game-{game:06d}.zip", arrays, samples)
+        if semantic_history:
+            catalog = np.stack(
+                [
+                    encode_public_event(
+                        {"type": "start_kyoku", "dora_marker": "1m"}
+                    ),
+                    encode_public_event(
+                        {"type": "tsumo", "actor": game % 4, "pai": "5mr"}
+                    ),
+                    encode_public_event(
+                        {
+                            "type": "dahai",
+                            "actor": game % 4,
+                            "pai": "5mr",
+                            "tsumogiri": True,
+                        }
+                    ),
+                ]
+            )
+            arrays["history_start"] = np.zeros(count, dtype=np.uint32)
+            arrays["history_length"] = (
+                np.arange(count, dtype=np.uint16) % len(catalog) + 1
+            )
+            save_chunk_archive(
+                stage / f"game-{game:06d}.zip",
+                arrays,
+                samples,
+                event_catalog=catalog,
+            )
+        else:
+            save_chunk_archive(stage / f"game-{game:06d}.zip", arrays, samples)
 
     output = root / "packs"
     paths = staged_games(stage)
@@ -175,6 +207,28 @@ def test_multibyte_unsigned_targets_are_promoted_at_the_torch_boundary() -> None
 
     assert batch["score"].dtype == torch.int64
     assert batch["shanten"].dtype == torch.uint8
+
+
+def test_semantic_event_history_is_materialized_and_padded_per_batch(
+    scratch: Path,
+) -> None:
+    root = pack_directory(
+        scratch,
+        games=2,
+        chunks=2,
+        samples=2,
+        pack_samples=3,
+        semantic_history=True,
+    )
+
+    batches = collect(PackDataset(root, batch_size=3))
+
+    assert [len(batch["policy"]) for batch in batches] == [3, 3, 2]
+    assert all(batch["event_tokens"].shape[:2] == batch["event_mask"].shape for batch in batches)
+    lengths = np.concatenate([batch["event_mask"].sum(axis=1) for batch in batches])
+    assert sorted(lengths.tolist()) == sorted([1, 2, 3, 1] * 2)
+    assert all("history_start" not in batch for batch in batches)
+    assert all("event_catalog" not in batch for batch in batches)
 
 
 def test_legacy_terminal_score_migration_awards_pool_to_absolute_first_place() -> None:

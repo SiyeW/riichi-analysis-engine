@@ -74,7 +74,7 @@ def encode_public_event(event: dict[str, Any]) -> np.ndarray:
 
     consumed = event.get("consumed", [])
     if not isinstance(consumed, list):
-        raise ValueError("event consumed tiles must be a list")
+        raise TypeError("event consumed tiles must be a list")
     if len(consumed) > MAX_EVENT_CONSUMED:
         raise ValueError("event contains too many consumed tiles")
     for offset, tile in enumerate(consumed):
@@ -167,4 +167,3 @@ def semantic_input_metadata() -> dict[str, object]:
         "physicalTileTypes": len(TILE37_TO_ACTION),
         "players": PLAYERS,
     }
-

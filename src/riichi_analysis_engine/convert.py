@@ -6,6 +6,7 @@ import json
 import sys
 import time
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,14 @@ from .replay import (
     read_events,
     rotated_future,
 )
+from .semantic_input import EVENT_MEMORY_SCHEMA_ID, PublicEventHistoryEncoder
 from .storage import STAGED_GAME_FORMAT, read_chunk_archive_meta, save_chunk_archive
+
+
+@dataclass(frozen=True)
+class ConvertedGame:
+    arrays: dict[str, np.ndarray]
+    event_catalog: np.ndarray
 
 
 def read_manifest(path: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
@@ -92,15 +100,18 @@ def convert_game(
     source_id: str,
     *,
     player_state_type: Any,
-) -> dict[str, np.ndarray]:
+) -> ConvertedGame:
     annotations = annotate_game(events)
     full_state = FullState()
     public_state = PublicHistoryState()
     analysis_encoder = IncrementalTilePlaneEncoder()
     exact_tracker = ExactTargetTracker()
+    event_history = PublicEventHistoryEncoder()
     states = [player_state_type(player) for player in range(4)]
     samples: dict[str, list[Any]] = {}
     kyoku_index = -1
+    history_start = -1
+    history_length = 0
 
     def append_sample(
         event_index: int,
@@ -137,6 +148,8 @@ def convert_game(
             "perspective": np.uint8(perspective),
             "event_index": np.int32(event_index),
             "kyoku_index": np.int32(kyoku_index),
+            "history_start": np.uint32(history_start),
+            "history_length": np.uint16(history_length),
             **targets,
         }
         for name, value in values.items():
@@ -152,6 +165,7 @@ def convert_game(
         exact_targets = exact_tracker.process(event, states)
         if event["type"] not in FRAME_EVENTS:
             continue
+        history_start, history_length = event_history.advance(event)
         analysis_encoder.advance(event, public_state)
         if exact_targets is None:
             raise RuntimeError(f"missing exact targets at {source_id}:{index}")
@@ -210,7 +224,7 @@ def convert_game(
         raise RuntimeError(
             f"analysis supervision is not one row per frame in {source_id}"
         )
-    return arrays
+    return ConvertedGame(arrays=arrays, event_catalog=event_history.array())
 
 
 def convert_record_to_archive(
@@ -230,6 +244,7 @@ def convert_record_to_archive(
             if (
                 meta.get("format") == STAGED_GAME_FORMAT
                 and meta.get("modelInputSchema") == MODEL_INPUT_SCHEMA_ID
+                and meta.get("eventMemorySchema") == EVENT_MEMORY_SCHEMA_ID
             ):
                 return record_index, record["sourceId"], int(meta["samples"]), None
             destination.unlink()
@@ -241,12 +256,17 @@ def convert_record_to_archive(
 
     try:
         events = read_events(record["path"])
-        arrays = convert_game(
+        converted = convert_game(
             events,
             record["sourceId"],
             player_state_type=PlayerState,
         )
-        meta = save_chunk_archive(destination, arrays, chunk_samples)
+        meta = save_chunk_archive(
+            destination,
+            converted.arrays,
+            chunk_samples,
+            event_catalog=converted.event_catalog,
+        )
         return record_index, record["sourceId"], int(meta["samples"]), None
     except Exception as error:  # noqa: BLE001 -- one malformed game must not stop a batch
         return record_index, record["sourceId"], 0, repr(error)

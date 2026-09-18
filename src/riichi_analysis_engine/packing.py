@@ -30,12 +30,16 @@ from pathlib import Path
 import numpy as np
 
 from .constants import OBS_CHANNELS
+from .semantic_input import EVENT_MEMORY_SCHEMA_ID
 from .storage import (
+    PACK_CATALOG_FIELDS,
     SUPPORTED_STORAGE_FORMATS,
     concatenate_packed,
     normalize_packed_metadata,
     permute_packed,
     read_chunk_archive_meta,
+    read_chunk_event_catalog,
+    validate_event_references,
     write_packed_shard,
 )
 
@@ -364,6 +368,7 @@ def build_pack(
         last_game=int(combined["source_game"][-1]),
     )
     permuted = permute_packed(combined, order)
+    _attach_event_catalogs(game_paths, plan, slot, permuted)
     permuted["pack_index"] = np.full(len(order), slot.index, dtype=np.uint32)
     name = f"pack-{slot.index:05d}.npz"
     write_packed_shard(output / name, permuted)
@@ -378,6 +383,66 @@ def build_pack(
         "observationChannels": int(permuted["obs_channels"].item()),
     }
     return meta, int(permuted["source_game"][-1])
+
+
+def _attach_event_catalogs(
+    game_paths: list[Path],
+    plan: dict[str, np.ndarray],
+    slot: PackSlot,
+    packed: dict[str, np.ndarray],
+) -> None:
+    """Make one pack self-contained without duplicating event prefixes per sample."""
+
+    source_games = plan["source_game"][slot.start : slot.stop]
+    if "source_path" in plan:
+        path_indices = plan["source_path"][slot.start : slot.stop]
+    else:
+        offset = int(plan.get("game_offset", np.asarray(0)))
+        path_indices = source_games - offset
+    path_by_game: dict[int, int] = {}
+    for game, path_index in zip(source_games.tolist(), path_indices.tolist(), strict=True):
+        previous = path_by_game.setdefault(int(game), int(path_index))
+        if previous != int(path_index):
+            raise ValueError(f"source game {game} resolves to multiple staged archives")
+
+    catalogs = {
+        game: read_chunk_event_catalog(game_paths[path_index])
+        for game, path_index in sorted(path_by_game.items())
+    }
+    present = {game: catalog is not None for game, catalog in catalogs.items()}
+    if not any(present.values()):
+        if {"history_start", "history_length"}.intersection(packed):
+            raise ValueError("semantic samples have no staged event catalog")
+        return
+    if not all(present.values()):
+        raise ValueError("one pack mixes staged games with and without event catalogs")
+    if not {"history_start", "history_length"}.issubset(packed):
+        raise ValueError("staged event catalogs have no sample references")
+
+    games = np.asarray(sorted(catalogs), dtype=np.uint32)
+    offsets = np.zeros(len(games) + 1, dtype=np.uint64)
+    pieces: list[np.ndarray] = []
+    game_offsets: dict[int, int] = {}
+    for index, game in enumerate(games.tolist()):
+        catalog = catalogs[game]
+        assert catalog is not None
+        game_offsets[game] = int(offsets[index])
+        pieces.append(catalog)
+        offsets[index + 1] = offsets[index] + len(catalog)
+    catalog = np.concatenate(pieces, axis=0)
+    starts = packed["history_start"].astype(np.uint64, copy=True)
+    for game, offset in game_offsets.items():
+        starts[packed["source_game"] == game] += offset
+    validate_event_references(catalog, starts, packed["history_length"])
+    packed.update(
+        {
+            "history_start": starts,
+            "event_memory_schema": np.asarray(EVENT_MEMORY_SCHEMA_ID),
+            "event_catalog": catalog,
+            "event_catalog_games": games,
+            "event_catalog_offsets": offsets,
+        }
+    )
 
 
 def write_manifest(path: Path, payload: dict[str, object]) -> None:
@@ -424,6 +489,46 @@ def audit_packs(
                 if "obs_channels" in source.files
                 else OBS_CHANNELS
             )
+            catalog_fields = PACK_CATALOG_FIELDS.intersection(source.files)
+            if catalog_fields:
+                if catalog_fields != PACK_CATALOG_FIELDS:
+                    raise ValueError(f"{name} has an incomplete event catalog")
+                event_schema = (
+                    source["event_memory_schema"].item()
+                    if "event_memory_schema" in source.files
+                    else ""
+                )
+                if event_schema != EVENT_MEMORY_SCHEMA_ID:
+                    raise ValueError(f"{name} has an unsupported event-memory schema")
+                catalog = source["event_catalog"]
+                catalog_games = source["event_catalog_games"]
+                catalog_offsets = source["event_catalog_offsets"]
+                starts = source["history_start"]
+                lengths = source["history_length"]
+                validate_event_references(catalog, starts, lengths)
+                if len(catalog_offsets) != len(catalog_games) + 1:
+                    raise ValueError(f"{name} has invalid event-catalog offsets")
+                if int(catalog_offsets[0]) != 0 or int(catalog_offsets[-1]) != len(catalog):
+                    raise ValueError(f"{name} event-catalog offsets do not cover the catalog")
+                if len(np.unique(catalog_games)) != len(catalog_games):
+                    raise ValueError(f"{name} repeats a game in its event catalog")
+                game_bounds = {
+                    int(game): (int(catalog_offsets[i]), int(catalog_offsets[i + 1]))
+                    for i, game in enumerate(catalog_games.tolist())
+                }
+                for game in np.unique(games).tolist():
+                    if int(game) not in game_bounds:
+                        raise ValueError(f"{name} omits source game {game} from its event catalog")
+                    lower, upper = game_bounds[int(game)]
+                    selected = games == game
+                    if (starts[selected] < lower).any() or (
+                        starts[selected] + lengths[selected] > upper
+                    ).any():
+                        raise ValueError(
+                            f"{name} has an event-history reference outside source game {game}"
+                        )
+            elif {"history_start", "history_length"}.intersection(source.files):
+                raise ValueError(f"{name} has event references without a catalog")
         if input_schema is None:
             input_schema = pack_schema
             observation_channels = pack_channels

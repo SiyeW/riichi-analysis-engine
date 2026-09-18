@@ -12,6 +12,7 @@ from riichi_analysis_engine.model_input import (
     MODEL_INPUT_CHANNELS,
     MODEL_INPUT_SCHEMA_ID,
 )
+from riichi_analysis_engine.semantic_input import encode_public_event
 from riichi_analysis_engine.storage import (
     PackedObservations,
     concatenate_packed,
@@ -21,6 +22,7 @@ from riichi_analysis_engine.storage import (
     pack_shard_arrays,
     permute_packed,
     read_chunk_archive_meta,
+    read_chunk_event_catalog,
     read_chunk_payload,
     save_chunk_archive,
     slice_packed,
@@ -190,6 +192,44 @@ def test_chunk_archive_round_trip(scratch: Path) -> None:
     np.testing.assert_allclose(restored["obs"], arrays["obs"], rtol=0, atol=5e-4)
     for name in ("action_mask", "policy", "perspective", "event_index", "kyoku_index"):
         np.testing.assert_array_equal(restored[name], arrays[name])
+
+
+def test_chunk_archive_stores_one_shared_event_catalog(scratch: Path) -> None:
+    arrays = sample_arrays(3)
+    catalog = np.stack(
+        [
+            encode_public_event({"type": "start_kyoku", "dora_marker": "1m"}),
+            encode_public_event({"type": "tsumo", "actor": 0, "pai": "5mr"}),
+            encode_public_event({"type": "dahai", "actor": 0, "pai": "5mr"}),
+        ]
+    )
+    arrays["history_start"] = np.zeros(3, dtype=np.uint32)
+    arrays["history_length"] = np.asarray([1, 2, 3], dtype=np.uint16)
+    path = scratch / "game-000000.zip"
+
+    meta = save_chunk_archive(path, arrays, 2, event_catalog=catalog)
+
+    assert meta["eventCount"] == 3
+    np.testing.assert_array_equal(read_chunk_event_catalog(path), catalog)
+    with np.load(io.BytesIO(read_chunk_payload(path, 1)), allow_pickle=False) as source:
+        assert "event_catalog" not in source.files
+        np.testing.assert_array_equal(source["history_length"], [3])
+
+
+def test_semantic_samples_reject_missing_or_out_of_bounds_catalogs(scratch: Path) -> None:
+    arrays = sample_arrays(1)
+    arrays["history_start"] = np.asarray([0], dtype=np.uint32)
+    arrays["history_length"] = np.asarray([2], dtype=np.uint16)
+    catalog = np.stack(
+        [encode_public_event({"type": "start_kyoku", "dora_marker": "1m"})]
+    )
+
+    with pytest.raises(ValueError, match="require one event catalog"):
+        save_chunk_archive(scratch / "missing.zip", arrays, 1)
+    with pytest.raises(ValueError, match="outside"):
+        save_chunk_archive(
+            scratch / "outside.zip", arrays, 1, event_catalog=catalog
+        )
 
 
 def test_concurrent_archive_writers_do_not_share_a_temporary_file(scratch: Path) -> None:
