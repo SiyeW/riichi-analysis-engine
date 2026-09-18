@@ -12,6 +12,7 @@ from riichi_analysis_engine.physical_tile_features import (
     PHYSICAL_TILE_TYPES,
     dora_tile_index,
     physical_dora_features,
+    physical_red_features,
 )
 
 
@@ -81,3 +82,18 @@ def test_physical_dora_features_reject_the_combined_model_input() -> None:
     with pytest.raises(ValueError, match="public-history"):
         physical_dora_features(torch.zeros(1, PLANE_CHANNELS + 1, TILE_TYPES))
 
+
+def test_red_five_public_facts_are_localized_to_red_entities() -> None:
+    observation = torch.zeros(1, PLANE_CHANNELS, TILE_TYPES)
+    observation[:, PLANE_CHANNEL_INDEX["hand_red_m"], :] = 1
+    observation[:, PLANE_CHANNEL_INDEX["river_p2_red_p"], :] = 1
+    observation[:, PLANE_CHANNEL_INDEX["current_tile_red_s"], :] = 1
+
+    features = physical_red_features(observation)
+
+    assert features.shape == (1, PHYSICAL_TILE_TYPES, 7)
+    assert torch.count_nonzero(features[:, :TILE_TYPES]) == 0
+    assert features[0, 34, 0] == 1
+    assert features[0, 35, 4] == 1
+    assert features[0, 36, 6] == 1
+    assert torch.count_nonzero(features) == 3

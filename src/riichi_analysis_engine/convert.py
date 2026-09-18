@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
+import os
 import sys
 import time
 import zipfile
@@ -46,6 +48,103 @@ def read_manifest(path: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
     if not rows or "manifest" not in rows[0]:
         raise ValueError(f"{path} does not start with manifest metadata")
     return rows[0]["manifest"], rows[1:]
+
+
+def preflight_conversion(
+    manifest_path: Path,
+    output: Path,
+    *,
+    start_game: int,
+    end_game: int,
+    max_games: int,
+) -> tuple[dict[str, Any], list[dict[str, str]], dict[str, object]]:
+    """Validate conversion identity and paths without creating any output."""
+
+    metadata, records = read_manifest(manifest_path)
+    if not isinstance(metadata, dict):
+        raise TypeError("manifest metadata must be an object")
+    source_ids: set[str] = set()
+    source_order: list[str] = []
+    missing: list[str] = []
+    zip_members: dict[Path, set[str]] = {}
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise TypeError(f"manifest record {index} must be an object")
+        source_id = record.get("sourceId")
+        source = record.get("path")
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError(f"manifest record {index} has no sourceId")
+        if source_id in source_ids:
+            raise ValueError(f"manifest repeats sourceId {source_id!r}")
+        source_ids.add(source_id)
+        source_order.append(source_id)
+        if not isinstance(source, str) or not source:
+            raise ValueError(f"manifest record {index} has no source path")
+        if source.startswith("zip://"):
+            locator = source[6:]
+            if "!" not in locator:
+                raise ValueError(f"manifest record {index} has an invalid zip path")
+            archive_name, member = locator.split("!", 1)
+            if not member:
+                raise ValueError(f"manifest record {index} has no zip member")
+            physical = Path(archive_name)
+            zip_members.setdefault(physical, set()).add(member)
+        else:
+            physical = Path(source)
+        if not physical.is_file():
+            missing.append(str(physical))
+    if missing:
+        example = ", ".join(missing[:3])
+        raise FileNotFoundError(
+            f"manifest references {len(missing)} missing source files; first: {example}"
+        )
+    for archive_path, expected_members in zip_members.items():
+        with zipfile.ZipFile(archive_path) as archive:
+            absent = expected_members.difference(archive.namelist())
+        if absent:
+            example = min(absent)
+            raise FileNotFoundError(
+                f"manifest references {len(absent)} missing members in "
+                f"{archive_path}; first: {example}"
+            )
+    selected_count = metadata.get("selectedCount")
+    if selected_count is not None and int(selected_count) != len(records):
+        raise ValueError("manifest selectedCount does not match its records")
+    selection_hash = metadata.get("selectionHash")
+    actual_hash = hashlib.sha256("\n".join(source_order).encode()).hexdigest()
+    if selection_hash is not None and selection_hash != actual_hash:
+        raise ValueError("manifest selectionHash does not match its source order")
+    stop = end_game or len(records)
+    if not 0 <= start_game <= stop <= len(records):
+        raise ValueError("game range is outside the manifest")
+    if max_games < 0:
+        raise ValueError("maximum games must be non-negative")
+    if max_games > 0:
+        stop = min(stop, start_game + max_games)
+    resolved_output = output.resolve()
+    if resolved_output.exists() and not resolved_output.is_dir():
+        raise NotADirectoryError(f"conversion output is not a directory: {resolved_output}")
+    write_boundary = resolved_output if resolved_output.exists() else resolved_output.parent
+    if not write_boundary.exists():
+        ancestor = write_boundary
+        while not ancestor.exists() and ancestor != ancestor.parent:
+            ancestor = ancestor.parent
+        if not os.access(ancestor, os.W_OK):
+            raise PermissionError(f"output ancestor is not writable: {ancestor}")
+    elif not os.access(write_boundary, os.W_OK):
+        raise PermissionError(f"output boundary is not writable: {write_boundary}")
+    return metadata, records, {
+        "format": "riichi-analysis-conversion-preflight-v1",
+        "manifest": str(manifest_path.resolve()),
+        "output": str(resolved_output),
+        "manifestGames": len(records),
+        "selectedGames": stop - start_game,
+        "startGame": start_game,
+        "endGame": stop,
+        "sourceIdsUnique": True,
+        "sourceFilesPresent": True,
+        "writesPerformed": False,
+    }
 
 
 def _sample_targets(
@@ -293,6 +392,11 @@ def main() -> None:
     parser.add_argument("--summary-name", default="summary.json")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="validate the manifest, runtime and output boundary without writing",
+    )
     args = parser.parse_args()
 
     mortal_root = str(args.mortal_python_root.resolve())
@@ -302,13 +406,18 @@ def main() -> None:
     # once, at the command boundary, instead of once per submitted game.
     __import__("libriichi.state")
 
-    metadata, records = read_manifest(args.manifest)
-    start_game = args.start_game
-    end_game = args.end_game or len(records)
-    if not 0 <= start_game <= end_game <= len(records):
-        raise ValueError("game range is outside the manifest")
-    if args.max_games > 0:
-        end_game = min(end_game, start_game + args.max_games)
+    metadata, records, preflight = preflight_conversion(
+        args.manifest,
+        args.output,
+        start_game=args.start_game,
+        end_game=args.end_game,
+        max_games=args.max_games,
+    )
+    if args.preflight_only:
+        print(json.dumps(preflight, ensure_ascii=False, indent=2))
+        return
+    start_game = int(preflight["startGame"])
+    end_game = int(preflight["endGame"])
     indexed_records = list(enumerate(records[start_game:end_game], start=start_game))
     if args.reverse:
         indexed_records.reverse()

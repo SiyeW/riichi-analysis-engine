@@ -18,6 +18,15 @@ from .constants import RED_TILES, TILE_TYPES, TILES_37
 
 PHYSICAL_TILE_TYPES = len(TILES_37)
 RED_BASE_TILE_INDICES = (4, 13, 22)
+RED_ENTITY_FEATURE_NAMES = (
+    "hand",
+    "dora_indicator",
+    "river_p0",
+    "river_p1",
+    "river_p2",
+    "river_p3",
+    "current_tile",
+)
 
 
 def dora_tile_index(marker: int) -> int:
@@ -123,5 +132,37 @@ def physical_dora_features(analysis_observation: Tensor) -> PhysicalDoraFeatures
     )
 
 
-assert PHYSICAL_TILE_TYPES == TILE_TYPES + len(RED_TILES)
+def physical_red_features(analysis_observation: Tensor) -> Tensor:
+    """Attach broadcast red-five facts to their three physical entities.
 
+    The proven 34-axis encoder broadcasts these flags because it has no red
+    tile positions. A semantic model must not ask a learned layer to recover
+    which physical five owns them, so this boundary localizes every
+    suit-specific public flag before the first projection.
+    """
+
+    if analysis_observation.ndim != 3 or tuple(analysis_observation.shape[1:]) != (
+        PLANE_CHANNELS,
+        TILE_TYPES,
+    ):
+        raise ValueError(
+            "physical red features require a batched public-history observation"
+        )
+    result = analysis_observation.new_zeros(
+        len(analysis_observation), PHYSICAL_TILE_TYPES, len(RED_ENTITY_FEATURE_NAMES)
+    )
+    for suit_index, suit in enumerate("mps"):
+        channels = [
+            PLANE_CHANNEL_INDEX[f"hand_red_{suit}"],
+            PLANE_CHANNEL_INDEX[f"dora_indicator_red_{suit}"],
+            *(
+                PLANE_CHANNEL_INDEX[f"river_p{player}_red_{suit}"]
+                for player in range(4)
+            ),
+            PLANE_CHANNEL_INDEX[f"current_tile_red_{suit}"],
+        ]
+        result[:, TILE_TYPES + suit_index] = analysis_observation[:, channels, 0]
+    return result
+
+
+assert PHYSICAL_TILE_TYPES == TILE_TYPES + len(RED_TILES)
