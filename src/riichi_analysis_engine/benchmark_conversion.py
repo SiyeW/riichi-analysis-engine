@@ -24,7 +24,7 @@ from typing import Any
 from .storage import read_chunk_archive_meta
 
 BENCHMARK_FORMAT = "riichi-analysis-conversion-benchmark-v1"
-DEFAULT_CASES = ("1:1", "2:1", "4:1", "2:6")
+DEFAULT_MAX_WORKERS = 16
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,25 @@ def parse_case(value: str) -> BenchmarkCase:
     if not 0 <= compression_level <= 9:
         raise argparse.ArgumentTypeError("case compression must be in 0..9")
     return BenchmarkCase(workers, compression_level)
+
+
+def default_cases(
+    max_games: int, logical_cpu_count: int | None = None
+) -> list[BenchmarkCase]:
+    """Use a bounded power-of-two ladder, then compare normal compression."""
+
+    limit = min(
+        max_games,
+        logical_cpu_count or 1,
+        DEFAULT_MAX_WORKERS,
+    )
+    cases: list[BenchmarkCase] = []
+    workers = 1
+    while workers <= limit:
+        cases.append(BenchmarkCase(workers, 1))
+        workers *= 2
+    cases.append(BenchmarkCase(cases[-1].workers, 6))
+    return cases
 
 
 def _sha256(path: Path) -> str:
@@ -128,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--mortal-python-root", type=Path, required=True)
-    parser.add_argument("--max-games", type=int, default=4)
+    parser.add_argument("--max-games", type=int, default=16)
     parser.add_argument("--start-game", type=int, default=0)
     parser.add_argument("--chunk-samples", type=int, default=16)
     parser.add_argument(
@@ -136,8 +155,9 @@ def parse_args() -> argparse.Namespace:
         action="append",
         type=parse_case,
         help=(
-            "WORKERS:COMPRESSION; repeat to choose cases "
-            f"(default: {', '.join(DEFAULT_CASES)})"
+            "WORKERS:COMPRESSION; repeat to choose cases (default: a power-of-two "
+            "worker ladder through min(max-games, logical CPUs, 16), then level 6 "
+            "compression at the largest worker count)"
         ),
     )
     parser.add_argument(
@@ -163,7 +183,7 @@ def main() -> None:
         raise FileExistsError(f"benchmark output root is not empty: {output_root}")
     output_root.mkdir(parents=True, exist_ok=True)
     report_path = output_root / "benchmark.json"
-    cases = args.case or [parse_case(value) for value in DEFAULT_CASES]
+    cases = args.case or default_cases(args.max_games, os.cpu_count())
     if len({case.key for case in cases}) != len(cases):
         raise ValueError("benchmark cases must be unique")
     report: dict[str, Any] = {
