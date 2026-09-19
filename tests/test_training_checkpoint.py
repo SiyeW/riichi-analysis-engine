@@ -78,6 +78,8 @@ def test_v8_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> 
     assert payload["modelArchitecture"] == architecture.to_dict()
     assert payload["analysisSamplesSeen"] == 12
     assert payload["lossBalancer"]["terms"] == list(LOSS_TERMS_V8)
+    assert payload["learningRateSchedule"] is None
+    assert payload["resumeAllowed"] is True
     assert payload["trainingCursor"] == {
         "type": "single-pass-v1",
         "nextSample": 20,
