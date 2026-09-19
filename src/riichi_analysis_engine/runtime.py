@@ -58,7 +58,6 @@ from .semantic_input import (
     semantic_input_metadata,
 )
 from .structured_outputs import (
-    conditional_deal_in_probabilities,
     fixed_total_values,
     zero_sum_accounts,
 )
@@ -562,17 +561,16 @@ class AnalysisRuntime:
 
         shanten = outputs["shanten"].softmax(-1).numpy()
         furiten = outputs["furiten_no_yaku"].sigmoid().numpy()
-        waits = (
-            conditional_deal_in_probabilities(outputs).numpy()
-            if self.format_version >= 8
-            else outputs["deal_in_tile"].sigmoid().numpy()
-        )
+        waits = outputs["deal_in_tile"].sigmoid().numpy()
         for index, seat in enumerate(opponents):
             shanten[index], waits[index] = apply_opponent_rule_certainties(
                 shanten[index],
                 waits[index],
                 is_riichi=rule_state.riichi[seat],
                 forbidden_tiles=rule_state.forbidden_tiles[seat],
+                furiten_no_yaku_probability=(
+                    furiten[index] if self.format_version >= 8 else None
+                ),
             )
         results["opponent-shanten"] = {
             "players": [

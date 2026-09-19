@@ -336,12 +336,22 @@ def apply_opponent_rule_certainties(
     *,
     is_riichi: bool,
     forbidden_tiles: set[str],
+    furiten_no_yaku_probability: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Apply public certainties before composing an absolute deal-in risk.
+
+    ``wait_probabilities`` are conditional legal-wait probabilities when
+    ``furiten_no_yaku_probability`` is supplied, and already-absolute risks for
+    legacy models otherwise.
+    """
+
     shanten = np.asarray(shanten_probabilities, dtype=np.float64).copy()
     waits = np.asarray(wait_probabilities, dtype=np.float64).copy()
     if is_riichi:
         shanten.fill(0.0)
         shanten[0] = 1.0
+    if furiten_no_yaku_probability is not None:
+        waits *= shanten[0] * (1.0 - float(furiten_no_yaku_probability))
     for index, tile in enumerate(TILES_34):
         if tile in forbidden_tiles:
             waits[index] = 0.0
