@@ -1,0 +1,580 @@
+"""Global mixing of staged games into training packs.
+
+Conversion stages each game as independently compressed chunks. Training reads
+the packs once, in order, so the corpus has to be mixed when it is written
+rather than every time it is read.
+
+The order is produced in two steps. A seeded permutation visits the staged
+chunks of the whole corpus in one random order, which by itself already makes
+two neighbours from the same game unlikely. Then each pack is rearranged so
+that every source game inside it is spread as evenly as possible, which turns
+that likelihood into a guarantee and matters most when the corpus is small
+enough that one pack holds many chunks of the same game.
+
+Both steps are deterministic, so the same staged corpus always yields the same
+order, and :func:`audit_packs` re-derives the invariants from the written packs
+so training can refuse to start on an order that violates them.
+"""
+
+from __future__ import annotations
+
+import heapq
+import io
+import json
+import re
+import zipfile
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+from .constants import OBS_CHANNELS
+from .semantic_input import EVENT_MEMORY_SCHEMA_ID
+from .storage import (
+    PACK_CATALOG_FIELDS,
+    SUPPORTED_STORAGE_FORMATS,
+    concatenate_packed,
+    normalize_packed_metadata,
+    permute_packed,
+    read_chunk_archive_meta,
+    read_chunk_event_catalog,
+    validate_event_references,
+    write_packed_shard,
+)
+
+PLAN_FORMAT = "riichi-analysis-global-plan-v2"
+MANIFEST_FORMAT = "riichi-analysis-global-manifest-v2"
+LEGACY_PLAN_FORMATS = frozenset({"riichi-analysis-global-plan-v1"})
+LEGACY_MANIFEST_FORMATS = frozenset({"riichi-analysis-global-manifest-v1"})
+SUPPORTED_MANIFEST_FORMATS = frozenset({MANIFEST_FORMAT, *LEGACY_MANIFEST_FORMATS})
+_STAGED_GAME_NAME = re.compile(r"game-(\d+)\.zip")
+
+
+@dataclass(frozen=True)
+class PackSlot:
+    """One contiguous run of the globally permuted chunk order."""
+
+    index: int
+    start: int
+    stop: int
+
+
+def staged_games(stage: Path) -> list[Path]:
+    """Return the staged game archives in a stable order."""
+
+    paths = sorted(stage.glob("game-*.zip"), key=staged_game_number)
+    if not paths:
+        raise FileNotFoundError(f"no staged games under {stage}")
+    identifiers = [staged_game_number(path) for path in paths]
+    if len(identifiers) != len(set(identifiers)):
+        raise ValueError(f"duplicate staged-game number under {stage}")
+    return paths
+
+
+def staged_game_number(path: Path) -> int:
+    """Read the stable source-game number from one staged archive name."""
+
+    match = _STAGED_GAME_NAME.fullmatch(path.name)
+    if match is None:
+        raise ValueError(f"invalid staged-game archive name: {path.name}")
+    return int(match.group(1))
+
+
+def plan_corpus(
+    game_paths: list[Path], seed: int, game_offset: int = 0
+) -> dict[str, np.ndarray]:
+    """Enumerate every staged chunk and apply one seeded permutation.
+
+    The number in each ``game-N.zip`` name is the stable source identity.  An
+    optional offset is only an explicit translation for a stage whose archive
+    names start at zero; missing archives must never renumber the games after
+    them.
+    """
+
+    games: list[int] = []
+    members: list[int] = []
+    lengths: list[int] = []
+    path_indices: list[int] = []
+    for path_index, path in enumerate(game_paths):
+        source_game = staged_game_number(path) + game_offset
+        chunk_lengths = [int(value) for value in read_chunk_archive_meta(path)["chunkLengths"]]
+        games.extend([source_game] * len(chunk_lengths))
+        path_indices.extend([path_index] * len(chunk_lengths))
+        members.extend(range(len(chunk_lengths)))
+        lengths.extend(chunk_lengths)
+    if not lengths:
+        raise ValueError("staged games contain no chunks")
+    order = np.random.default_rng(seed).permutation(len(lengths))
+    return {
+        "game_offset": np.asarray(game_offset, dtype=np.uint32),
+        "source_game": np.asarray(games, dtype=np.uint32)[order],
+        # File lookup is independent of source identity.  This is what keeps a
+        # recoverable conversion failure from shifting every later game.
+        "source_path": np.asarray(path_indices, dtype=np.uint32)[order],
+        "source_member": np.asarray(members, dtype=np.uint16)[order],
+        "length": np.asarray(lengths, dtype=np.uint16)[order],
+    }
+
+
+def write_plan(path: Path, plan: dict[str, np.ndarray]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(handle, format=np.asarray(PLAN_FORMAT), **plan)
+    temporary.replace(path)
+
+
+def read_plan(path: Path) -> dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=False) as source:
+        arrays = {name: source[name] for name in source.files}
+    format_name = arrays.pop("format").item()
+    if format_name != PLAN_FORMAT and format_name not in LEGACY_PLAN_FORMATS:
+        raise ValueError(f"unsupported plan format in {path}")
+    return arrays
+
+
+def pack_slots(lengths: np.ndarray, pack_samples: int) -> list[PackSlot]:
+    """Split the permuted chunk order into packs of roughly equal sample count."""
+
+    if pack_samples <= 0:
+        raise ValueError("pack size must be positive")
+    if len(lengths) == 0:
+        raise ValueError("the plan holds no chunks")
+    slots: list[PackSlot] = []
+    start = 0
+    running = 0
+    for index, length in enumerate(lengths):
+        if running >= pack_samples and index > start:
+            slots.append(PackSlot(len(slots), start, index))
+            start = index
+            running = 0
+        running += int(length)
+    slots.append(PackSlot(len(slots), start, len(lengths)))
+    return slots
+
+
+def seam_game(plan: dict[str, np.ndarray], slot: PackSlot) -> int | None:
+    """The source game the pack before this one ended on, if there is one."""
+
+    if slot.start == 0:
+        return None
+    return int(plan["source_game"][slot.start - 1])
+
+
+def nonadjacent_order(
+    source_game: np.ndarray,
+    seed: int,
+    forbidden_first: int | None = None,
+    last_game: int | None = None,
+) -> np.ndarray:
+    """Order the samples so that every source game is spread evenly.
+
+    Each game is given a spacing of total/count samples and is served at its
+    earliest due position. Serving by due position rather than by remaining
+    count is what keeps a game that contributes more samples than the others
+    from clustering at the front of the pack. A game that is due but is also
+    the previous sample is deferred by one position, which makes two neighbours
+    from the same game impossible rather than merely unlikely.
+
+    One case overrides the due position: as soon as a single game holds half of
+    the samples that are left, every second sample has to be one of its own, so
+    that game is served whenever it comes due at all. Without that rule a pack
+    can run out of partners for its largest game and end with two of its
+    samples next to each other.
+
+    `last_game` reserves the final position for one sample of that game, which
+    is how the seam between two packs is kept safe: the next pack then knows
+    what to avoid from the plan alone, without waiting for this pack.
+    """
+
+    rng = np.random.default_rng(seed)
+    indices_by_game: dict[int, list[int]] = {}
+    for game in np.unique(source_game):
+        indices = np.flatnonzero(source_game == game)
+        rng.shuffle(indices)
+        indices_by_game[int(game)] = indices.astype(int).tolist()
+
+    reserved: int | None = None
+    if last_game is not None and indices_by_game.get(int(last_game)):
+        reserved = indices_by_game[int(last_game)].pop()
+        if not indices_by_game[int(last_game)]:
+            del indices_by_game[int(last_game)]
+
+    order: list[int] = []
+    for attempt in range(16):
+        groups = {game: list(indices) for game, indices in indices_by_game.items()}
+        order = _spread_order(groups, source_game, seed + attempt, forbidden_first)
+        # The reserved sample goes last, so the sample before it must not come
+        # from the same game. Re-running with another shuffle is cheaper than
+        # steering the tail of the schedule, and it almost never happens: the
+        # chance is one game's share of the pack.
+        if reserved is None or not order or int(source_game[order[-1]]) != int(last_game):
+            break
+    else:
+        raise RuntimeError(f"cannot keep the pack's last sample away from game {last_game}")
+
+    if reserved is not None:
+        order.append(reserved)
+    return np.asarray(order, dtype=np.int64)
+
+
+def _spread_order(
+    groups: dict[int, list[int]],
+    source_game: np.ndarray,
+    seed: int,
+    forbidden_first: int | None,
+) -> list[int]:
+    """Spread every game of the groups across one order, consuming the groups."""
+
+    rng = np.random.default_rng(seed)
+    total = sum(len(indices) for indices in groups.values())
+    largest = max(len(indices) for indices in groups.values())
+    if largest > (total + 1) // 2:
+        raise RuntimeError(f"cannot avoid adjacent source games: largest group {largest}/{total}")
+
+    # Each game's first sample is staggered inside its own spacing, so a pack
+    # does not always open with the same games in the same order.
+    spacing = {game: total / len(indices) for game, indices in groups.items()}
+    due_heap: list[tuple[float, float, int]] = [
+        (float(rng.random()) * spacing[game], float(rng.random()), game) for game in groups
+    ]
+    heapq.heapify(due_heap)
+    # A second heap tracks which game has the most samples left. Serving a game
+    # makes its entry there stale, so the loop below re-pushes the current count
+    # whenever it finds one.
+    count_heap: list[tuple[int, int]] = [(-len(indices), game) for game, indices in groups.items()]
+    heapq.heapify(count_heap)
+
+    remaining = {game: len(indices) for game, indices in groups.items()}
+    order: list[int] = []
+    previous: int | None = forbidden_first
+    left = total
+    while left:
+        while -count_heap[0][0] != remaining[count_heap[0][1]]:
+            _, stale = heapq.heappop(count_heap)
+            if remaining[stale]:
+                heapq.heappush(count_heap, (-remaining[stale], stale))
+        most = count_heap[0][1]
+        # Serving any other game would leave the largest one with more samples
+        # than the remaining slots can separate, so this position is its own.
+        # With an even number of slots left there is always room to serve
+        # somebody else first, which is what keeps the order from alternating
+        # needlessly.
+        if left % 2 == 1 and remaining[most] == (left + 1) // 2:
+            held, entry = _take_until(due_heap, most)
+        else:
+            held, entry = _take_next(due_heap, previous)
+        due, _, game = entry
+        order.append(groups[game].pop())
+        remaining[game] -= 1
+        left -= 1
+        previous = game
+        for item in held:
+            heapq.heappush(due_heap, item)
+        if remaining[game]:
+            heapq.heappush(due_heap, (due + spacing[game], float(rng.random()), game))
+    return order
+
+
+def _take_next(
+    heap: list[tuple[float, float, int]], previous: int | None
+) -> tuple[list[tuple[float, float, int]], tuple[float, float, int]]:
+    """Pop the earliest due game that is not the previous sample."""
+
+    held: list[tuple[float, float, int]] = []
+    while heap:
+        entry = heapq.heappop(heap)
+        if entry[2] != previous:
+            return held, entry
+        held.append(entry)
+    raise RuntimeError(f"cannot avoid source game {previous} at the end of the order")
+
+
+def _take_until(
+    heap: list[tuple[float, float, int]], game: int
+) -> tuple[list[tuple[float, float, int]], tuple[float, float, int]]:
+    """Pop one game's own entry, holding the entries that come before it."""
+
+    held: list[tuple[float, float, int]] = []
+    while heap:
+        entry = heapq.heappop(heap)
+        if entry[2] == game:
+            return held, entry
+        held.append(entry)
+    raise RuntimeError(f"source game {game} has no entry left to serve")
+
+
+def load_slot(
+    game_paths: list[Path], plan: dict[str, np.ndarray], slot: PackSlot
+) -> dict[str, np.ndarray]:
+    """Read every chunk a slot needs, opening each staged game at most once."""
+
+    games = plan["source_game"][slot.start : slot.stop]
+    if "source_path" in plan:
+        path_indices = plan["source_path"][slot.start : slot.stop]
+    else:
+        # Compatibility with plans written before file identity was separated
+        # from source identity.  Those plans numbered paths consecutively.
+        offset = int(plan["game_offset"]) if "game_offset" in plan else 0
+        path_indices = games - offset
+    members = plan["source_member"][slot.start : slot.stop]
+    lengths = plan["length"][slot.start : slot.stop]
+
+    positions_by_game: dict[int, list[int]] = defaultdict(list)
+    for position, path_index in enumerate(path_indices.tolist()):
+        positions_by_game[path_index].append(position)
+
+    payloads: list[bytes | None] = [None] * len(games)
+    for path_index, positions in sorted(positions_by_game.items()):
+        with zipfile.ZipFile(game_paths[path_index], "r") as archive:
+            for position in positions:
+                member = int(members[position])
+                payloads[position] = archive.read(f"chunk_{member:05d}.npz")
+
+    parts = []
+    source_game: list[int] = []
+    for position, payload in enumerate(payloads):
+        assert payload is not None
+        with np.load(io.BytesIO(payload), allow_pickle=False) as data:
+            parts.append(
+                normalize_packed_metadata(
+                    {name: data[name] for name in data.files}
+                )
+            )
+        source_game.extend([int(games[position])] * int(lengths[position]))
+    combined = concatenate_packed(parts)
+    combined["source_game"] = np.asarray(source_game, dtype=np.uint32)
+    return combined
+
+
+def build_pack(
+    game_paths: list[Path],
+    output: Path,
+    plan: dict[str, np.ndarray],
+    slot: PackSlot,
+    seed: int,
+    forbidden_first: int | None,
+) -> tuple[dict[str, object], int]:
+    """Materialize one globally mixed pack and report the game it ends on."""
+
+    combined = load_slot(game_paths, plan, slot)
+    order = nonadjacent_order(
+        combined["source_game"],
+        seed=int(np.random.SeedSequence([seed, slot.index]).generate_state(1)[0]),
+        forbidden_first=forbidden_first,
+        # The next pack derives its own seam rule from the plan, so this pack
+        # has to end on the game the plan ends on.
+        last_game=int(combined["source_game"][-1]),
+    )
+    permuted = permute_packed(combined, order)
+    _attach_event_catalogs(game_paths, plan, slot, permuted)
+    permuted["pack_index"] = np.full(len(order), slot.index, dtype=np.uint32)
+    name = f"pack-{slot.index:05d}.npz"
+    write_packed_shard(output / name, permuted)
+    meta: dict[str, object] = {
+        "pack": name,
+        "samples": len(order),
+        "chunks": slot.stop - slot.start,
+        "sourceGames": len(np.unique(combined["source_game"])),
+        "firstGame": int(permuted["source_game"][0]),
+        "lastGame": int(permuted["source_game"][-1]),
+        "modelInputSchema": permuted["model_input_schema"].item(),
+        "observationChannels": int(permuted["obs_channels"].item()),
+    }
+    if "event_memory_schema" in permuted:
+        meta["eventMemorySchema"] = permuted["event_memory_schema"].item()
+    return meta, int(permuted["source_game"][-1])
+
+
+def _attach_event_catalogs(
+    game_paths: list[Path],
+    plan: dict[str, np.ndarray],
+    slot: PackSlot,
+    packed: dict[str, np.ndarray],
+) -> None:
+    """Make one pack self-contained without duplicating event prefixes per sample."""
+
+    source_games = plan["source_game"][slot.start : slot.stop]
+    if "source_path" in plan:
+        path_indices = plan["source_path"][slot.start : slot.stop]
+    else:
+        offset = int(plan.get("game_offset", np.asarray(0)))
+        path_indices = source_games - offset
+    path_by_game: dict[int, int] = {}
+    for game, path_index in zip(source_games.tolist(), path_indices.tolist(), strict=True):
+        previous = path_by_game.setdefault(int(game), int(path_index))
+        if previous != int(path_index):
+            raise ValueError(f"source game {game} resolves to multiple staged archives")
+
+    catalogs = {
+        game: read_chunk_event_catalog(game_paths[path_index])
+        for game, path_index in sorted(path_by_game.items())
+    }
+    present = {game: catalog is not None for game, catalog in catalogs.items()}
+    if not any(present.values()):
+        if {"history_start", "history_length"}.intersection(packed):
+            raise ValueError("semantic samples have no staged event catalog")
+        return
+    if not all(present.values()):
+        raise ValueError("one pack mixes staged games with and without event catalogs")
+    if not {"history_start", "history_length"}.issubset(packed):
+        raise ValueError("staged event catalogs have no sample references")
+
+    games = np.asarray(sorted(catalogs), dtype=np.uint32)
+    offsets = np.zeros(len(games) + 1, dtype=np.uint64)
+    pieces: list[np.ndarray] = []
+    game_offsets: dict[int, int] = {}
+    for index, game in enumerate(games.tolist()):
+        catalog = catalogs[game]
+        assert catalog is not None
+        game_offsets[game] = int(offsets[index])
+        pieces.append(catalog)
+        offsets[index + 1] = offsets[index] + len(catalog)
+    catalog = np.concatenate(pieces, axis=0)
+    starts = packed["history_start"].astype(np.uint64, copy=True)
+    for game, offset in game_offsets.items():
+        starts[packed["source_game"] == game] += offset
+    validate_event_references(catalog, starts, packed["history_length"])
+    packed.update(
+        {
+            "history_start": starts,
+            "event_memory_schema": np.asarray(EVENT_MEMORY_SCHEMA_ID),
+            "event_catalog": catalog,
+            "event_catalog_games": games,
+            "event_catalog_offsets": offsets,
+        }
+    )
+
+
+def write_manifest(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def audit_packs(
+    output: Path, manifest: dict[str, object], plan: dict[str, np.ndarray]
+) -> dict[str, object]:
+    """Re-derive the training-order invariants from the written packs."""
+
+    entries = manifest.get("packs")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("manifest lists no packs")
+
+    expected_samples = int(plan["length"].sum())
+    game_count = int(plan["source_game"].max()) + 1
+    unique_game_count = len(np.unique(plan["source_game"]))
+    plan_samples = np.bincount(
+        np.repeat(plan["source_game"], plan["length"]), minlength=game_count
+    )
+    seen_samples = np.zeros(game_count, dtype=np.int64)
+
+    total = 0
+    adjacent_pairs = 0
+    previous_game: int | None = None
+    input_schema: str | None = None
+    observation_channels: int | None = None
+    event_memory_schema: str | None = None
+    event_schema_initialized = False
+    for entry in entries:
+        assert isinstance(entry, dict)
+        name = str(entry["pack"])
+        with np.load(output / name, allow_pickle=False) as source:
+            if source["storage_format"].item() not in SUPPORTED_STORAGE_FORMATS:
+                raise ValueError(f"{name} declares an unsupported storage format")
+            games = source["source_game"]
+            pack_schema = (
+                str(source["model_input_schema"].item())
+                if "model_input_schema" in source.files
+                else "riichi-analysis-model-input-legacy-v8"
+            )
+            pack_channels = (
+                int(source["obs_channels"].item())
+                if "obs_channels" in source.files
+                else OBS_CHANNELS
+            )
+            catalog_fields = PACK_CATALOG_FIELDS.intersection(source.files)
+            if catalog_fields:
+                if catalog_fields != PACK_CATALOG_FIELDS:
+                    raise ValueError(f"{name} has an incomplete event catalog")
+                event_schema = (
+                    source["event_memory_schema"].item()
+                    if "event_memory_schema" in source.files
+                    else ""
+                )
+                if event_schema != EVENT_MEMORY_SCHEMA_ID:
+                    raise ValueError(f"{name} has an unsupported event-memory schema")
+                catalog = source["event_catalog"]
+                catalog_games = source["event_catalog_games"]
+                catalog_offsets = source["event_catalog_offsets"]
+                starts = source["history_start"]
+                lengths = source["history_length"]
+                validate_event_references(catalog, starts, lengths)
+                if len(catalog_offsets) != len(catalog_games) + 1:
+                    raise ValueError(f"{name} has invalid event-catalog offsets")
+                if int(catalog_offsets[0]) != 0 or int(catalog_offsets[-1]) != len(catalog):
+                    raise ValueError(f"{name} event-catalog offsets do not cover the catalog")
+                if len(np.unique(catalog_games)) != len(catalog_games):
+                    raise ValueError(f"{name} repeats a game in its event catalog")
+                game_bounds = {
+                    int(game): (int(catalog_offsets[i]), int(catalog_offsets[i + 1]))
+                    for i, game in enumerate(catalog_games.tolist())
+                }
+                for game in np.unique(games).tolist():
+                    if int(game) not in game_bounds:
+                        raise ValueError(f"{name} omits source game {game} from its event catalog")
+                    lower, upper = game_bounds[int(game)]
+                    selected = games == game
+                    if (starts[selected] < lower).any() or (
+                        starts[selected] + lengths[selected] > upper
+                    ).any():
+                        raise ValueError(
+                            f"{name} has an event-history reference outside source game {game}"
+                        )
+            elif {"history_start", "history_length"}.intersection(source.files):
+                raise ValueError(f"{name} has event references without a catalog")
+        if input_schema is None:
+            input_schema = pack_schema
+            observation_channels = pack_channels
+        elif (pack_schema, pack_channels) != (input_schema, observation_channels):
+            raise ValueError("packs do not share one model-input contract")
+        pack_event_schema = (
+            str(entry["eventMemorySchema"])
+            if "eventMemorySchema" in entry
+            else None
+        )
+        if not event_schema_initialized:
+            event_memory_schema = pack_event_schema
+            event_schema_initialized = True
+        elif pack_event_schema != event_memory_schema:
+            raise ValueError("packs do not share one event-memory contract")
+        if len(games) != int(entry["samples"]):
+            raise ValueError(f"{name} holds {len(games)} samples, manifest says {entry['samples']}")
+        if len(games) == 0:
+            raise ValueError(f"{name} is empty")
+        seen_samples += np.bincount(games, minlength=game_count)
+        total += len(games)
+        if previous_game is not None and int(games[0]) == previous_game:
+            adjacent_pairs += 1
+        if len(games) > 1:
+            adjacent_pairs += int(np.count_nonzero(np.diff(games) == 0))
+        previous_game = int(games[-1])
+
+    if total != expected_samples:
+        raise ValueError(f"packs hold {total} samples, the plan holds {expected_samples}")
+    if not np.array_equal(seen_samples, plan_samples):
+        raise ValueError("packs do not reproduce the planned source-game sample counts")
+    if adjacent_pairs:
+        raise ValueError(f"{adjacent_pairs} adjacent sample pairs share a source game")
+    return {
+        "format": MANIFEST_FORMAT,
+        "verified": True,
+        "samples": total,
+        "packs": len(entries),
+        "sourceGames": unique_game_count,
+        "plannedChunks": len(plan["length"]),
+        "adjacentSameGamePairs": 0,
+        "modelInputSchema": input_schema,
+        "observationChannels": observation_channels,
+        "eventMemorySchema": event_memory_schema,
+    }

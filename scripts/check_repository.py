@@ -33,7 +33,7 @@ def main() -> None:
     require(manifest["name"] == "Riichi Analysis Engine", "unexpected engine name")
     require(
         manifest["protocol"]
-        == {"name": "riichi-engine-protocol", "major": 2, "minor": 1},
+        == {"name": "riichi-engine-protocol", "major": 2, "minor": 2},
         "unexpected protocol version",
     )
     require(
@@ -47,7 +47,14 @@ def main() -> None:
     forbidden = [path for path in files if path.suffix.lower() in forbidden_suffixes]
     require(not forbidden, "generated data or weights found in the source tree")
 
-    local_path = re.compile(r"(?i)\b[a-z]:\\")
+    environment_files = [
+        path
+        for path in files
+        if path.name == ".env" or (path.name.startswith(".env.") and path.name != ".env.example")
+    ]
+    require(not environment_files, "local environment file found in the source tree")
+
+    local_path = re.compile(r"(?i)\b[a-z]:[\\/]")
     for path in files:
         if path.suffix.lower() not in {".json", ".md", ".ps1", ".py", ".toml"}:
             continue

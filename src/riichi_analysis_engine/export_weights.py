@@ -9,7 +9,15 @@ from pathlib import Path
 
 import torch
 
+from .architecture import (
+    ModelArchitecture,
+    SemanticModelArchitecture,
+    StructuredModelArchitecture,
+)
 from .model import RiichiAnalysisModel, count_parameters
+from .model_input import model_input_metadata
+from .prediction_values import DORA_VALUES, SCORE_VALUES
+from .semantic_input import semantic_input_metadata
 
 
 def sha256(path: Path) -> str:
@@ -58,37 +66,109 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Export inference-only model weights.")
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--training-data", default="2025-1of20")
+    parser.add_argument("--training-data", default="2025-train")
     parser.add_argument("--validation-data", default="2026-md5-holdout")
     args = parser.parse_args()
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if checkpoint.get("format") != "riichi-analysis-model-v1":
+    model_format = checkpoint.get("format")
+    formats = {
+        "riichi-analysis-model-v1": 1,
+        "riichi-analysis-model-v2": 2,
+        "riichi-analysis-model-v3": 3,
+        "riichi-analysis-model-v4": 4,
+        "riichi-analysis-model-v5": 5,
+        "riichi-analysis-model-v6": 6,
+        "riichi-analysis-model-v7": 7,
+        "riichi-analysis-model-v8": 8,
+        "riichi-analysis-model-v9": 9,
+        "riichi-analysis-model-v10": 10,
+        "riichi-analysis-model-v11": 11,
+        "riichi-analysis-model-v12": 12,
+    }
+    if model_format not in formats:
         raise RuntimeError("checkpoint has an unsupported format")
-    model = RiichiAnalysisModel()
+    format_version = formats[model_format]
+    architecture: (
+        ModelArchitecture | StructuredModelArchitecture | SemanticModelArchitecture | None
+    ) = None
+    if format_version in {6, 7, 8, 9, 10, 11, 12}:
+        architecture_type = (
+            SemanticModelArchitecture
+            if format_version == 12
+            else StructuredModelArchitecture
+            if format_version in {8, 9, 10, 11}
+            else ModelArchitecture
+        )
+        architecture = architecture_type.from_dict(checkpoint.get("modelArchitecture"))
+        model = RiichiAnalysisModel(
+            format_version=format_version, architecture=architecture
+        )
+    else:
+        model = RiichiAnalysisModel(format_version=format_version)
     model.load_state_dict(checkpoint["model"], strict=True)
+    training = {
+        "step": int(checkpoint.get("step", 0)),
+        "samplesSeen": int(checkpoint.get("samplesSeen", 0)),
+        "analysisSamplesSeen": int(
+            checkpoint.get("analysisSamplesSeen", checkpoint.get("samplesSeen", 0))
+        ),
+        "trainingData": args.training_data,
+        "validationData": args.validation_data,
+        "datasets": public_dataset_metadata(checkpoint),
+        "environment": checkpoint.get("environment"),
+        "validation": checkpoint.get("validation"),
+        "sourceRevision": training_source_revision(checkpoint),
+    }
+    cursor = checkpoint.get("trainingCursor")
+    if isinstance(cursor, dict):
+        training["pass"] = {
+            "type": cursor.get("type"),
+            "nextSample": cursor.get("nextSample"),
+            "complete": cursor.get("complete"),
+        }
+    elif "epoch" in checkpoint:
+        # Historical checkpoints remain exportable, but only new checkpoints
+        # with an explicit cursor may be resumed for training.
+        training["epoch"] = int(checkpoint["epoch"])
+
     payload = {
-        "format": "riichi-analysis-model-v1",
+        "format": model_format,
         "model": model.state_dict(),
         "architecture": {
             "observationVersion": 4,
-            "channels": 256,
-            "residualBlocks": 54,
-            "stateWidth": 1024,
-            "futureWidth": 768,
             "parameters": count_parameters(model),
+            **(
+                {"model": architecture.to_dict()}
+                if architecture is not None
+                else {
+                    "channels": 256,
+                    "residualBlocks": 54,
+                    "stateWidth": 1024,
+                    "futureWidth": 768,
+                }
+            ),
         },
-        "training": {
-            "epoch": int(checkpoint.get("epoch", 0)),
-            "step": int(checkpoint.get("step", 0)),
-            "trainingData": args.training_data,
-            "validationData": args.validation_data,
-            "datasets": public_dataset_metadata(checkpoint),
-            "environment": checkpoint.get("environment"),
-            "validation": checkpoint.get("validation"),
-            "sourceRevision": training_source_revision(checkpoint),
-        },
+        "training": training,
     }
+    if format_version in {9, 10, 11, 12}:
+        expected_input = model_input_metadata()
+        if checkpoint.get("modelInput") != expected_input:
+            raise RuntimeError("checkpoint uses a different model-input contract")
+        payload["architecture"]["modelInput"] = expected_input
+    if format_version == 12:
+        expected_semantic_input = semantic_input_metadata()
+        if checkpoint.get("semanticInput") != expected_semantic_input:
+            raise RuntimeError("checkpoint uses a different semantic-input contract")
+        payload["architecture"]["semanticInput"] = expected_semantic_input
+    if format_version >= 2:
+        prediction_values = {
+            "dora": list(DORA_VALUES),
+            "score": list(SCORE_VALUES),
+        }
+        if checkpoint.get("predictionValues") != prediction_values:
+            raise RuntimeError("checkpoint uses different prediction values")
+        payload["architecture"]["predictionValues"] = prediction_values
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
     torch.save(payload, temporary)

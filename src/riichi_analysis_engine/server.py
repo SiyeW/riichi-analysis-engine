@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sys
+import tempfile
+import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -10,8 +14,8 @@ import torch
 
 from .runtime import AnalysisRuntime
 
-PROTOCOL = {"name": "riichi-engine-protocol", "major": 2, "minor": 1}
-ENGINE_VERSION = "0.1.0-dev.0"
+PROTOCOL = {"name": "riichi-engine-protocol", "major": 2, "minor": 2}
+ENGINE_VERSION = "0.1.0-dev.6"
 OUTPUT_IDS = [
     "action-recommendation",
     "opponent-shanten",
@@ -28,11 +32,15 @@ OUTPUT_IDS = [
 NUMERIC_REPRESENTATIONS = {
     "opponent-concealed-tile-count": ["distribution", "expected-value"],
     "wall-tile-count": ["distribution", "expected-value"],
-    "opponent-dora-count": ["expected-value"],
-    "opponent-score": ["expected-value"],
     "kyoku-score-delta": ["expected-value"],
     "match-placement": ["distribution", "expected-value"],
     "match-score": ["expected-value"],
+}
+OUTPUT_INTRODUCED = {
+    "kyoku-outcome": 1,
+    "kyoku-score-delta": 1,
+    "match-placement": 1,
+    "match-score": 1,
 }
 POLICY_METRIC = {
     "id": "policy",
@@ -50,10 +58,67 @@ class ProtocolError(Exception):
         self.code = code
 
 
-def output_declaration(output_id: str, *, initialized: bool = False) -> dict[str, Any]:
-    result: dict[str, Any] = {"id": output_id, "version": 1}
-    if output_id in NUMERIC_REPRESENTATIONS:
-        result["representations"] = NUMERIC_REPRESENTATIONS[output_id]
+def available_output_ids(protocol_minor: int) -> list[str]:
+    return [
+        output_id
+        for output_id in OUTPUT_IDS
+        if OUTPUT_INTRODUCED.get(output_id, 0) <= protocol_minor
+    ]
+
+
+def numeric_representations(output_id: str, protocol_minor: int) -> list[str] | None:
+    if output_id == "opponent-dora-count":
+        if protocol_minor >= 2:
+            return ["distribution", "expected-value", "point-estimate"]
+        return ["expected-value"]
+    if output_id == "opponent-score":
+        if protocol_minor >= 2:
+            return ["distribution", "expected-value", "point-estimate"]
+        return ["distribution", "expected-value"]
+    return NUMERIC_REPRESENTATIONS.get(output_id)
+
+
+def output_reference(output_id: str, protocol_minor: int) -> dict[str, Any]:
+    reference: dict[str, Any] = {"id": output_id}
+    if protocol_minor < 2:
+        reference["version"] = 1
+    return reference
+
+
+def requested_output_ids(values: Any, protocol_minor: int) -> list[str] | None:
+    if not isinstance(values, list):
+        return None
+    result: list[str] = []
+    for item in values:
+        if not isinstance(item, dict):
+            return None
+        output_id = item.get("id")
+        if not isinstance(output_id, str) or not output_id:
+            return None
+        if protocol_minor < 2:
+            if item.get("version") != 1:
+                return None
+        elif "version" in item:
+            return None
+        result.append(output_id)
+    return result
+
+
+def output_declaration(
+    output_id: str,
+    protocol_minor: int,
+    *,
+    initialized: bool = False,
+    representations: list[str] | None = None,
+) -> dict[str, Any]:
+    result = output_reference(output_id, protocol_minor)
+    representations = (
+        numeric_representations(output_id, protocol_minor)
+        if representations is None
+        else representations
+    )
+    if representations is not None:
+        result["representations"] = representations
     if output_id == "action-recommendation":
         result["metrics"] = [POLICY_METRIC]
         if initialized:
@@ -67,6 +132,7 @@ class Engine:
         self.runtime: AnalysisRuntime | None = None
         self.enabled: set[str] = set()
         self.state = "starting"
+        self.protocol_minor: int | None = None
 
     def hello(self, params: dict[str, Any]) -> dict[str, Any]:
         protocol = params.get("protocol")
@@ -76,22 +142,29 @@ class Engine:
             or protocol.get("major") != 2
             or isinstance(protocol.get("minor"), bool)
             or not isinstance(protocol.get("minor"), int)
-            or protocol.get("minor") < 1
+            or protocol.get("minor") < 0
         ):
             raise ProtocolError("protocol version is not compatible", "PROTOCOL_MISMATCH")
+        self.protocol_minor = min(protocol["minor"], PROTOCOL["minor"])
+        outputs = available_output_ids(self.protocol_minor)
         devices = [{"type": "cpu", "title": {"default": "CPU"}}]
         if torch.cuda.is_available():
             devices.append({"type": "cuda", "title": {"default": "NVIDIA CUDA"}})
         return {
-            "protocol": PROTOCOL,
+            "protocol": {**PROTOCOL, "minor": self.protocol_minor},
             "engine": {"id": "org.riichi.analysis", "name": "Riichi Analysis Engine", "version": ENGINE_VERSION},
-            "outputContracts": [output_declaration(value) for value in OUTPUT_IDS],
+            "outputContracts": [
+                output_declaration(value, self.protocol_minor) for value in outputs
+            ],
             "weightSlots": [
                 {
                     "id": "model",
                     "title": {"default": "Model weights", "zh-CN": "模型权重", "ja-JP": "モデルの重み"},
                     "formats": [{"id": "riichi-analysis-pytorch-v1", "extensions": [".pt"]}],
-                    "requiredForOutputs": [{"id": value, "version": 1} for value in OUTPUT_IDS],
+                    "requiredForOutputs": [
+                        output_reference(value, self.protocol_minor)
+                        for value in outputs
+                    ],
                 }
             ],
             "devices": devices,
@@ -100,11 +173,14 @@ class Engine:
         }
 
     def initialize(self, params: dict[str, Any]) -> dict[str, Any]:
+        if self.protocol_minor is None:
+            raise ProtocolError("engine.hello is required", "PROTOCOL_MISMATCH")
         enabled = params.get("enabledOutputs")
         if not isinstance(enabled, list) or not enabled:
             raise ProtocolError("enabledOutputs must be non-empty", "UNSUPPORTED_OUTPUT")
-        ids = [item.get("id") for item in enabled if isinstance(item, dict) and item.get("version") == 1]
-        if len(ids) != len(enabled) or len(set(ids)) != len(ids) or not set(ids).issubset(OUTPUT_IDS):
+        ids = requested_output_ids(enabled, self.protocol_minor)
+        available = set(available_output_ids(self.protocol_minor))
+        if ids is None or len(set(ids)) != len(ids) or not set(ids).issubset(available):
             raise ProtocolError("enabledOutputs contains an unavailable output", "UNSUPPORTED_OUTPUT")
         weights = params.get("weights")
         if (
@@ -125,7 +201,19 @@ class Engine:
         self.enabled = set(ids)
         self.state = "ready"
         return {
-            "outputs": [output_declaration(value, initialized=True) for value in ids],
+            "outputs": [
+                output_declaration(
+                    value,
+                    self.protocol_minor,
+                    initialized=True,
+                    representations=(
+                        self.runtime.representations(value, self.protocol_minor)
+                        if value in {"opponent-dora-count", "opponent-score"}
+                        else None
+                    ),
+                )
+                for value in ids
+            ],
             "device": {"type": device_type},
             "effectiveOptions": {},
         }
@@ -133,26 +221,86 @@ class Engine:
     def analyze(self, params: dict[str, Any]) -> dict[str, Any]:
         if self.runtime is None:
             raise ProtocolError("engine is not initialized", "ENGINE_NOT_INITIALIZED")
+        session_id = params.get("sessionId")
         seat = params.get("controlledSeat")
         events = params.get("events")
         requested = params.get("outputs")
         if isinstance(seat, bool) or not isinstance(seat, int) or not 0 <= seat <= 3:
             raise ProtocolError("controlledSeat must be 0..3", "INVALID_HISTORY")
+        if not isinstance(session_id, str) or not session_id:
+            raise ProtocolError("sessionId must be a non-empty string", "INVALID_HISTORY")
         if params.get("inputMode") != "standard" or not isinstance(events, list) or not events:
             raise ProtocolError("standard non-empty history is required", "INVALID_HISTORY")
         if not isinstance(requested, list) or not requested:
             raise ProtocolError("outputs must be non-empty", "UNSUPPORTED_OUTPUT")
-        ids = [item.get("id") for item in requested if isinstance(item, dict) and item.get("version") == 1]
-        if len(ids) != len(requested) or len(set(ids)) != len(ids) or not set(ids).issubset(self.enabled):
+        ids = requested_output_ids(requested, self.protocol_minor or 0)
+        if ids is None or len(set(ids)) != len(ids) or not set(ids).issubset(self.enabled):
             raise ProtocolError("outputs contains an unavailable output", "UNSUPPORTED_OUTPUT")
         try:
-            data, elapsed = self.runtime.predict(events, seat, requested)
+            data, elapsed = self.runtime.predict(
+                events,
+                seat,
+                requested,
+                self.protocol_minor or 0,
+                session_id=session_id,
+            )
         except (KeyError, TypeError, ValueError) as error:
             raise ProtocolError(str(error), "INVALID_HISTORY") from error
         return {
-            "outputs": [{"id": value, "version": 1, "data": data[value]} for value in ids],
+            "outputs": [
+                {
+                    **output_reference(value, self.protocol_minor or 0),
+                    "data": data[value],
+                }
+                for value in ids
+            ],
             "timing": {"totalMs": elapsed},
         }
+
+    def clear_session(self, params: dict[str, Any]) -> dict[str, bool]:
+        session_id = params.get("sessionId")
+        if not isinstance(session_id, str) or not session_id:
+            raise ProtocolError("sessionId must be a non-empty string", "INVALID_HISTORY")
+        if self.runtime is not None:
+            self.runtime.clear_session(session_id)
+        return {"ok": True}
+
+
+def log_path() -> Path:
+    """Where this engine writes what happened to it.
+
+    A host only sees an exit code when an engine dies, so the engine keeps its
+    own record next to itself, falling back to the user's temporary directory
+    when it cannot write there.
+    """
+
+    beside = Path(sys.executable).resolve().parent
+    for candidate in (beside, Path(tempfile.gettempdir()) / "riichi-analysis-engine"):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / "engine.log"
+            with probe.open("a", encoding="utf-8"):
+                pass
+            return probe
+        except OSError:
+            continue
+    return Path(os.devnull)
+
+
+LOG_LIMIT_BYTES = 2 * 1024 * 1024
+
+
+def log(message: str) -> None:
+    try:
+        path = log_path()
+        # The log outlives the process, so it keeps itself bounded: a played
+        # session writes one line per analysis.
+        if path.exists() and path.stat().st_size > LOG_LIMIT_BYTES:
+            path.unlink()
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {os.getpid()} {message}\n")
+    except OSError:
+        pass
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -167,7 +315,23 @@ def error_payload(error: Exception) -> dict[str, Any]:
 
 
 def main() -> None:
+    log(f"started, log file {log_path()}")
     engine = Engine()
+    exited_by = "stdin closed"
+    try:
+        _serve(engine)
+    except SystemExit as stop:
+        exited_by = f"exit {stop.code}"
+        raise
+    except BaseException:
+        log("crashed:\n" + traceback.format_exc())
+        exited_by = "unhandled exception"
+        raise
+    finally:
+        log(f"stopping ({exited_by})")
+
+
+def _serve(engine: Engine) -> None:
     for line in sys.stdin:
         request: Any = None
         try:
@@ -186,15 +350,19 @@ def main() -> None:
                     result = engine.analyze(params)
                 elif method == "engine.getStatus":
                     result = {"state": engine.state, "activeTasks": 0, "queuedTasks": 0, "lastError": None}
-                elif method in {"session.reset", "session.close"} or method == "engine.shutdown":
+                elif method in {"session.reset", "session.close"}:
+                    result = engine.clear_session(params)
+                elif method == "engine.shutdown":
                     result = {"ok": True}
                 else:
                     raise ProtocolError("method not found", "METHOD_NOT_FOUND", -32601)
             if "id" in request:
                 emit({"jsonrpc": "2.0", "id": request["id"], "result": result})
+            log(f"{method} -> ok")
             if method == "engine.shutdown":
                 break
         except Exception as error:  # noqa: BLE001 -- JSON-RPC errors belong on the wire
+            log(f"request failed: {type(error).__name__}: {error}\n{traceback.format_exc()}")
             if not isinstance(request, dict) or "id" in request:
                 emit({"jsonrpc": "2.0", "id": request.get("id") if isinstance(request, dict) else None, "error": error_payload(error)})
 

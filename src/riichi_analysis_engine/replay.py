@@ -14,11 +14,15 @@ import numpy as np
 
 from .constants import (
     PLAYERS,
+    RED_TILE_TO_INDEX,
+    RED_TILES,
     TILE37_TO_ACTION,
     deaka,
     relative_players,
     tile34_index,
 )
+from .kyoku_outcome import outcome_class_index
+from .prediction_values import SCORE_VALUE_SET
 from .yaku import has_ron_yaku, is_complete_hand
 
 FRAME_EVENTS = {
@@ -34,6 +38,29 @@ FRAME_EVENTS = {
     "reach_accepted",
     "dora",
 }
+
+
+def _ron_label_hand(
+    hand: np.ndarray,
+    *,
+    player: int,
+    last_tsumo_actor: int | None,
+    last_tsumo_tile: int | None,
+) -> np.ndarray:
+    """Return the 3n+1 concealed shape used for ron-label supervision.
+
+    The target is defined at a frame immediately before the acting player has
+    made the required discard.  In particular, a chi/pon does not erase that
+    player's earlier draw for this label convention.
+    """
+    result = hand.copy()
+    if (
+        player == last_tsumo_actor
+        and last_tsumo_tile is not None
+        and int(result.sum()) % 3 == 2
+    ):
+        result[last_tsumo_tile] -= 1
+    return result
 
 
 def read_events(source: str) -> list[dict[str, Any]]:
@@ -70,10 +97,15 @@ def _dora_from_marker(marker: str) -> str:
 
 @dataclass
 class FullState:
-    hands: list[Counter[str]] = field(default_factory=lambda: [Counter() for _ in range(4)])
+    hands: list[Counter[str]] = field(
+        default_factory=lambda: [Counter() for _ in range(4)]
+    )
     melds: list[list[list[str]]] = field(default_factory=lambda: [[] for _ in range(4)])
     wall: np.ndarray = field(default_factory=lambda: np.zeros(34, dtype=np.uint8))
-    scores: np.ndarray = field(default_factory=lambda: np.full(4, 25_000, dtype=np.int32))
+    wall_red: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.uint8))
+    scores: np.ndarray = field(
+        default_factory=lambda: np.full(4, 25_000, dtype=np.int32)
+    )
     dora_markers: list[str] = field(default_factory=list)
     riichi: list[bool] = field(default_factory=lambda: [False] * 4)
     honba: int = 0
@@ -98,13 +130,19 @@ class FullState:
             self.last_discard = None
             self.last_kan_tile = None
             self.wall = np.full(34, 4, dtype=np.int16)
+            self.wall_red = np.ones(3, dtype=np.int8)
             for hand in event["tehais"]:
                 for tile in hand:
                     self.wall[tile34_index(tile)] -= 1
+                    if tile in RED_TILE_TO_INDEX:
+                        self.wall_red[RED_TILE_TO_INDEX[tile]] -= 1
             self.wall[tile34_index(event["dora_marker"])] -= 1
-            if (self.wall < 0).any():
+            if event["dora_marker"] in RED_TILE_TO_INDEX:
+                self.wall_red[RED_TILE_TO_INDEX[event["dora_marker"]]] -= 1
+            if (self.wall < 0).any() or (self.wall_red < 0).any():
                 raise ValueError("negative wall count at start_kyoku")
             self.wall = self.wall.astype(np.uint8)
+            self.wall_red = self.wall_red.astype(np.uint8)
         elif kind == "tsumo":
             actor, tile = int(event["actor"]), event["pai"]
             self.hands[actor][tile] += 1
@@ -112,6 +150,11 @@ class FullState:
             if self.wall[index] == 0:
                 raise ValueError(f"negative wall count after drawing {tile}")
             self.wall[index] -= 1
+            if tile in RED_TILE_TO_INDEX:
+                red_index = RED_TILE_TO_INDEX[tile]
+                if self.wall_red[red_index] == 0:
+                    raise ValueError(f"negative red wall count after drawing {tile}")
+                self.wall_red[red_index] -= 1
             self.last_kan_tile = None
         elif kind == "dahai":
             actor, tile = int(event["actor"]), event["pai"]
@@ -160,16 +203,34 @@ class FullState:
             if self.wall[index] == 0:
                 raise ValueError(f"negative wall count after dora marker {marker}")
             self.wall[index] -= 1
+            if marker in RED_TILE_TO_INDEX:
+                red_index = RED_TILE_TO_INDEX[marker]
+                if self.wall_red[red_index] == 0:
+                    raise ValueError(
+                        f"negative red wall count after dora marker {marker}"
+                    )
+                self.wall_red[red_index] -= 1
         elif kind in {"hora", "ryukyoku"}:
             deltas = event.get("deltas")
             if isinstance(deltas, list):
                 self.scores = self.scores + np.asarray(deltas, dtype=np.int32)
+            if kind == "hora":
+                # The first winner's settlement already contains every riichi
+                # stick on the table. Later winners in the same settlement do
+                # not collect it again.
+                self.kyotaku = 0
 
     def concealed_counts(self, player: int) -> np.ndarray:
         counts = np.zeros(34, dtype=np.uint8)
         for tile, count in self.hands[player].items():
             counts[tile34_index(tile)] += count
         return counts
+
+    def concealed_red_counts(self, player: int) -> np.ndarray:
+        return np.asarray(
+            [self.hands[player].get(tile, 0) for tile in RED_TILES],
+            dtype=np.uint8,
+        )
 
     def winning_tiles(self, actor: int, target: int) -> list[str]:
         tiles = list(self.hands[actor].elements())
@@ -186,9 +247,29 @@ class FullState:
         tiles = self.winning_tiles(actor, target)
         dora_tiles = [_dora_from_marker(marker) for marker in self.dora_markers]
         dora_tiles.extend(_dora_from_marker(marker) for marker in ura_markers)
-        normal = sum(deaka(tile) in dora_tiles for tile in tiles)
+        normal = sum(dora_tiles.count(deaka(tile)) for tile in tiles)
         reds = sum(tile.endswith("r") for tile in tiles)
         return normal + reds
+
+
+def hand_score(event: dict[str, Any], state: FullState, *, first_winner: bool) -> int:
+    deltas = np.asarray(event["deltas"], dtype=np.int32)
+    # The winner's total gain, taken from the settlement itself rather than from
+    # one assumed payer: 包牌 (pao, liability) makes the player who supplied the
+    # tile that completed daisangen or daisuushii responsible for part or all of
+    # the payment, so one ron can be paid by two players. See
+    # 2025061121gm-00a9-0000-5f8f6cdd, where a daisangen was completed from
+    # player 0's discard and won on player 3's.
+    value = int(deltas[int(event["actor"])])
+    if first_winner:
+        # Only the first winner collects the riichi sticks and the honba.
+        value -= state.honba * 300 + state.kyotaku * 1000
+    if value not in SCORE_VALUE_SET:
+        raise ValueError(
+            "hora produced an unsupported hand score: "
+            f"{value} (deltas={deltas.tolist()})"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -233,11 +314,12 @@ def annotate_game(events: list[dict[str, Any]]) -> dict[int, FutureAnnotation]:
             active.targets[actor] = target
             if actor != target:
                 active.deal_in[target] = 1
-            active.dora[actor] = state.dora_count(actor, target, list(event.get("ura_markers", [])))
-            value = int(event["deltas"][actor]) - state.honba * 300
-            if not active.first_winner_seen:
-                value -= state.kyotaku * 1_000
-            active.score[actor] = max(0, value)
+            active.dora[actor] = state.dora_count(
+                actor, target, list(event.get("ura_markers", []))
+            )
+            active.score[actor] = hand_score(
+                event, state, first_winner=not active.first_winner_seen
+            )
             active.first_winner_seen = True
         elif kind == "ryukyoku" and active is not None:
             active.draw = 1
@@ -247,7 +329,7 @@ def annotate_game(events: list[dict[str, Any]]) -> dict[int, FutureAnnotation]:
             builders.append((active, state.scores.copy()))
             active = None
 
-    final_match_scores = state.scores.copy()
+    final_match_scores = terminal_match_scores(state.scores, state.kyotaku)
     annotations: dict[int, FutureAnnotation] = {}
     for builder, final_kyoku_scores in builders:
         annotation = FutureAnnotation(
@@ -264,6 +346,27 @@ def annotate_game(events: list[dict[str, Any]]) -> dict[int, FutureAnnotation]:
     return annotations
 
 
+def terminal_match_scores(scores: np.ndarray, kyotaku: int) -> np.ndarray:
+    """Return final net-mahjong scores after assigning unclaimed riichi sticks.
+
+    Tenhou-style MJAI logs can end immediately after a drawn last hand. In
+    that case the final ``ryukyoku`` settlement leaves the sticks outside the
+    four player accounts and no later event records their award. RMS uses the
+    common online rule that the current first-place player receives that pool.
+    Ties follow the initial-seat order, matching :func:`placement_label`.
+    """
+
+    if kyotaku < 0:
+        raise ValueError("kyotaku cannot be negative")
+    result = np.asarray(scores, dtype=np.int32).copy()
+    if result.shape != (PLAYERS,):
+        raise ValueError(f"scores must contain exactly {PLAYERS} values")
+    if kyotaku:
+        first = min(range(PLAYERS), key=lambda player: (-int(result[player]), player))
+        result[first] += kyotaku * 1_000
+    return result
+
+
 class ExactTargetTracker:
     """Build exact shanten and legal-ron labels from four libriichi states."""
 
@@ -272,6 +375,7 @@ class ExactTargetTracker:
         self.oya = 0
         self.wall_remaining = 70
         self.last_tsumo_actor: int | None = None
+        self.last_tsumo_tile: int | None = None
         self.chankan_tile: int | None = None
         self.discarded = np.zeros((4, 34), dtype=bool)
         self.temporary_furiten = np.zeros(4, dtype=bool)
@@ -289,7 +393,6 @@ class ExactTargetTracker:
             if isinstance(hand_raw, bytes)
             else np.asarray(hand_raw, dtype=np.uint8)
         ).astype(np.int16)
-        drawn = state.last_self_tsumo()
         can_improve_after_discard = int(hand.sum()) % 3 == 2 and bool(
             state.has_next_shanten_discard
         )
@@ -301,12 +404,21 @@ class ExactTargetTracker:
         if shanten != 0:
             return shanten, 0, ron_waits
 
-        if drawn is not None and int(hand.sum()) % 3 == 2:
-            hand[tile34_index(drawn)] -= 1
+        # Keep the established public-label convention independent from a
+        # policy-state implementation detail such as PlayerState's transient
+        # last_self_tsumo marker.
+        hand = _ron_label_hand(
+            hand,
+            player=player,
+            last_tsumo_actor=self.last_tsumo_actor,
+            last_tsumo_tile=self.last_tsumo_tile,
+        )
         if int(hand.sum()) % 3 != 1:
             return shanten, 0, ron_waits
 
-        open_melds = len(state.chis) + len(state.pons) + len(state.minkans) + len(state.ankans)
+        open_melds = (
+            len(state.chis) + len(state.pons) + len(state.minkans) + len(state.ankans)
+        )
         waits = np.zeros(34, dtype=bool)
         for tile in range(34):
             if hand[tile] >= 4:
@@ -370,12 +482,14 @@ class ExactTargetTracker:
             self.oya = int(event["oya"])
             self.wall_remaining = 70
             self.last_tsumo_actor = None
+            self.last_tsumo_tile = None
             self.discarded.fill(False)
             self.temporary_furiten.fill(False)
             self.riichi_pass_furiten.fill(False)
         elif kind == "tsumo":
             self.wall_remaining = max(0, self.wall_remaining - 1)
             self.last_tsumo_actor = int(event["actor"])
+            self.last_tsumo_tile = tile34_index(event["pai"])
             self.temporary_furiten[int(event["actor"])] = False
         elif kind == "dahai":
             self.discarded[int(event["actor"]), tile34_index(event["pai"])] = True
@@ -392,7 +506,9 @@ class ExactTargetTracker:
                 base = position * 8
                 rotated[perspective, base + shanten] = 1
                 rotated[perspective, base + 7] = stuck
-                rotated[perspective, 24 + position * 34 : 24 + (position + 1) * 34] = waits
+                rotated[perspective, 24 + position * 34 : 24 + (position + 1) * 34] = (
+                    waits
+                )
         if kind == "dahai":
             discarder = int(event["actor"])
             tile = tile34_index(event["pai"])
@@ -416,13 +532,15 @@ def action_label(
     while len(window) < 3:
         window.append({"type": "end_game"})
     immediate = window[0]
-    next_event = window[1] if immediate["type"] in {"reach_accepted", "dora"} else immediate
+    next_event = (
+        window[1] if immediate["type"] in {"reach_accepted", "dora"} else immediate
+    )
     kind = next_event["type"]
     kan_select: int | None = None
 
-    if kind == "dahai":
+    if kind == "dahai" and int(next_event["actor"]) == player:
         return TILE37_TO_ACTION[next_event["pai"]], None
-    if kind == "reach":
+    if kind == "reach" and int(next_event["actor"]) == player:
         return 37, None
     if kind == "chi" and int(next_event["actor"]) == player:
         called = tile34_index(next_event["pai"])
@@ -433,13 +551,13 @@ def action_label(
         return 41, None
     if kind == "daiminkan" and int(next_event["actor"]) == player:
         return 42, None
-    if kind == "kakan":
+    if kind == "kakan" and int(next_event["actor"]) == player:
         candidates = player_state.kakan_candidates
         candidates = candidates() if callable(candidates) else candidates
         if len(candidates) > 1:
             kan_select = tile34_index(next_event["pai"])
         return 42, kan_select
-    if kind == "ankan":
+    if kind == "ankan" and int(next_event["actor"]) == player:
         candidates = player_state.ankan_candidates
         candidates = candidates() if callable(candidates) else candidates
         if len(candidates) > 1:
@@ -482,11 +600,15 @@ PERMUTATIONS = tuple(itertools.permutations(range(PLAYERS)))
 
 
 def placement_label(scores: np.ndarray, perspective: int) -> int:
-    absolute_order = sorted(range(PLAYERS), key=lambda player: (-int(scores[player]), player))
+    absolute_order = sorted(
+        range(PLAYERS), key=lambda player: (-int(scores[player]), player)
+    )
     rank_by_player = np.empty(PLAYERS, dtype=np.uint8)
     for rank, player in enumerate(absolute_order):
         rank_by_player[player] = rank
-    relative = tuple(int(value) for value in rotate_absolute(rank_by_player, perspective))
+    relative = tuple(
+        int(value) for value in rotate_absolute(rank_by_player, perspective)
+    )
     return PERMUTATIONS.index(relative)
 
 
@@ -508,6 +630,7 @@ def rotated_future(
         "win": annotation.win[order],
         "deal_in_player": annotation.deal_in[order],
         "target": target_relative,
+        "outcome": outcome_class_index(annotation.win[order], target_relative),
         "dora": annotation.dora[list(opponents)],
         "score": annotation.score[list(opponents)],
         "kyoku_delta": (annotation.final_kyoku_scores - current_scores)[order],
