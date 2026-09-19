@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,28 @@ def public_files() -> list[Path]:
 
 def main() -> None:
     manifest = json.loads((ROOT / "engine.json").read_text(encoding="utf-8"))
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    package_source = (ROOT / "src/riichi_analysis_engine/__init__.py").read_text(
+        encoding="utf-8"
+    )
+    server_source = (ROOT / "src/riichi_analysis_engine/server.py").read_text(
+        encoding="utf-8"
+    )
+    package_version = re.search(r'^__version__ = "([^"]+)"$', package_source, re.MULTILINE)
+    server_version = re.search(r'^ENGINE_VERSION = "([^"]+)"$', server_source, re.MULTILINE)
+    require(package_version is not None, "package version is missing")
+    require(server_version is not None, "server version is missing")
+    canonical_version = project["project"]["version"]
+    display_version = canonical_version.replace(".dev", "-dev.")
+    require(
+        package_version.group(1) == canonical_version,
+        "package and project versions differ",
+    )
+    require(
+        manifest["version"] == display_version
+        and server_version.group(1) == display_version,
+        "manifest, server, and project versions differ",
+    )
     require(manifest["id"] == "org.riichi.analysis", "unexpected engine id")
     require(manifest["name"] == "Riichi Analysis Engine", "unexpected engine name")
     require(

@@ -15,7 +15,7 @@ import torch
 from .runtime import AnalysisRuntime
 
 PROTOCOL = {"name": "riichi-engine-protocol", "major": 2, "minor": 2}
-ENGINE_VERSION = "0.1.0-dev.6"
+ENGINE_VERSION = "0.1.0-dev.7"
 OUTPUT_IDS = [
     "action-recommendation",
     "opponent-shanten",
