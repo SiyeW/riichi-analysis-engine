@@ -1,5 +1,6 @@
 import pytest
 import torch
+
 from riichi_analysis_engine.architecture import SemanticModelArchitecture
 from riichi_analysis_engine.constants import ACTION_SPACE, TILE_TYPES
 from riichi_analysis_engine.kyoku_outcome import OUTCOME_COUNT

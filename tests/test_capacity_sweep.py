@@ -5,7 +5,6 @@ import json
 import sys
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "capacity_sweep.py"
 SPEC = importlib.util.spec_from_file_location("capacity_sweep", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
