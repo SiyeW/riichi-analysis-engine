@@ -146,6 +146,9 @@ class SemanticModelArchitecture:
     event_blocks: int = 4
     decoder_width: int = 512
     attention_heads: int = 8
+    transformer_ff_multiplier: int = 4
+    transformer_tile_prior_blocks: int = 0
+    transformer_event_prior_blocks: int = 0
 
     def __post_init__(self) -> None:
         if self.backbone not in {"cnn", "transformer"}:
@@ -155,12 +158,28 @@ class SemanticModelArchitecture:
         positive = {
             name: value
             for name, value in asdict(self).items()
-            if name not in {"backbone", "observation_version"}
+            if name
+            not in {
+                "backbone",
+                "observation_version",
+                "transformer_tile_prior_blocks",
+                "transformer_event_prior_blocks",
+            }
         }
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
             raise ValueError(
                 f"architecture dimensions must be positive: {', '.join(invalid)}"
+            )
+        non_negative = {
+            "transformer_tile_prior_blocks": self.transformer_tile_prior_blocks,
+            "transformer_event_prior_blocks": self.transformer_event_prior_blocks,
+        }
+        invalid = [name for name, value in non_negative.items() if value < 0]
+        if invalid:
+            raise ValueError(
+                "architecture block counts must be non-negative: "
+                f"{', '.join(invalid)}"
             )
         if self.width % self.attention_heads:
             raise ValueError("semantic width must be divisible by attention heads")
@@ -173,12 +192,17 @@ class SemanticModelArchitecture:
         if not isinstance(value, dict):
             raise TypeError("model architecture must be an object")
         expected = set(cls.__dataclass_fields__)
-        if set(value) != expected:
-            missing = sorted(expected - set(value))
-            extra = sorted(set(value) - expected)
+        optional = {
+            "transformer_ff_multiplier",
+            "transformer_tile_prior_blocks",
+            "transformer_event_prior_blocks",
+        }
+        missing = expected - set(value)
+        extra = set(value) - expected
+        if extra or missing - optional:
             raise ValueError(
                 "model architecture fields do not match "
-                f"(missing={missing}, extra={extra})"
+                f"(missing={sorted(missing)}, extra={sorted(extra)})"
             )
         if type(value["backbone"]) is not str or not all(
             type(item) is int
@@ -186,4 +210,13 @@ class SemanticModelArchitecture:
             if name != "backbone"
         ):
             raise ValueError("model architecture values have invalid types")
-        return cls(**value)
+        # v12 checkpoints written before the prior-enhanced Transformer did not
+        # carry these Transformer-only controls.  Their historical topology was
+        # a 4x FFN without explicit tile or event prior blocks.
+        compatible = {
+            "transformer_ff_multiplier": 4,
+            "transformer_tile_prior_blocks": 0,
+            "transformer_event_prior_blocks": 0,
+            **value,
+        }
+        return cls(**compatible)

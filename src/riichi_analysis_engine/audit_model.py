@@ -46,6 +46,9 @@ def main() -> None:
     parser.add_argument("--semantic-event-blocks", type=int, default=4)
     parser.add_argument("--semantic-decoder-width", type=int, default=512)
     parser.add_argument("--semantic-attention-heads", type=int, default=8)
+    parser.add_argument("--semantic-transformer-ff-multiplier", type=int, default=4)
+    parser.add_argument("--semantic-transformer-tile-prior-blocks", type=int, default=0)
+    parser.add_argument("--semantic-transformer-event-prior-blocks", type=int, default=0)
     args = parser.parse_args()
     if args.model_format == 12:
         architecture = SemanticModelArchitecture(
@@ -57,6 +60,9 @@ def main() -> None:
             event_blocks=args.semantic_event_blocks,
             decoder_width=args.semantic_decoder_width,
             attention_heads=args.semantic_attention_heads,
+            transformer_ff_multiplier=args.semantic_transformer_ff_multiplier,
+            transformer_tile_prior_blocks=args.semantic_transformer_tile_prior_blocks,
+            transformer_event_prior_blocks=args.semantic_transformer_event_prior_blocks,
         )
     elif args.model_format >= 8:
         family_latent_width = args.family_latent_width or (
