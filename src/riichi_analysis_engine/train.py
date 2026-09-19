@@ -79,6 +79,16 @@ def gradient_total_norm(parameters: list[torch.nn.Parameter]) -> float:
     return float(torch.stack(squared).sum().sqrt())
 
 
+def gradients_are_finite(parameters: list[torch.nn.Parameter]) -> bool:
+    """Return whether every materialized gradient can be applied safely."""
+
+    return all(
+        bool(torch.isfinite(parameter.grad).all())
+        for parameter in parameters
+        if parameter.grad is not None
+    )
+
+
 def shared_gradient_geometry(
     losses: Mapping[str, torch.Tensor],
     active: Mapping[str, bool],
@@ -1311,6 +1321,7 @@ def main() -> None:
         else 0
     )
     model.train()
+    trainable_parameters = [*model.parameters(), *balancer.parameters()]
     for batch in train_loader:
         if interrupt_requested:
             stop_reason = "interrupted"
@@ -1327,47 +1338,82 @@ def main() -> None:
             args.loss_balance_learning_rate,
             args.loss_balance_learning_rate,
         )
-        optimizer.zero_grad(set_to_none=True)
-        gradient_geometry: dict[str, float] = {}
-        diagnose_gradients = bool(
-            args.gradient_diagnostics_every
-            and (step + 1) % args.gradient_diagnostics_every == 0
-        )
-        try:
-            with torch.autocast(
-                device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None
-            ):
-                if diagnose_gradients:
-                    outputs, shared = model.forward_with_shared(batch["obs"].float())
-                else:
-                    outputs = forward_batch(model, batch)
-                total, losses, active, weights = multitask_loss(
-                    outputs, batch, balancer
-                )
-            if diagnose_gradients:
-                gradient_geometry = shared_gradient_geometry(losses, active, shared)
-            scaler.scale(total).backward()
-        except torch.cuda.OutOfMemoryError:
-            # The failed batch has not advanced the single-pass cursor, so a
-            # resumed run will read it again rather than silently dropping it.
-            save_run_checkpoint(args.run / "oom-interrupted.pt")
-            write_pointer(
-                args.run,
-                args.run / "oom-interrupted.pt",
-                step=step,
-                samplesSeen=samples_seen,
+        amp_backoffs = 0
+        while True:
+            optimizer.zero_grad(set_to_none=True)
+            gradient_geometry: dict[str, float] = {}
+            diagnose_gradients = bool(
+                args.gradient_diagnostics_every
+                and (step + 1) % args.gradient_diagnostics_every == 0
             )
-            print(json.dumps({"phase": "oom", "step": step}))
-            raise
-        scaler.unscale_(optimizer)
-        gradient_norm = gradient_total_norm(list(model.parameters()))
-        gradient_max = max(
-            float(parameter.grad.abs().max())
-            for parameter in model.parameters()
-            if parameter.grad is not None
-        )
-        scaler.step(optimizer)
-        scaler.update()
+            try:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=amp_dtype,
+                    enabled=amp_dtype is not None,
+                ):
+                    if diagnose_gradients:
+                        outputs, shared = model.forward_with_shared(
+                            batch["obs"].float()
+                        )
+                    else:
+                        outputs = forward_batch(model, batch)
+                    total, losses, active, weights = multitask_loss(
+                        outputs, batch, balancer
+                    )
+                if diagnose_gradients:
+                    gradient_geometry = shared_gradient_geometry(
+                        losses, active, shared
+                    )
+                scaler.scale(total).backward()
+            except torch.cuda.OutOfMemoryError:
+                # The failed batch has not advanced the single-pass cursor, so a
+                # resumed run will read it again rather than silently dropping it.
+                save_run_checkpoint(args.run / "oom-interrupted.pt")
+                write_pointer(
+                    args.run,
+                    args.run / "oom-interrupted.pt",
+                    step=step,
+                    samplesSeen=samples_seen,
+                )
+                print(json.dumps({"phase": "oom", "step": step}))
+                raise
+            scaler.unscale_(optimizer)
+            if gradients_are_finite(trainable_parameters):
+                gradient_norm = gradient_total_norm(trainable_parameters)
+                gradient_max = max(
+                    float(parameter.grad.abs().max())
+                    for parameter in trainable_parameters
+                    if parameter.grad is not None
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                break
+
+            previous_scale = float(scaler.get_scale())
+            # GradScaler observes the non-finite gradients here, skips the
+            # optimizer update, and lowers its scale. Retry this same in-memory
+            # batch so the single-pass cursor never consumes an untrained sample.
+            scaler.step(optimizer)
+            scaler.update()
+            amp_backoffs += 1
+            current_scale = float(scaler.get_scale())
+            print(
+                json.dumps(
+                    {
+                        "phase": "amp-backoff",
+                        "step": step,
+                        "attempt": amp_backoffs,
+                        "previousScale": previous_scale,
+                        "currentScale": current_scale,
+                    }
+                ),
+                flush=True,
+            )
+            if amp_backoffs >= 8 or current_scale >= previous_scale:
+                raise FloatingPointError(
+                    "automatic mixed precision could not produce finite gradients"
+                )
         step += 1
         samples_seen += len(batch["policy"])
         analysis_rows = batch.get("analysis_active")
