@@ -149,6 +149,7 @@ class SemanticModelArchitecture:
     transformer_ff_multiplier: int = 4
     transformer_tile_prior_blocks: int = 0
     transformer_event_prior_blocks: int = 0
+    semantic_prior_version: int = 2
 
     def __post_init__(self) -> None:
         if self.backbone not in {"cnn", "transformer"}:
@@ -183,6 +184,8 @@ class SemanticModelArchitecture:
             )
         if self.width % self.attention_heads:
             raise ValueError("semantic width must be divisible by attention heads")
+        if self.semantic_prior_version not in {1, 2}:
+            raise ValueError("semantic prior version must be 1 or 2")
 
     def to_dict(self) -> dict[str, str | int]:
         return asdict(self)
@@ -196,6 +199,7 @@ class SemanticModelArchitecture:
             "transformer_ff_multiplier",
             "transformer_tile_prior_blocks",
             "transformer_event_prior_blocks",
+            "semantic_prior_version",
         }
         missing = expected - set(value)
         extra = set(value) - expected
@@ -217,6 +221,7 @@ class SemanticModelArchitecture:
             "transformer_ff_multiplier": 4,
             "transformer_tile_prior_blocks": 0,
             "transformer_event_prior_blocks": 0,
+            "semantic_prior_version": 1,
             **value,
         }
         return cls(**compatible)

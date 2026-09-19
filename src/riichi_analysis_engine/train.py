@@ -925,6 +925,7 @@ def main() -> None:
     parser.add_argument("--semantic-transformer-ff-multiplier", type=int, default=4)
     parser.add_argument("--semantic-transformer-tile-prior-blocks", type=int, default=0)
     parser.add_argument("--semantic-transformer-event-prior-blocks", type=int, default=0)
+    parser.add_argument("--semantic-prior-version", type=int, choices=(1, 2), default=2)
     parser.add_argument(
         "--analysis-channels", type=int, default=288, help=argparse.SUPPRESS
     )
@@ -1022,6 +1023,7 @@ def main() -> None:
             transformer_ff_multiplier=args.semantic_transformer_ff_multiplier,
             transformer_tile_prior_blocks=args.semantic_transformer_tile_prior_blocks,
             transformer_event_prior_blocks=args.semantic_transformer_event_prior_blocks,
+            semantic_prior_version=args.semantic_prior_version,
         )
         available_loss_terms = LOSS_TERMS_V8
     elif args.model_format in {8, 9, 10, 11}:
@@ -1110,7 +1112,12 @@ def main() -> None:
         checkpoint = torch.load(resume_path, map_location="cpu", weights_only=True)
         if checkpoint.get("format") != f"riichi-analysis-model-v{args.model_format}":
             raise RuntimeError("resume checkpoint has an unsupported format")
-        if checkpoint.get("modelArchitecture") != architecture.to_dict():
+        checkpoint_architecture = checkpoint.get("modelArchitecture")
+        if args.model_format == 12:
+            checkpoint_architecture = SemanticModelArchitecture.from_dict(
+                checkpoint_architecture
+            ).to_dict()
+        if checkpoint_architecture != architecture.to_dict():
             raise RuntimeError("resume checkpoint uses a different model architecture")
         if (
             args.model_format in {9, 10, 11, 12}

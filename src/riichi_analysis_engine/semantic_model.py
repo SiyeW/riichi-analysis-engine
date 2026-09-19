@@ -43,6 +43,22 @@ class SemanticState:
     policy_context: Tensor
 
 
+def _sinusoidal_positions(length: int, width: int, reference: Tensor) -> Tensor:
+    """Generate deterministic absolute positions without a fixed length limit."""
+
+    position = torch.arange(length, device=reference.device, dtype=torch.float32)
+    frequency = torch.exp(
+        torch.arange(0, width, 2, device=reference.device, dtype=torch.float32)
+        * (-log(10_000.0) / width)
+    )
+    encoding = torch.zeros(length, width, device=reference.device, dtype=torch.float32)
+    encoding[:, 0::2] = torch.sin(position[:, None] * frequency)
+    encoding[:, 1::2] = torch.cos(
+        position[:, None] * frequency[: encoding[:, 1::2].shape[1]]
+    )
+    return encoding.to(dtype=reference.dtype)
+
+
 class SemanticInputStem(nn.Module):
     """Turn audited planes and event fields into entity-aligned tokens."""
 
@@ -128,7 +144,7 @@ class SemanticInputStem(nn.Module):
 class TileGraphBlock(nn.Module):
     """Relation-aware CNN block without crossing suit and honor boundaries."""
 
-    def __init__(self, width: int) -> None:
+    def __init__(self, width: int, *, prior_version: int) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(width)
         self.self_projection = nn.Linear(width, width, bias=False)
@@ -140,7 +156,12 @@ class TileGraphBlock(nn.Module):
             nn.Linear(width * 2, width),
         )
         adjacency = torch.eye(PHYSICAL_TILE_TYPES)
-        for start, stop in ((0, 9), (9, 18), (18, 27), (27, 31), (31, 34)):
+        groups = (
+            ((0, 9), (9, 18), (18, 27), (27, 31), (31, 34))
+            if prior_version == 1
+            else ((0, 9), (9, 18), (18, 27))
+        )
+        for start, stop in groups:
             for tile in range(start, stop):
                 if tile > start:
                     adjacency[tile, tile - 1] = 1
@@ -164,14 +185,17 @@ class TileGraphBlock(nn.Module):
 class MaskedCausalEventBlock(nn.Module):
     """Append-safe event convolution that never reads padded or future tokens."""
 
-    def __init__(self, width: int) -> None:
+    def __init__(
+        self, width: int, *, first_dilation: int = 1, second_dilation: int = 1
+    ) -> None:
         super().__init__()
-        self.first = nn.Conv1d(width, width, 3)
-        self.second = nn.Conv1d(width, width, 3)
+        self.first = nn.Conv1d(width, width, 3, dilation=first_dilation)
+        self.second = nn.Conv1d(width, width, 3, dilation=second_dilation)
 
     @staticmethod
     def _causal(convolution: nn.Conv1d, value: Tensor) -> Tensor:
-        return convolution(F.pad(value, (2, 0)))
+        left_padding = convolution.dilation[0] * (convolution.kernel_size[0] - 1)
+        return convolution(F.pad(value, (left_padding, 0)))
 
     def forward(self, value: Tensor, mask: Tensor) -> Tensor:
         channel_mask = mask.unsqueeze(1)
@@ -205,12 +229,29 @@ class CNNBackbone(nn.Module):
         super().__init__()
         width = architecture.width
         self.tile_blocks = nn.Sequential(
-            *(TileGraphBlock(width) for _ in range(architecture.backbone_blocks))
+            *(
+                TileGraphBlock(
+                    width, prior_version=architecture.semantic_prior_version
+                )
+                for _ in range(architecture.backbone_blocks)
+            )
         )
+        dilation_pairs = ((1, 1),) * architecture.event_blocks
+        if architecture.semantic_prior_version >= 2:
+            long_range = ((1, 2), (4, 8), (16, 32))
+            dilation_pairs = tuple(
+                long_range[index] if index < len(long_range) else (1, 2)
+                for index in range(architecture.event_blocks)
+            )
         self.event_blocks = nn.ModuleList(
-            MaskedCausalEventBlock(width)
-            for _ in range(architecture.event_blocks)
+            MaskedCausalEventBlock(
+                width,
+                first_dilation=first_dilation,
+                second_dilation=second_dilation,
+            )
+            for first_dilation, second_dilation in dilation_pairs
         )
+        self.position_events = architecture.semantic_prior_version >= 2
         self.player_queries = nn.Parameter(torch.empty(4, width))
         self.global_query = nn.Parameter(torch.empty(1, width))
         self.readout = nn.MultiheadAttention(
@@ -226,6 +267,10 @@ class CNNBackbone(nn.Module):
         self, tiles: Tensor, events: Tensor, event_mask: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
         tiles = self.tile_blocks(tiles)
+        if self.position_events:
+            events = events + _sinusoidal_positions(
+                events.shape[1], events.shape[-1], events
+            ).unsqueeze(0) * event_mask.unsqueeze(-1)
         event_sequence = events.transpose(1, 2)
         for block in self.event_blocks:
             event_sequence = block(event_sequence, event_mask)
@@ -284,7 +329,9 @@ class TransformerBackbone(nn.Module):
         self.global_token = nn.Parameter(torch.empty(1, width))
         self.tile_prior_blocks = nn.Sequential(
             *(
-                TileGraphBlock(width)
+                TileGraphBlock(
+                    width, prior_version=architecture.semantic_prior_version
+                )
                 for _ in range(architecture.transformer_tile_prior_blocks)
             )
         )
@@ -313,22 +360,6 @@ class TransformerBackbone(nn.Module):
         nn.init.normal_(self.player_tokens, std=width**-0.5)
         nn.init.normal_(self.global_token, std=width**-0.5)
 
-    @staticmethod
-    def _positions(length: int, width: int, reference: Tensor) -> Tensor:
-        """Generate deterministic absolute positions without a fixed length limit."""
-
-        position = torch.arange(length, device=reference.device, dtype=torch.float32)
-        frequency = torch.exp(
-            torch.arange(0, width, 2, device=reference.device, dtype=torch.float32)
-            * (-log(10_000.0) / width)
-        )
-        encoding = torch.zeros(length, width, device=reference.device, dtype=torch.float32)
-        encoding[:, 0::2] = torch.sin(position[:, None] * frequency)
-        encoding[:, 1::2] = torch.cos(
-            position[:, None] * frequency[: encoding[:, 1::2].shape[1]]
-        )
-        return encoding.to(dtype=reference.dtype)
-
     def forward(
         self, tiles: Tensor, events: Tensor, event_mask: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -344,7 +375,7 @@ class TransformerBackbone(nn.Module):
         )
         event_mask = event_mask.bool()
         event_length = events.shape[1]
-        events = events + self._positions(
+        events = events + _sinusoidal_positions(
             event_length, events.shape[-1], events
         ).unsqueeze(0) * event_mask.unsqueeze(-1)
         for block in self.event_prior_blocks:

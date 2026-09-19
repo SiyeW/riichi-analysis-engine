@@ -1,6 +1,5 @@
 import pytest
 import torch
-
 from riichi_analysis_engine.architecture import SemanticModelArchitecture
 from riichi_analysis_engine.constants import ACTION_SPACE, TILE_TYPES
 from riichi_analysis_engine.kyoku_outcome import OUTCOME_COUNT
@@ -14,6 +13,7 @@ from riichi_analysis_engine.semantic_input import (
     EVENT_TYPE,
     PUBLIC_EVENT_TYPE_TO_ID,
 )
+from riichi_analysis_engine.semantic_model import TileGraphBlock
 
 
 def _architecture(backbone: str) -> SemanticModelArchitecture:
@@ -152,6 +152,7 @@ def test_old_transformer_architecture_metadata_keeps_historical_topology() -> No
         "transformer_ff_multiplier",
         "transformer_tile_prior_blocks",
         "transformer_event_prior_blocks",
+        "semantic_prior_version",
     ):
         current.pop(name)
 
@@ -160,6 +161,47 @@ def test_old_transformer_architecture_metadata_keeps_historical_topology() -> No
     assert restored.transformer_ff_multiplier == 4
     assert restored.transformer_tile_prior_blocks == 0
     assert restored.transformer_event_prior_blocks == 0
+    assert restored.semantic_prior_version == 1
+
+
+def test_current_tile_graph_does_not_invent_honor_adjacency() -> None:
+    current = TileGraphBlock(8, prior_version=2)
+    legacy = TileGraphBlock(8, prior_version=1)
+
+    assert current.adjacency[0, 1] > 0
+    assert current.adjacency[4, TILE_TYPES] > 0
+    assert current.adjacency[27, 28] == 0
+    assert current.adjacency[31, 32] == 0
+    assert legacy.adjacency[27, 28] > 0
+    assert legacy.adjacency[31, 32] > 0
+
+
+def test_current_cnn_event_blocks_cover_a_full_history() -> None:
+    architecture = SemanticModelArchitecture(backbone="cnn")
+    model = RiichiAnalysisModel(format_version=12, architecture=architecture)
+    blocks = model.semantic_model.backbone.event_blocks
+
+    dilations = [
+        convolution.dilation[0]
+        for block in blocks
+        for convolution in (block.first, block.second)
+    ]
+    assert dilations == [1, 2, 4, 8, 16, 32, 1, 2]
+    assert 1 + 2 * sum(dilations) >= 96
+
+
+def test_legacy_cnn_metadata_preserves_local_event_blocks() -> None:
+    metadata = SemanticModelArchitecture(backbone="cnn").to_dict()
+    metadata.pop("semantic_prior_version")
+    restored = SemanticModelArchitecture.from_dict(metadata)
+    model = RiichiAnalysisModel(format_version=12, architecture=restored)
+
+    assert restored.semantic_prior_version == 1
+    assert all(
+        convolution.dilation == (1,)
+        for block in model.semantic_model.backbone.event_blocks
+        for convolution in (block.first, block.second)
+    )
 
 
 def test_prior_transformer_candidate_stays_below_the_frozen_cnn_budget() -> None:
