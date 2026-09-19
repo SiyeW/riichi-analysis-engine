@@ -651,6 +651,29 @@ def learning_rate_at(
     return base_rate
 
 
+def tail_learning_rate_factor(
+    samples_after_update: int,
+    sample_limit: int,
+    tail_decay_samples: int,
+    final_factor: float,
+) -> float:
+    """Linearly reduce both optimizer rates over the final sample window.
+
+    The position is expressed in authoritative single-pass samples rather than
+    wall time or epochs.  A resumed run therefore obtains exactly the same
+    factor for the same next batch.  The caller passes the cursor after the
+    pending update so the last update reaches ``final_factor``.
+    """
+
+    if tail_decay_samples <= 0:
+        return 1.0
+    start = sample_limit - tail_decay_samples
+    if samples_after_update <= start:
+        return 1.0
+    progress = min(1.0, (samples_after_update - start) / tail_decay_samples)
+    return 1.0 + (final_factor - 1.0) * progress
+
+
 def _label_entropy(counts: np.ndarray) -> float:
     """Entropy in nats of a label distribution, the score of a null predictor."""
 
@@ -836,6 +859,8 @@ def save_checkpoint(
     datasets: dict[str, dict[str, object]],
     environment: dict[str, object],
     validation: dict[str, float] | None,
+    learning_rate_schedule: dict[str, object] | None = None,
+    resume_allowed: bool = True,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -879,6 +904,8 @@ def save_checkpoint(
             "datasets": datasets,
             "environment": environment,
             "validation": validation,
+            "learningRateSchedule": learning_rate_schedule,
+            "resumeAllowed": resume_allowed,
         },
         temporary,
     )
@@ -914,7 +941,9 @@ def main() -> None:
     parser.add_argument("--policy-context-blocks", type=int, default=6)
     parser.add_argument("--policy-context-width", type=int, default=384)
     parser.add_argument("--policy-width", type=int, default=1024)
-    parser.add_argument("--semantic-backbone", choices=("cnn", "transformer"), default="cnn")
+    parser.add_argument(
+        "--semantic-backbone", choices=("cnn", "transformer"), default="cnn"
+    )
     parser.add_argument("--semantic-width", type=int, default=256)
     parser.add_argument("--semantic-stem-width", type=int, default=384)
     parser.add_argument("--semantic-event-width", type=int, default=192)
@@ -924,7 +953,9 @@ def main() -> None:
     parser.add_argument("--semantic-attention-heads", type=int, default=8)
     parser.add_argument("--semantic-transformer-ff-multiplier", type=int, default=4)
     parser.add_argument("--semantic-transformer-tile-prior-blocks", type=int, default=0)
-    parser.add_argument("--semantic-transformer-event-prior-blocks", type=int, default=0)
+    parser.add_argument(
+        "--semantic-transformer-event-prior-blocks", type=int, default=0
+    )
     parser.add_argument("--semantic-prior-version", type=int, choices=(1, 2), default=2)
     parser.add_argument(
         "--analysis-channels", type=int, default=288, help=argparse.SUPPRESS
@@ -968,6 +999,18 @@ def main() -> None:
         default=0.0,
         help="rate the warmup reaches; defaults to the plateau rate",
     )
+    parser.add_argument(
+        "--tail-decay-samples",
+        type=int,
+        default=0,
+        help="linearly decay both learning rates over the final N samples; zero disables it",
+    )
+    parser.add_argument(
+        "--tail-learning-rate-factor",
+        type=float,
+        default=0.1,
+        help="final learning-rate multiplier for an enabled tail decay",
+    )
     parser.add_argument("--keep-checkpoints", type=int, default=3)
     parser.add_argument("--resume", type=Path)
     parser.add_argument(
@@ -994,8 +1037,14 @@ def main() -> None:
         raise ValueError("checkpoint retention must be non-negative")
     if args.gradient_diagnostics_every < 0:
         raise ValueError("gradient diagnostics interval must be non-negative")
+    if args.tail_decay_samples < 0:
+        raise ValueError("tail decay samples must be non-negative")
+    if not 0.0 < args.tail_learning_rate_factor <= 1.0:
+        raise ValueError("tail learning-rate factor must be in (0, 1]")
     if args.gradient_diagnostics_every and args.model_format not in {8, 9, 10, 11}:
-        raise ValueError("shared-gradient diagnostics require model formats 8 through 11")
+        raise ValueError(
+            "shared-gradient diagnostics require model formats 8 through 11"
+        )
     if args.validate_only and args.resume is None:
         raise ValueError("--validate-only requires --resume")
 
@@ -1031,26 +1080,24 @@ def main() -> None:
             1024 if args.model_format == 11 else 768
         )
         task_width = args.task_width or (1024 if args.model_format == 11 else 512)
-        architecture = (
-            StructuredModelArchitecture(
-                shared_channels=args.shared_channels,
-                shared_blocks=args.shared_blocks,
-                family_latent_width=family_latent_width,
-                opponent_latent_width=args.opponent_latent_width,
-                policy_latent_width=args.policy_latent_width,
-                opponent_blocks=args.opponent_blocks,
-                hidden_blocks=args.hidden_blocks,
-                value_blocks=args.value_blocks,
-                kyoku_blocks=args.kyoku_blocks,
-                match_blocks=args.match_blocks,
-                policy_blocks=args.policy_blocks,
-                task_width=task_width,
-                tile_width=args.tile_width,
-                policy_context_channels=args.policy_context_channels,
-                policy_context_blocks=args.policy_context_blocks,
-                policy_context_width=args.policy_context_width,
-                policy_width=args.policy_width,
-            )
+        architecture = StructuredModelArchitecture(
+            shared_channels=args.shared_channels,
+            shared_blocks=args.shared_blocks,
+            family_latent_width=family_latent_width,
+            opponent_latent_width=args.opponent_latent_width,
+            policy_latent_width=args.policy_latent_width,
+            opponent_blocks=args.opponent_blocks,
+            hidden_blocks=args.hidden_blocks,
+            value_blocks=args.value_blocks,
+            kyoku_blocks=args.kyoku_blocks,
+            match_blocks=args.match_blocks,
+            policy_blocks=args.policy_blocks,
+            task_width=task_width,
+            tile_width=args.tile_width,
+            policy_context_channels=args.policy_context_channels,
+            policy_context_blocks=args.policy_context_blocks,
+            policy_context_width=args.policy_context_width,
+            policy_width=args.policy_width,
         )
         available_loss_terms = LOSS_TERMS_V8
     else:
@@ -1110,6 +1157,8 @@ def main() -> None:
         resume_path = resolve_resume_path(args.resume)
         print(json.dumps({"resumedFrom": str(resume_path)}))
         checkpoint = torch.load(resume_path, map_location="cpu", weights_only=True)
+        if not args.validate_only and checkpoint.get("resumeAllowed", True) is not True:
+            raise RuntimeError("this checkpoint is a validation-only model candidate")
         if checkpoint.get("format") != f"riichi-analysis-model-v{args.model_format}":
             raise RuntimeError("resume checkpoint has an unsupported format")
         checkpoint_architecture = checkpoint.get("modelArchitecture")
@@ -1130,7 +1179,9 @@ def main() -> None:
             args.model_format == 12
             and checkpoint.get("semanticInput") != semantic_input_metadata()
         ):
-            raise RuntimeError("resume checkpoint uses a different semantic-input contract")
+            raise RuntimeError(
+                "resume checkpoint uses a different semantic-input contract"
+            )
         if checkpoint.get("predictionValues") != {
             "dora": list(DORA_VALUES),
             "score": list(SCORE_VALUES),
@@ -1188,6 +1239,41 @@ def main() -> None:
             max_samples=unread_samples,
             batch_size=args.batch_size,
         )
+    if args.tail_decay_samples > sample_limit:
+        raise ValueError("tail decay cannot be longer than the training sample limit")
+    peak_learning_rate = args.peak_learning_rate or args.learning_rate
+    learning_rate_schedule = {
+        "type": "sample-tail-linear-v1",
+        "warmupSteps": args.warmup_steps,
+        "cooldownSteps": args.cooldown_steps,
+        "peakLearningRate": peak_learning_rate,
+        "learningRate": args.learning_rate,
+        "lossBalanceLearningRate": args.loss_balance_learning_rate,
+        "tailDecaySamples": args.tail_decay_samples,
+        "tailLearningRateFactor": args.tail_learning_rate_factor,
+    }
+    if args.tail_decay_samples > 0:
+        # The terminal sample is part of the schedule only when it affects the
+        # rate.  Prefix-only development runs with no tail can therefore extend
+        # the same single pass without manufacturing a scheduler mismatch.
+        learning_rate_schedule["sampleLimit"] = sample_limit
+    if args.resume is not None:
+        saved_schedule = checkpoint.get("learningRateSchedule")
+        if args.validate_only and isinstance(saved_schedule, dict):
+            learning_rate_schedule = saved_schedule
+        elif saved_schedule is not None and saved_schedule != learning_rate_schedule:
+            raise RuntimeError(
+                "resume checkpoint uses a different learning-rate schedule"
+            )
+        if (
+            not args.validate_only
+            and saved_schedule is None
+            and samples_seen > 0
+            and args.tail_decay_samples > 0
+        ):
+            raise RuntimeError(
+                "a tail decay cannot be introduced while resuming a legacy checkpoint"
+            )
     validation_data = PackDataset(
         args.validation,
         max_samples=args.max_validation_samples,
@@ -1316,6 +1402,12 @@ def main() -> None:
             datasets=datasets,
             environment=environment,
             validation=validation,
+            learning_rate_schedule=learning_rate_schedule,
+            resume_allowed=(
+                True
+                if args.resume is None
+                else checkpoint.get("resumeAllowed", True) is True
+            ),
         )
 
     signal.signal(signal.SIGINT, request_interrupt)
@@ -1340,11 +1432,21 @@ def main() -> None:
             stop_reason = "interrupted"
             break
         batch = move_batch(batch, device)
-        peak = args.peak_learning_rate or args.learning_rate
-        optimizer.param_groups[0]["lr"] = learning_rate_at(
-            step, args.warmup_steps, args.cooldown_steps, peak, args.learning_rate
+        samples_after_update = min(sample_limit, samples_seen + len(batch["policy"]))
+        tail_factor = tail_learning_rate_factor(
+            samples_after_update,
+            sample_limit,
+            args.tail_decay_samples,
+            args.tail_learning_rate_factor,
         )
-        optimizer.param_groups[1]["lr"] = learning_rate_at(
+        optimizer.param_groups[0]["lr"] = tail_factor * learning_rate_at(
+            step,
+            args.warmup_steps,
+            args.cooldown_steps,
+            peak_learning_rate,
+            args.learning_rate,
+        )
+        optimizer.param_groups[1]["lr"] = tail_factor * learning_rate_at(
             step,
             args.warmup_steps,
             args.cooldown_steps,
@@ -1375,9 +1477,7 @@ def main() -> None:
                         outputs, batch, balancer
                     )
                 if diagnose_gradients:
-                    gradient_geometry = shared_gradient_geometry(
-                        losses, active, shared
-                    )
+                    gradient_geometry = shared_gradient_geometry(losses, active, shared)
                 scaler.scale(total).backward()
             except torch.cuda.OutOfMemoryError:
                 # The failed batch has not advanced the single-pass cursor, so a
@@ -1449,6 +1549,9 @@ def main() -> None:
                 "total": float(total.detach()),
                 "gradientNorm": gradient_norm,
                 "gradientMax": gradient_max,
+                "learningRate": optimizer.param_groups[0]["lr"],
+                "lossBalanceLearningRate": optimizer.param_groups[1]["lr"],
+                "tailLearningRateFactor": tail_factor,
                 **{name: float(value.detach()) for name, value in losses.items()},
                 **{
                     f"lossWeight/{name}": float(value.detach())
@@ -1487,6 +1590,10 @@ def main() -> None:
                 for name, value in gradient_geometry.items():
                     writer.add_scalar(f"GradientShared/{name}", value, step)
                 writer.add_scalar("LR", optimizer.param_groups[0]["lr"], step)
+                writer.add_scalar(
+                    "LR/loss_balance", optimizer.param_groups[1]["lr"], step
+                )
+                writer.add_scalar("LR/tail_factor", tail_factor, step)
                 writer.add_scalar("Progress/samples", samples_seen, step)
                 writer.add_scalar(
                     "Progress/analysis_samples", analysis_samples_seen, step

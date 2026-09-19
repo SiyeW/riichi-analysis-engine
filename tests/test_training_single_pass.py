@@ -41,6 +41,8 @@ def run_training(
     validate_only: bool = False,
     model_format: int = 8,
     max_analysis_samples: int = 0,
+    tail_decay_samples: int = 0,
+    tail_learning_rate_factor: float = 0.1,
 ) -> Path:
     arguments = [
         "riichi-analysis-train",
@@ -60,6 +62,10 @@ def run_training(
         "8",
         "--checkpoint-every-samples",
         str(checkpoint_every_samples),
+        "--tail-decay-samples",
+        str(tail_decay_samples),
+        "--tail-learning-rate-factor",
+        str(tail_learning_rate_factor),
         "--device",
         "cpu",
         "--model-format",
@@ -391,3 +397,23 @@ def test_terminal_sample_boundary_is_not_saved_twice(
 
     assert final_checkpoint.name == "checkpoint-step-4.pt"
     assert sorted(path.name for path in run.glob("ckpt-*.pt")) == ["ckpt-000000002.pt"]
+
+
+def test_tail_decay_is_applied_and_recorded_as_a_resume_contract(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packs = pack_directory(scratch, training_targets=True)
+    checkpoint_path = run_training(
+        monkeypatch,
+        packs,
+        scratch / "tail-run",
+        max_samples=16,
+        tail_decay_samples=8,
+        tail_learning_rate_factor=0.5,
+    )
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert checkpoint["learningRateSchedule"]["sampleLimit"] == 16
+    assert checkpoint["learningRateSchedule"]["tailDecaySamples"] == 8
+    assert checkpoint["optimizer"]["param_groups"][0]["lr"] == pytest.approx(1e-4)
+    assert checkpoint["optimizer"]["param_groups"][1]["lr"] == pytest.approx(5e-4)

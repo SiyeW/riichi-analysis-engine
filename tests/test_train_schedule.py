@@ -5,6 +5,7 @@ from riichi_analysis_engine.train import (
     gradient_total_norm,
     learning_rate_at,
     shared_gradient_geometry,
+    tail_learning_rate_factor,
 )
 
 
@@ -62,3 +63,15 @@ def test_the_schedule_depends_only_on_the_step() -> None:
     assert learning_rate_at(5_000, 2_000, 500, 4e-4, 2e-4) == learning_rate_at(
         5_000, 2_000, 500, 4e-4, 2e-4
     )
+
+
+def test_tail_decay_uses_the_authoritative_sample_cursor() -> None:
+    assert tail_learning_rate_factor(79, 100, 20, 0.1) == 1.0
+    assert tail_learning_rate_factor(80, 100, 20, 0.1) == 1.0
+    assert tail_learning_rate_factor(90, 100, 20, 0.1) == pytest.approx(0.55)
+    assert tail_learning_rate_factor(100, 100, 20, 0.1) == pytest.approx(0.1)
+    assert tail_learning_rate_factor(120, 100, 20, 0.1) == pytest.approx(0.1)
+
+
+def test_disabled_tail_decay_does_not_change_existing_runs() -> None:
+    assert tail_learning_rate_factor(100, 100, 0, 0.1) == 1.0
