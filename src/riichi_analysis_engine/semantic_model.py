@@ -181,6 +181,25 @@ class MaskedCausalEventBlock(nn.Module):
         return (value + update) * channel_mask
 
 
+class MaskedCausalEventPriorBlock(nn.Module):
+    """Cheap local event prior that preserves the complete causal memory."""
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(width)
+        self.depthwise = nn.Conv1d(width, width, 3, groups=width)
+        self.pointwise = nn.Linear(width, width)
+
+    def forward(self, value: Tensor, mask: Tensor) -> Tensor:
+        token_mask = mask.unsqueeze(-1)
+        normalized = self.norm(value) * token_mask
+        local = self.depthwise(
+            F.pad(normalized.transpose(1, 2), (2, 0))
+        ).transpose(1, 2)
+        update = self.pointwise(F.gelu(local)) * token_mask
+        return (value + update) * token_mask
+
+
 class CNNBackbone(nn.Module):
     def __init__(self, architecture: SemanticModelArchitecture) -> None:
         super().__init__()
@@ -227,13 +246,16 @@ class CNNBackbone(nn.Module):
 
 
 class DualStreamTransformerBlock(nn.Module):
-    def __init__(self, width: int, heads: int) -> None:
+    def __init__(self, width: int, heads: int, ff_multiplier: int) -> None:
         super().__init__()
         self.state_norm = nn.LayerNorm(width)
         self.state_attention = nn.MultiheadAttention(width, heads, batch_first=True)
         self.cross_attention = nn.MultiheadAttention(width, heads, batch_first=True)
         self.state_ff = nn.Sequential(
-            nn.LayerNorm(width), nn.Linear(width, width * 4), nn.GELU(), nn.Linear(width * 4, width)
+            nn.LayerNorm(width),
+            nn.Linear(width, width * ff_multiplier),
+            nn.GELU(),
+            nn.Linear(width * ff_multiplier, width),
         )
         self.event_norm = nn.LayerNorm(width)
 
@@ -260,10 +282,20 @@ class TransformerBackbone(nn.Module):
         width = architecture.width
         self.player_tokens = nn.Parameter(torch.empty(4, width))
         self.global_token = nn.Parameter(torch.empty(1, width))
+        self.tile_prior_blocks = nn.Sequential(
+            *(
+                TileGraphBlock(width)
+                for _ in range(architecture.transformer_tile_prior_blocks)
+            )
+        )
+        self.event_prior_blocks = nn.ModuleList(
+            MaskedCausalEventPriorBlock(width)
+            for _ in range(architecture.transformer_event_prior_blocks)
+        )
         event_layer = nn.TransformerEncoderLayer(
             width,
             architecture.attention_heads,
-            dim_feedforward=width * 4,
+            dim_feedforward=width * architecture.transformer_ff_multiplier,
             batch_first=True,
             norm_first=True,
         )
@@ -271,7 +303,11 @@ class TransformerBackbone(nn.Module):
             event_layer, architecture.event_blocks, enable_nested_tensor=False
         )
         self.blocks = nn.ModuleList(
-            DualStreamTransformerBlock(width, architecture.attention_heads)
+            DualStreamTransformerBlock(
+                width,
+                architecture.attention_heads,
+                architecture.transformer_ff_multiplier,
+            )
             for _ in range(architecture.backbone_blocks)
         )
         nn.init.normal_(self.player_tokens, std=width**-0.5)
@@ -296,6 +332,7 @@ class TransformerBackbone(nn.Module):
     def forward(
         self, tiles: Tensor, events: Tensor, event_mask: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
+        tiles = self.tile_prior_blocks(tiles)
         batch = len(tiles)
         state = torch.cat(
             (
@@ -310,6 +347,8 @@ class TransformerBackbone(nn.Module):
         events = events + self._positions(
             event_length, events.shape[-1], events
         ).unsqueeze(0) * event_mask.unsqueeze(-1)
+        for block in self.event_prior_blocks:
+            events = block(events, event_mask)
         causal_mask = torch.ones(
             event_length,
             event_length,

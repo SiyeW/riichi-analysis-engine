@@ -29,6 +29,22 @@ def _architecture(backbone: str) -> SemanticModelArchitecture:
     )
 
 
+def _prior_transformer_architecture() -> SemanticModelArchitecture:
+    return SemanticModelArchitecture(
+        backbone="transformer",
+        width=32,
+        stem_width=40,
+        event_width=24,
+        backbone_blocks=3,
+        event_blocks=1,
+        decoder_width=32,
+        attention_heads=4,
+        transformer_ff_multiplier=2,
+        transformer_tile_prior_blocks=1,
+        transformer_event_prior_blocks=2,
+    )
+
+
 def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     observation = torch.zeros(2, MODEL_INPUT_CHANNELS, TILE_TYPES)
     events = torch.zeros(2, 3, EVENT_FIELDS, dtype=torch.uint8)
@@ -107,6 +123,72 @@ def test_transformer_event_order_changes_the_prediction() -> None:
     changed = model(observation[0:1], reordered, mask[0:1])
 
     assert not torch.allclose(original["outcome"], changed["outcome"])
+
+
+def test_prior_transformer_supports_backward_and_ignores_event_padding() -> None:
+    torch.manual_seed(17)
+    model = RiichiAnalysisModel(
+        format_version=12, architecture=_prior_transformer_architecture()
+    )
+    model.eval()
+    observation, events, mask = _inputs()
+
+    alone = model(observation[1:2], events[1:2, :2], mask[1:2, :2])
+    batched = model(observation, events, mask)
+
+    for name in alone:
+        torch.testing.assert_close(alone[name][0], batched[name][1], atol=2e-6, rtol=2e-5)
+    sum(value.float().sum() for value in batched.values()).backward()
+    assert all(
+        parameter.grad is not None
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+
+
+def test_old_transformer_architecture_metadata_keeps_historical_topology() -> None:
+    current = _architecture("transformer").to_dict()
+    for name in (
+        "transformer_ff_multiplier",
+        "transformer_tile_prior_blocks",
+        "transformer_event_prior_blocks",
+    ):
+        current.pop(name)
+
+    restored = SemanticModelArchitecture.from_dict(current)
+
+    assert restored.transformer_ff_multiplier == 4
+    assert restored.transformer_tile_prior_blocks == 0
+    assert restored.transformer_event_prior_blocks == 0
+
+
+def test_prior_transformer_candidate_stays_below_the_frozen_cnn_budget() -> None:
+    candidate = SemanticModelArchitecture(
+        backbone="transformer",
+        width=256,
+        stem_width=320,
+        event_width=160,
+        backbone_blocks=6,
+        event_blocks=1,
+        decoder_width=384,
+        attention_heads=8,
+        transformer_ff_multiplier=2,
+        transformer_tile_prior_blocks=1,
+        transformer_event_prior_blocks=2,
+    )
+
+    candidate_parameters = count_parameters(
+        RiichiAnalysisModel(format_version=12, architecture=candidate)
+    )
+    cnn_parameters = count_parameters(
+        RiichiAnalysisModel(
+            format_version=12,
+            architecture=SemanticModelArchitecture(backbone="cnn"),
+        )
+    )
+
+    assert candidate_parameters["total"] == 7_989_137
+    assert candidate_parameters["total"] < cnn_parameters["total"] == 8_084_881
 
 
 def test_policy_context_can_change_without_recomputing_semantic_state() -> None:
