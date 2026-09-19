@@ -639,7 +639,10 @@ def test_v8_runtime_emits_constrained_probabilities_and_score_totals() -> None:
             "dora_marker": "1p",
             "scores": [25_000] * 4,
             "tehais": [own_hand, ["?"] * 13, ["?"] * 13, ["?"] * 13],
-        }
+        },
+        {"type": "tsumo", "actor": 1, "pai": "?"},
+        {"type": "reach", "actor": 1},
+        {"type": "dahai", "actor": 1, "pai": "3m"},
     ]
     runtime = AnalysisRuntime.__new__(AnalysisRuntime)
     runtime.device = torch.device("cpu")
@@ -663,16 +666,19 @@ def test_v8_runtime_emits_constrained_probabilities_and_score_totals() -> None:
         tile["expectedValue"] for tile in results["wall-tile-count"]["tiles"].values()
     )
     assert opponent_totals == pytest.approx([13.0, 13.0, 13.0], abs=1e-4)
-    assert wall_total == pytest.approx(83.0, abs=1e-4)
+    assert wall_total == pytest.approx(82.0, abs=1e-4)
     assert sum(
         player["prediction"]["expectedValue"]
         for player in results["match-score"]["players"]
     ) == pytest.approx(100_000.0, abs=1e-3)
-    tenpai_probability = 1.0 / 7.0
-    assert all(
-        probability <= tenpai_probability
+    risks = {
+        player["seat"]: player["tiles"]
         for player in results["opponent-deal-in-probability"]["players"]
-        for probability in player["tiles"].values()
-    )
+    }
+    legal_wait_probability = torch.sigmoid(torch.tensor(10.0)).item()
+    assert risks[1]["4m"] == pytest.approx(0.5 * legal_wait_probability)
+    assert risks[1]["3m"] == 0.0
+    assert risks[2]["4m"] == pytest.approx((1.0 / 7.0) * 0.5 * legal_wait_probability)
+    assert risks[3]["4m"] == pytest.approx((1.0 / 7.0) * 0.5 * legal_wait_probability)
     assert repeated is results
     assert runtime.model.calls == 1

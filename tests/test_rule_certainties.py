@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from riichi_analysis_engine.rule_certainties import (
     PublicRuleState,
@@ -108,8 +109,9 @@ def test_riichi_and_furiten_rules_use_exact_probabilities() -> None:
         np.full(34, 0.25),
         is_riichi=state.riichi[1],
         forbidden_tiles=state.forbidden_tiles[1],
+        furiten_no_yaku_probability=0.2,
     )
 
     assert shanten.tolist() == [1, 0, 0, 0, 0, 0, 0]
     assert waits[2] == 0
-    assert waits[3] == 0.25
+    assert waits[3] == pytest.approx(0.2)
