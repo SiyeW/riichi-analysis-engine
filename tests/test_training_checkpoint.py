@@ -5,11 +5,23 @@ from riichi_analysis_engine.architecture import StructuredModelArchitecture
 from riichi_analysis_engine.losses import LOSS_TERMS_V8, LearnedUncertaintyBalancer
 from riichi_analysis_engine.model import RiichiAnalysisModel
 from riichi_analysis_engine.train import (
+    gradients_are_finite,
     resume_training_cursor,
     save_checkpoint,
     single_pass_window,
     step_budget_reached,
 )
+
+
+def test_gradient_finiteness_checks_every_materialized_gradient() -> None:
+    finite = torch.nn.Parameter(torch.tensor([1.0]))
+    unused = torch.nn.Parameter(torch.tensor([2.0]))
+    finite.grad = torch.tensor([3.0])
+
+    assert gradients_are_finite([finite, unused])
+
+    finite.grad = torch.tensor([float("inf")])
+    assert not gradients_are_finite([finite, unused])
 
 
 def test_v8_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> None:
