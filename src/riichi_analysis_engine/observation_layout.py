@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from .constants import MORTAL_OBS_CHANNELS, OBS_CHANNELS, RANK_FEATURE_CHANNELS
 
-
 # Mortal v4's `at_kan_select` marker starts at channel 870.  The engine inserts
 # explicit all-player rank features before the decision-only tail.
 MORTAL_ANALYSIS_CHANNELS = 870

@@ -1,8 +1,15 @@
 import numpy as np
 
-from riichi_analysis_engine.constants import MORTAL_OBS_CHANNELS, OBS_CHANNELS, TILE_TYPES
+from riichi_analysis_engine.constants import (
+    MORTAL_OBS_CHANNELS,
+    OBS_CHANNELS,
+    TILE_TYPES,
+)
 from riichi_analysis_engine.observation_layout import POLICY_CONTEXT_START
-from riichi_analysis_engine.observations import add_all_player_ranks, all_player_rank_features
+from riichi_analysis_engine.observations import (
+    add_all_player_ranks,
+    all_player_rank_features,
+)
 
 
 def test_all_player_rank_features_encode_each_relative_player() -> None:

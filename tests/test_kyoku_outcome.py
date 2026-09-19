@@ -4,8 +4,8 @@ import pytest
 from riichi_analysis_engine.kyoku_outcome import (
     OUTCOME_CLASSES,
     OUTCOME_COUNT,
-    outcome_marginals,
     outcome_class_index,
+    outcome_marginals,
 )
 
 

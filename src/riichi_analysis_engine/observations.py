@@ -4,7 +4,12 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from .constants import MORTAL_OBS_CHANNELS, OBS_CHANNELS, RANK_FEATURE_CHANNELS, TILE_TYPES
+from .constants import (
+    MORTAL_OBS_CHANNELS,
+    OBS_CHANNELS,
+    RANK_FEATURE_CHANNELS,
+    TILE_TYPES,
+)
 from .observation_layout import MORTAL_ANALYSIS_CHANNELS
 
 

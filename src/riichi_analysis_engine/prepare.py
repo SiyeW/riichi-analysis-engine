@@ -25,7 +25,7 @@ def stable_source_order(names: list[str], seed: int) -> list[str]:
     return sorted(
         names,
         key=lambda name: (
-            hashlib.sha256(f"{seed}\0{name}".encode("utf-8")).digest(),
+            hashlib.sha256(f"{seed}\0{name}".encode()).digest(),
             name,
         ),
     )

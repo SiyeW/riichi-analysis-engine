@@ -19,10 +19,10 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable
-
+from typing import Any
 
 SWEEP_FORMAT = "riichi-analysis-capacity-sweep-v1"
 
