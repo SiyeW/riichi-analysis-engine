@@ -49,6 +49,7 @@ from .model_input import (
 from .observations import add_all_player_ranks
 from .prediction_values import DORA_VALUES, SCORE_VALUES, score_class_mask
 from .rule_certainties import (
+    PublicRuleState,
     apply_opponent_rule_certainties,
     constrain_distribution,
 )
@@ -436,6 +437,7 @@ class AnalysisRuntime:
         *,
         at_kan_select: bool,
         analysis_observation: np.ndarray | None = None,
+        rule_state: PublicRuleState | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         observation, mask = state.encode_obs(4, at_kan_select)
         if self.format_version in {9, 10, 11, 12, 13}:
@@ -453,6 +455,8 @@ class AnalysisRuntime:
                         candidates,
                         mask,
                         at_kan_select=at_kan_select,
+                        seat=int(state.player_id),
+                        rule_state=rule_state,
                     ),
                 )
                 if self.format_version == 13
@@ -487,8 +491,10 @@ class AnalysisRuntime:
     ) -> np.ndarray:
         state = self._state(events, controlled_seat)
         score_state = PublicScoreState()
+        rule_state = PublicRuleState()
         for event in events:
             score_state.process(event)
+            rule_state.process(event)
         analysis_observation = (
             self._analysis_observation(events, controlled_seat)
             if self.format_version in {9, 10, 11, 12, 13}
@@ -499,6 +505,7 @@ class AnalysisRuntime:
             score_state,
             at_kan_select=False,
             analysis_observation=analysis_observation,
+            rule_state=rule_state,
         )
         return observation
 
@@ -553,6 +560,7 @@ class AnalysisRuntime:
             score_state,
             at_kan_select=False,
             analysis_observation=analysis_observation,
+            rule_state=session.rule_state,
         )
         tensor = torch.from_numpy(observation).unsqueeze(0).to(self.device)
         semantic_memory: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -968,6 +976,7 @@ class AnalysisRuntime:
                     score_state,
                     at_kan_select=True,
                     analysis_observation=analysis_observation,
+                    rule_state=session.rule_state,
                 )
                 selection_tensor = (
                     torch.from_numpy(selection_observation).unsqueeze(0).to(self.device)

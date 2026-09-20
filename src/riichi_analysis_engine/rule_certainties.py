@@ -52,6 +52,8 @@ def constrain_distribution(
 
 @dataclass
 class PublicRuleState:
+    bakaze: int = 0
+    oya: int = 0
     concealed_sizes: list[int] = field(default_factory=lambda: [0] * 4)
     known_concealed: list[Counter[str]] = field(
         default_factory=lambda: [Counter() for _ in range(4)]
@@ -81,6 +83,8 @@ class PublicRuleState:
         return state
 
     def _reset(self, event: dict[str, Any]) -> None:
+        self.bakaze = "ESWN".index(str(event.get("bakaze", "E")))
+        self.oya = int(event.get("oya", 0))
         raw_hands = event.get("tehais")
         hands = raw_hands if isinstance(raw_hands, list) else []
         self.concealed_sizes = [
@@ -202,6 +206,27 @@ class PublicRuleState:
             | self._riichi_passes[seat]
             for seat in range(4)
         ]
+
+    def visible_family_count(self, seat: int, family: str) -> int:
+        """Return copies known to this seat: its hand plus all public copies."""
+
+        return self._known_family_in_hand(seat, family) + sum(
+            count for tile, count in self.exposed.items() if deaka(tile) == family
+        )
+
+    def furiten_causes(
+        self, seat: int, structural_waits: np.ndarray
+    ) -> tuple[bool, bool, bool]:
+        waits = {
+            TILES_34[index]
+            for index, waiting in enumerate(np.asarray(structural_waits, dtype=bool))
+            if waiting
+        }
+        return (
+            bool(waits & self._own_discards[seat]),
+            bool(waits & self._temporary_passes[seat]),
+            bool(waits & self._riichi_passes[seat]),
+        )
 
     def _known_family_in_hand(self, seat: int, family: str) -> int:
         return sum(

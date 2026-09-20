@@ -11,9 +11,18 @@ from riichi_analysis_engine.rule_context import (
 
 
 def test_rule_context_names_and_encodes_decisive_self_facts() -> None:
+    hand = np.zeros(34, dtype=np.uint8)
+    hand[[0, 1, 2, 3]] = 3
+    hand[27] = 1
     state = SimpleNamespace(
+        player_id=0,
+        tehai=hand,
+        chis=[],
+        pons=[],
+        minkans=[],
+        ankans=[],
         shanten=0,
-        waits=np.eye(1, 34, 12, dtype=np.float32)[0],
+        waits=np.eye(1, 34, 27, dtype=np.float32)[0],
         at_furiten=False,
         self_riichi_declared=True,
         self_riichi_accepted=True,
@@ -48,9 +57,11 @@ def test_rule_context_names_and_encodes_decisive_self_facts() -> None:
         for index, name in enumerate(RULE_GLOBAL_FEATURE_NAMES)
     }
 
-    assert encoded[tile["completion_wait"], 12] == 1
+    assert encoded[tile["structural_wait"], 27] == 1
+    assert encoded[tile["ron_yaku"], 27] == 1
+    assert encoded[tile["tsumo_yaku"], 27] == 1
     assert encoded[tile["ankan_candidate"], 4] == 1
     assert encoded[tile["kakan_candidate"], 13] == 1
-    assert np.all(encoded[global_["shanten_complete"]] == 1)
+    assert np.all(encoded[global_["shanten_0"]] == 1)
     assert np.all(encoded[global_["can_ron"]] == 1)
     assert np.all(encoded[global_["phase_response"]] == 1)

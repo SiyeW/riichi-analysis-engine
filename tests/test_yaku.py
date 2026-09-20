@@ -1,6 +1,6 @@
 import numpy as np
 
-from riichi_analysis_engine.yaku import has_ron_yaku, is_complete_hand
+from riichi_analysis_engine.yaku import has_ron_yaku, has_tsumo_yaku, is_complete_hand
 
 
 def hand(*groups: tuple[int, int]) -> np.ndarray:
@@ -33,3 +33,12 @@ def test_open_hand_requires_yaku() -> None:
         jikaze=28,
         winning_tile=3,
     )
+
+
+def test_closed_tsumo_is_yaku_only_for_a_complete_hand() -> None:
+    complete = hand((0, 3), (1, 3), (2, 3), (3, 3), (27, 2))
+    incomplete = complete.copy()
+    incomplete[27] -= 1
+
+    assert has_tsumo_yaku(complete, bakaze=27, jikaze=28, winning_tile=27)
+    assert not has_tsumo_yaku(incomplete, bakaze=27, jikaze=28, winning_tile=27)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -7,6 +8,14 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+RULE_TABLE_HASHES = {
+    "src/riichi_analysis_engine/data/shanten_jihai.npy": (
+        "036676e6449d96add9e7d6bcd649d5f0ab7d0f93a3ea3758dab59d275cce46f6"
+    ),
+    "src/riichi_analysis_engine/data/shanten_suhai.npy": (
+        "8c8cf2b3d4181e1d82e484cd6c8000d3a7acd6bbb2695975e49970d097ba2a1c"
+    ),
+}
 
 
 def require(condition: bool, message: str) -> None:
@@ -67,8 +76,19 @@ def main() -> None:
 
     files = public_files()
     forbidden_suffixes = {".ckpt", ".mjson", ".npy", ".npz", ".onnx", ".pt", ".pth", ".zip"}
-    forbidden = [path for path in files if path.suffix.lower() in forbidden_suffixes]
+    allowlisted_rule_tables = {ROOT / path for path in RULE_TABLE_HASHES}
+    forbidden = [
+        path
+        for path in files
+        if path.suffix.lower() in forbidden_suffixes
+        and path not in allowlisted_rule_tables
+    ]
     require(not forbidden, "generated data or weights found in the source tree")
+    for relative, expected_hash in RULE_TABLE_HASHES.items():
+        table = ROOT / relative
+        require(table in files, f"missing audited rule table: {relative}")
+        actual_hash = hashlib.sha256(table.read_bytes()).hexdigest()
+        require(actual_hash == expected_hash, f"rule table checksum differs: {relative}")
 
     environment_files = [
         path

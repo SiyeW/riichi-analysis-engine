@@ -109,6 +109,7 @@ def _division_has_yaku(
     bakaze: int,
     jikaze: int,
     winning_tile: int,
+    is_ron: bool,
 ) -> bool:
     triplets = concealed_triplets + pons + minkans + ankans
     sequences = concealed_sequences + chis
@@ -146,7 +147,9 @@ def _division_has_yaku(
             return True
 
     closed_triplet_count = len(ankans) + len(concealed_triplets)
-    if _ron_opens_triplet(winning_tile, concealed_triplets, concealed_sequences):
+    if is_ron and _ron_opens_triplet(
+        winning_tile, concealed_triplets, concealed_sequences
+    ):
         closed_triplet_count -= 1
     if closed_triplet_count >= 3 or len(ankans) + len(minkans) >= 3:
         return True
@@ -169,7 +172,7 @@ def _division_has_yaku(
     )
 
 
-def has_ron_yaku(
+def has_yaku(
     hand: np.ndarray,
     *,
     chis: list[int] | tuple[int, ...] = (),
@@ -179,6 +182,7 @@ def has_ron_yaku(
     bakaze: int,
     jikaze: int,
     winning_tile: int,
+    is_ron: bool,
 ) -> bool:
     counts = tuple(int(value) for value in hand)
     chis = tuple(int(value) for value in chis)
@@ -189,6 +193,11 @@ def has_ron_yaku(
     if is_menzen and (_is_kokushi(counts) or _is_chiitoi(counts)):
         return True
     needed = 4 - len(chis) - len(pons) - len(minkans) - len(ankans)
+    divisions = _standard_divisions(counts, needed)
+    if not divisions:
+        return False
+    if is_menzen and not is_ron:
+        return True
     return any(
         _division_has_yaku(
             pair,
@@ -202,8 +211,57 @@ def has_ron_yaku(
             bakaze=bakaze,
             jikaze=jikaze,
             winning_tile=winning_tile,
+            is_ron=is_ron,
         )
-        for pair, triplets, sequences in _standard_divisions(counts, needed)
+        for pair, triplets, sequences in divisions
+    )
+
+
+def has_ron_yaku(
+    hand: np.ndarray,
+    *,
+    chis: list[int] | tuple[int, ...] = (),
+    pons: list[int] | tuple[int, ...] = (),
+    minkans: list[int] | tuple[int, ...] = (),
+    ankans: list[int] | tuple[int, ...] = (),
+    bakaze: int,
+    jikaze: int,
+    winning_tile: int,
+) -> bool:
+    return has_yaku(
+        hand,
+        chis=chis,
+        pons=pons,
+        minkans=minkans,
+        ankans=ankans,
+        bakaze=bakaze,
+        jikaze=jikaze,
+        winning_tile=winning_tile,
+        is_ron=True,
+    )
+
+
+def has_tsumo_yaku(
+    hand: np.ndarray,
+    *,
+    chis: list[int] | tuple[int, ...] = (),
+    pons: list[int] | tuple[int, ...] = (),
+    minkans: list[int] | tuple[int, ...] = (),
+    ankans: list[int] | tuple[int, ...] = (),
+    bakaze: int,
+    jikaze: int,
+    winning_tile: int,
+) -> bool:
+    return has_yaku(
+        hand,
+        chis=chis,
+        pons=pons,
+        minkans=minkans,
+        ankans=ankans,
+        bakaze=bakaze,
+        jikaze=jikaze,
+        winning_tile=winning_tile,
+        is_ron=False,
     )
 
 

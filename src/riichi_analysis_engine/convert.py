@@ -34,6 +34,7 @@ from .replay import (
     read_events,
     rotated_future,
 )
+from .rule_certainties import PublicRuleState
 from .rule_context import encode_rule_context
 from .semantic_input import EVENT_MEMORY_SCHEMA_ID, PublicEventHistoryEncoder
 from .storage import STAGED_GAME_FORMAT, read_chunk_archive_meta, save_chunk_archive
@@ -43,6 +44,29 @@ from .storage import STAGED_GAME_FORMAT, read_chunk_archive_meta, save_chunk_arc
 class ConvertedGame:
     arrays: dict[str, np.ndarray]
     event_catalog: np.ndarray
+
+
+def _analysis_perspective(
+    events: list[dict[str, Any]], source_id: str, event_index: int
+) -> int:
+    """Direct a terminal-preceding frame to an actual winner when possible."""
+
+    winners: list[int] = []
+    for event in events[event_index + 1 :]:
+        kind = event.get("type")
+        if kind in FRAME_EVENTS:
+            break
+        if kind == "hora":
+            actor = int(event["actor"])
+            if actor not in winners:
+                winners.append(actor)
+            continue
+        if kind in {"ryukyoku", "end_kyoku", "end_game"}:
+            break
+    if not winners:
+        return passive_perspective(source_id, event_index)
+    selection = passive_perspective(source_id, event_index) % len(winners)
+    return winners[selection]
 
 
 def read_manifest(path: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
@@ -215,6 +239,7 @@ def convert_game(
     annotations = annotate_game(events)
     full_state = FullState()
     public_state = PublicHistoryState()
+    rule_state = PublicRuleState()
     analysis_encoder = IncrementalTilePlaneEncoder()
     exact_tracker = ExactTargetTracker()
     event_history = PublicEventHistoryEncoder()
@@ -243,7 +268,12 @@ def convert_game(
             compose_shared_model_input(
                 analysis,
                 encode_rule_context(
-                    state, candidates, action_mask, at_kan_select=at_kan_select
+                    state,
+                    candidates,
+                    action_mask,
+                    at_kan_select=at_kan_select,
+                    seat=perspective,
+                    rule_state=rule_state,
                 ),
             )
             if model_format == 13
@@ -283,6 +313,7 @@ def convert_game(
         candidates = [state.update(event_json) for state in states]
         full_state.process(event)
         public_state.process(event)
+        rule_state.process(event)
         exact_targets = exact_tracker.process(event, states)
         if event["type"] not in FRAME_EVENTS:
             continue
@@ -293,7 +324,7 @@ def convert_game(
 
         sampled: set[int] = set()
         encoded: dict[int, tuple[Any, Any]] = {}
-        analysis_perspective = passive_perspective(source_id, index)
+        analysis_perspective = _analysis_perspective(events, source_id, index)
         for perspective, cans in enumerate(candidates):
             mortal_observation, mask = states[perspective].encode_obs(
                 OBS_VERSION, False
