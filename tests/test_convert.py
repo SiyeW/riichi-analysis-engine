@@ -111,7 +111,7 @@ def test_conversion_references_one_shared_full_event_catalog() -> None:
     np.testing.assert_array_equal(converted.arrays["analysis_active"], [True])
 
 
-def test_conversion_reuses_each_frame_observation() -> None:
+def test_conversion_encodes_only_the_retained_analysis_perspective() -> None:
     events = [
         {
             "type": "start_kyoku",
@@ -132,7 +132,7 @@ def test_conversion_reuses_each_frame_observation() -> None:
 
     convert_game(events, "count-observations", player_state_type=_CountingPlayerState)
 
-    assert _CountingPlayerState.encode_calls == 4
+    assert _CountingPlayerState.encode_calls == 1
 
 
 def test_conversion_records_perspective_relative_hidden_baseline_anchors() -> None:

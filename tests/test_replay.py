@@ -7,6 +7,7 @@ import numpy as np
 
 from riichi_analysis_engine.prediction_values import SCORE_VALUE_SET, SCORE_VALUES
 from riichi_analysis_engine.replay import (
+    ExactTargetTracker,
     FullState,
     HiddenBaselineAnchorTracker,
     _ron_label_hand,
@@ -161,6 +162,36 @@ def test_terminal_riichi_stick_tie_uses_initial_seat_order() -> None:
     scores = np.asarray([30000, 30000, 20000, 19000])
 
     assert terminal_match_scores(scores, 1).tolist() == [31000, 30000, 20000, 19000]
+
+
+def test_exact_targets_reuse_an_unchanged_player_state(monkeypatch) -> None:
+    tracker = ExactTargetTracker()
+    state = SimpleNamespace(
+        tehai=np.zeros(34, dtype=np.uint8),
+        chis=[],
+        pons=[],
+        minkans=[],
+        ankans=[],
+        shanten=3,
+        has_next_shanten_discard=False,
+        self_riichi_declared=False,
+        self_riichi_accepted=False,
+    )
+    calls = 0
+    original = tracker._compute_player_target
+
+    def counted(player, player_state):
+        nonlocal calls
+        calls += 1
+        return original(player, player_state)
+
+    monkeypatch.setattr(tracker, "_compute_player_target", counted)
+
+    first = tracker._player_target(0, state)
+    second = tracker._player_target(0, state)
+
+    assert second is first
+    assert calls == 1
 
 
 def test_annotate_game_settles_unclaimed_terminal_riichi_sticks() -> None:

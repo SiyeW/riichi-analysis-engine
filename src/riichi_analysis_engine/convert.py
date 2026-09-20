@@ -55,6 +55,35 @@ class ConvertedGame:
     frame_counts: dict[str, dict[str, int]]
 
 
+_ACTION_CANDIDATE_FLAGS = (
+    "can_discard",
+    "can_riichi",
+    "can_chi_low",
+    "can_chi_mid",
+    "can_chi_high",
+    "can_pon",
+    "can_daiminkan",
+    "can_ankan",
+    "can_kakan",
+    "can_tsumo_agari",
+    "can_ron_agari",
+    "can_ryukyoku",
+    "can_pass",
+)
+
+
+def _candidate_has_legal_action(candidates: Any) -> bool:
+    """Check action availability before materializing Mortal's observation."""
+
+    for name in _ACTION_CANDIDATE_FLAGS:
+        value = getattr(candidates, name, False)
+        if callable(value):
+            value = value()
+        if bool(value):
+            return True
+    return False
+
+
 def _analysis_perspective(
     source_id: str,
     event_index: int,
@@ -341,6 +370,18 @@ def convert_game(
 
         sampled: set[int] = set()
         encoded: dict[int, tuple[Any, Any]] = {}
+
+        def encode_primary(
+            perspective: int,
+            cache: dict[int, tuple[Any, Any]] = encoded,
+            player_states: list[Any] = states,
+        ) -> tuple[Any, Any]:
+            cached = cache.get(perspective)
+            if cached is None:
+                cached = player_states[perspective].encode_obs(OBS_VERSION, False)
+                cache[perspective] = cached
+            return cached
+
         analysis_perspective = _analysis_perspective(
             source_id, index, hidden_baseline_anchors
         )
@@ -357,11 +398,7 @@ def convert_game(
             analysis_kept_frames.add(index)
 
         for perspective, cans in enumerate(candidates):
-            mortal_observation, mask = states[perspective].encode_obs(
-                OBS_VERSION, False
-            )
-            encoded[perspective] = (mortal_observation, mask)
-            if not bool(mask.any()):
+            if not _candidate_has_legal_action(cans):
                 continue
             policy, kan_tile = action_label(
                 perspective, states[perspective], cans, events, index
@@ -374,6 +411,9 @@ def convert_game(
                 source_id, index, perspective, policy_stratum
             )
             if not keep_policy:
+                continue
+            mortal_observation, mask = encode_primary(perspective)
+            if not bool(mask.any()):
                 continue
             frame_counts[policy_stratum]["kept"] += 1
             append_sample(
@@ -410,7 +450,7 @@ def convert_game(
                 )
 
         if keep_analysis and analysis_perspective not in sampled:
-            mortal_observation, mask = encoded[analysis_perspective]
+            mortal_observation, mask = encode_primary(analysis_perspective)
             append_sample(
                 index,
                 event,
