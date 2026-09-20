@@ -267,9 +267,9 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
         if worker is None:
             packs = self.selected_packs()
         else:
-            if self.start_sample:
+            if self.start_sample and worker.num_workers != 1:
                 raise ValueError(
-                    "starting from a sample cursor requires a single worker"
+                    "starting from a sample cursor requires at most one loader worker"
                 )
             packs = self.selected_packs(worker.id, worker.num_workers)
         accepted = 0

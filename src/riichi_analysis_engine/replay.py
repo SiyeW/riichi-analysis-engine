@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import gzip
 import hashlib
 import itertools
@@ -121,12 +122,18 @@ def _ron_label_hand(
 
 
 def read_events(source: str) -> list[dict[str, Any]]:
+    return _decode_event_payload(_read_event_payload(source))
+
+
+def _read_event_payload(source: str) -> bytes:
     if source.startswith("zip://"):
         archive_path, member = source[6:].split("!", 1)
         with zipfile.ZipFile(archive_path) as archive:
-            payload = archive.read(member)
-    else:
-        payload = Path(source).read_bytes()
+            return archive.read(member)
+    return Path(source).read_bytes()
+
+
+def _decode_event_payload(payload: bytes) -> list[dict[str, Any]]:
     # Some source yearly archives store gzip members under a misleading
     # ``.mjson`` name.  Detect the payload format at the byte boundary instead
     # of trusting either the outer ZIP member name or the filesystem suffix.
@@ -134,6 +141,32 @@ def read_events(source: str) -> list[dict[str, Any]]:
         payload = gzip.decompress(payload)
     text = payload.decode("utf-8")
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+class EventArchiveCache:
+    """Reuse yearly ZIP central directories within one converter process."""
+
+    def __init__(self) -> None:
+        self._archives: dict[str, zipfile.ZipFile] = {}
+
+    def read_events(self, source: str) -> list[dict[str, Any]]:
+        if not source.startswith("zip://"):
+            return read_events(source)
+        archive_path, member = source[6:].split("!", 1)
+        archive = self._archives.get(archive_path)
+        if archive is None:
+            archive = zipfile.ZipFile(archive_path)
+            self._archives[archive_path] = archive
+        return _decode_event_payload(archive.read(member))
+
+    def close(self) -> None:
+        for archive in self._archives.values():
+            archive.close()
+        self._archives.clear()
+
+
+WORKER_EVENT_ARCHIVES = EventArchiveCache()
+atexit.register(WORKER_EVENT_ARCHIVES.close)
 
 
 def _remove_one(counter: Counter[str], tile: str) -> None:

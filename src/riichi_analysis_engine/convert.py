@@ -17,7 +17,7 @@ import numpy as np
 from .analysis_observation import IncrementalTilePlaneEncoder
 from .analysis_state import PublicHistoryState
 from .constants import OBS_VERSION, relative_players
-from .frame_sampling import FrameSamplingPlan
+from .frame_sampling import SAMPLING_STRATA, FrameSamplingPlan
 from .model_input import (
     MODEL_INPUT_SCHEMA_ID,
     SHARED_MODEL_INPUT_SCHEMA_ID,
@@ -27,6 +27,7 @@ from .model_input import (
 )
 from .replay import (
     FRAME_EVENTS,
+    WORKER_EVENT_ARCHIVES,
     ExactTargetTracker,
     FullState,
     HiddenBaselineAnchorTracker,
@@ -55,26 +56,24 @@ class ConvertedGame:
 
 
 def _analysis_perspective(
-    events: list[dict[str, Any]], source_id: str, event_index: int
+    source_id: str,
+    event_index: int,
+    baseline_anchors: np.ndarray | None = None,
 ) -> int:
-    """Direct a terminal-preceding frame to an actual winner when possible."""
+    """Select analysis supervision without consulting future labels.
 
-    winners: list[int] = []
-    for event in events[event_index + 1 :]:
-        kind = event.get("type")
-        if kind in FRAME_EVENTS:
-            break
-        if kind == "hora":
-            actor = int(event["actor"])
-            if actor not in winners:
-                winners.append(actor)
-            continue
-        if kind in {"ryukyoku", "end_kyoku", "end_game"}:
-            break
-    if not winners:
-        return passive_perspective(source_id, event_index)
-    selection = passive_perspective(source_id, event_index) % len(winners)
-    return winners[selection]
+    If any perspective is still in the exact no-information state, retain one
+    of those views so the scarce analytic anchors are not lost merely because
+    the ordinary passive-perspective hash selected another seat.
+    """
+
+    selection = passive_perspective(source_id, event_index)
+    if baseline_anchors is None:
+        return selection
+    anchored = np.flatnonzero(baseline_anchors)
+    if not len(anchored):
+        return selection
+    return int(anchored[selection % len(anchored)])
 
 
 def read_manifest(path: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
@@ -258,10 +257,8 @@ def convert_game(
     kyoku_index = -1
     history_start = -1
     history_length = 0
-    frame_counts = {
-        name: {"seen": 0, "kept": 0}
-        for name in ("decisive", "rare_action", "state_change", "ordinary")
-    }
+    frame_counts = {name: {"seen": 0, "kept": 0} for name in SAMPLING_STRATA}
+    analysis_kept_frames: set[int] = set()
 
     def append_sample(
         event_index: int,
@@ -342,22 +339,23 @@ def convert_game(
         if hidden_baseline_anchors is None:
             raise RuntimeError(f"missing hidden baseline state at {source_id}:{index}")
 
-        if sampling_plan is not None:
-            stratum = sampling_plan.classify(events, index, candidates)
-            frame_counts[stratum]["seen"] += 1
-            if not sampling_plan.keep(source_id, index, stratum):
-                continue
-            frame_counts[stratum]["kept"] += 1
-        else:
-            stratum = (
-                FrameSamplingPlan(0).classify(events, index, candidates)
-            )
-            frame_counts[stratum]["seen"] += 1
-            frame_counts[stratum]["kept"] += 1
-
         sampled: set[int] = set()
         encoded: dict[int, tuple[Any, Any]] = {}
-        analysis_perspective = _analysis_perspective(events, source_id, index)
+        analysis_perspective = _analysis_perspective(
+            source_id, index, hidden_baseline_anchors
+        )
+        analysis_stratum = FrameSamplingPlan.analysis_stratum(
+            event,
+            baseline_anchor=bool(hidden_baseline_anchors[analysis_perspective]),
+        )
+        frame_counts[analysis_stratum]["seen"] += 1
+        keep_analysis = sampling_plan is None or sampling_plan.keep(
+            source_id, index, analysis_perspective, analysis_stratum
+        )
+        if keep_analysis:
+            frame_counts[analysis_stratum]["kept"] += 1
+            analysis_kept_frames.add(index)
+
         for perspective, cans in enumerate(candidates):
             mortal_observation, mask = states[perspective].encode_obs(
                 OBS_VERSION, False
@@ -370,6 +368,14 @@ def convert_game(
             )
             if policy is None:
                 continue
+            policy_stratum = FrameSamplingPlan.policy_stratum(event, cans)
+            frame_counts[policy_stratum]["seen"] += 1
+            keep_policy = sampling_plan is None or sampling_plan.keep(
+                source_id, index, perspective, policy_stratum
+            )
+            if not keep_policy:
+                continue
+            frame_counts[policy_stratum]["kept"] += 1
             append_sample(
                 index,
                 event,
@@ -380,7 +386,7 @@ def convert_game(
                 states[perspective],
                 cans,
                 policy=policy,
-                analysis_active=perspective == analysis_perspective,
+                analysis_active=(keep_analysis and perspective == analysis_perspective),
                 hidden_baseline_anchor=bool(hidden_baseline_anchors[perspective]),
             )
             sampled.add(perspective)
@@ -399,13 +405,11 @@ def convert_game(
                     cans,
                     policy=kan_tile,
                     analysis_active=False,
-                    hidden_baseline_anchor=bool(
-                        hidden_baseline_anchors[perspective]
-                    ),
+                    hidden_baseline_anchor=bool(hidden_baseline_anchors[perspective]),
                     at_kan_select=True,
                 )
 
-        if analysis_perspective not in sampled:
+        if keep_analysis and analysis_perspective not in sampled:
             mortal_observation, mask = encoded[analysis_perspective]
             append_sample(
                 index,
@@ -428,11 +432,13 @@ def convert_game(
     arrays = {name: np.asarray(values) for name, values in samples.items()}
     frame_indices = arrays["event_index"]
     active_indices = frame_indices[arrays["analysis_active"]]
-    frames, active_counts = np.unique(active_indices, return_counts=True)
-    all_frames = np.unique(frame_indices)
-    if not np.array_equal(frames, all_frames) or np.any(active_counts != 1):
+    active_frames, active_counts = np.unique(active_indices, return_counts=True)
+    expected_active_frames = np.asarray(sorted(analysis_kept_frames), dtype=np.int32)
+    if not np.array_equal(active_frames, expected_active_frames) or np.any(
+        active_counts != 1
+    ):
         raise RuntimeError(
-            f"analysis supervision is not one row per frame in {source_id}"
+            f"analysis supervision does not match selected frames in {source_id}"
         )
     return ConvertedGame(
         arrays=arrays,
@@ -451,6 +457,7 @@ def convert_record_to_archive(
     compression_level: int,
     model_format: int,
     sampling_plan: FrameSamplingPlan | None,
+    use_archive_cache: bool,
 ) -> tuple[int, str, int, dict[str, dict[str, int]], str | None]:
     """Stage one game as independently compressed sample chunks."""
 
@@ -469,8 +476,7 @@ def convert_record_to_archive(
                 and meta.get("eventMemorySchema") == EVENT_MEMORY_SCHEMA_ID
                 and (
                     model_format != 13
-                    or meta.get("trainingTargetSchema")
-                    == TRAINING_TARGET_SCHEMA_ID
+                    or meta.get("trainingTargetSchema") == TRAINING_TARGET_SCHEMA_ID
                 )
                 and meta.get("frameSampling")
                 == (sampling_plan.metadata() if sampling_plan else None)
@@ -491,7 +497,11 @@ def convert_record_to_archive(
     from libriichi.state import PlayerState
 
     try:
-        events = read_events(record["path"])
+        events = (
+            WORKER_EVENT_ARCHIVES.read_events(record["path"])
+            if use_archive_cache
+            else read_events(record["path"])
+        )
         converted = convert_game(
             events,
             record["sourceId"],
@@ -593,10 +603,7 @@ def main() -> None:
         if args.frame_sampling_seed is not None
         else None
     )
-    frame_counts = {
-        name: {"seen": 0, "kept": 0}
-        for name in ("decisive", "rare_action", "state_change", "ordinary")
-    }
+    frame_counts = {name: {"seen": 0, "kept": 0} for name in SAMPLING_STRATA}
     failures: list[dict[str, str]] = []
     start = time.perf_counter()
     output_root = str(args.output.resolve())
@@ -611,6 +618,7 @@ def main() -> None:
             args.compression_level,
             args.model_format,
             sampling_plan,
+            True,
         )
         for index, record in indexed_records
     ]
@@ -646,7 +654,7 @@ def main() -> None:
         return summary
 
     def collect(
-        result: tuple[int, str, int, dict[str, dict[str, int]], str | None]
+        result: tuple[int, str, int, dict[str, dict[str, int]], str | None],
     ) -> None:
         nonlocal converted_games, converted_samples
         _index, source_id, samples, game_counts, error = result

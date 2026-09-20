@@ -61,7 +61,7 @@ def build_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--require-analysis-active",
         action="store_true",
-        help="require the v10 one-analysis-row-per-frame training contract",
+        help="audit selected analysis rows and reject duplicate supervision per frame",
     )
     parser.add_argument(
         "--verify-storage",
@@ -101,10 +101,11 @@ def check_one_pack(path: Path) -> dict[str, object]:
 
 
 def check_analysis_rows(paths: list[Path]) -> dict[str, int]:
-    """Verify that each staged natural frame owns exactly one analysis row."""
+    """Verify that a staged frame owns at most one selected analysis row."""
 
     frames = 0
     rows = 0
+    supervised_frames = 0
     for path in paths:
         meta = read_chunk_archive_meta(path)
         event_parts: list[np.ndarray] = []
@@ -124,13 +125,20 @@ def check_analysis_rows(paths: list[Path]) -> dict[str, int]:
         active_frames, active_counts = np.unique(
             event_index[analysis_active], return_counts=True
         )
-        if not np.array_equal(active_frames, all_frames) or np.any(active_counts != 1):
+        if np.any(active_counts != 1):
             raise SystemExit(
-                f"{path.name} does not contain exactly one analysis row per frame"
+                f"{path.name} contains duplicate analysis rows for a frame"
             )
         frames += len(all_frames)
+        supervised_frames += len(active_frames)
         rows += int(analysis_active.sum())
-    return {"games": len(paths), "frames": frames, "analysisRows": rows}
+    return {
+        "games": len(paths),
+        "frames": frames,
+        "supervisedFrames": supervised_frames,
+        "policyOnlyFrames": frames - supervised_frames,
+        "analysisRows": rows,
+    }
 
 
 def verify_storage(

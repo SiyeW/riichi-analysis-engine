@@ -252,7 +252,7 @@ def projected_count_distributions(
     physical_inventory: Tensor,
     source_capacities: Tensor,
     *,
-    iterations: int = 24,
+    iterations: int = 32,
 ) -> tuple[Tensor, Tensor]:
     """Apply learned residuals and restore public expectation constraints.
 
@@ -309,11 +309,11 @@ def projected_count_distributions(
     for _ in range(iterations):
         _probability, mean, variance = moments()
         row_delta = (row_target - mean.sum(-1)) / variance.sum(-1).clamp_min(1e-4)
-        row_bias = row_bias + row_delta.clamp(-2.0, 2.0)
+        row_bias = row_bias + row_delta.clamp(-1.0, 1.0)
 
         _probability, mean, variance = moments()
         column_delta = (column_target - mean.sum(1)) / variance.sum(1).clamp_min(1e-4)
-        column_bias = column_bias + column_delta.clamp(-2.0, 2.0)
+        column_bias = column_bias + column_delta.clamp(-1.0, 1.0)
 
     probability, _mean, _variance = moments()
     return probability, baseline

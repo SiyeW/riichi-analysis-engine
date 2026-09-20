@@ -149,6 +149,22 @@ def test_complete_count_residual_can_represent_a_non_binomial_shape() -> None:
     assert torch.isfinite(residual.grad).all()
 
 
+def test_count_projection_stays_stable_for_large_early_residuals() -> None:
+    _physical, inventory, capacities = physical_hidden_counts(*_example())
+    generator = torch.Generator().manual_seed(20260921)
+    residual = torch.randn(1, 4, 37, 5, generator=generator) * 4
+
+    probability, _baseline = projected_count_distributions(
+        residual, inventory, capacities
+    )
+    values = torch.arange(5, dtype=probability.dtype)
+    expected = (probability * values).sum(-1)
+
+    assert torch.isfinite(probability).all()
+    assert torch.allclose(expected.sum(-1), capacities.float(), atol=1e-4)
+    assert torch.allclose(expected.sum(1), inventory.float(), atol=1e-4)
+
+
 def test_anchor_loss_uses_theory_instead_of_the_sampled_allocation() -> None:
     physical, inventory, capacities = physical_hidden_counts(*_example())
     residual = torch.randn(1, 4, 37, 5)
