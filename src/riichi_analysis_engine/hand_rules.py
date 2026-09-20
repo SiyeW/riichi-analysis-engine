@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -27,6 +28,19 @@ class HandRuleFacts:
     discard_furiten: bool
     temporary_furiten: bool
     riichi_furiten: bool
+
+
+@dataclass(frozen=True)
+class _StaticHandRuleFacts:
+    complete: bool
+    shanten: int
+    structural_waits: np.ndarray
+    ron_yaku: np.ndarray
+    tsumo_yaku: np.ndarray
+    effective_draws: np.ndarray
+    discard_result_shanten: np.ndarray
+    discard_improving_draws: np.ndarray
+    discard_waits: np.ndarray
 
 
 def _array(owner: Any, name: str) -> np.ndarray:
@@ -71,41 +85,33 @@ def _remaining(rule_state: Any, seat: int, hand: np.ndarray) -> np.ndarray:
     )
 
 
-def analyze_hand_rules(
-    state: Any,
-    *,
-    seat: int,
-    rule_state: Any | None,
-) -> HandRuleFacts:
-    """Derive only exact rule facts; no strategy or value judgement is added."""
+@lru_cache(maxsize=4096)
+def _analyze_static_hand_rules(
+    hand_counts: tuple[int, ...],
+    chis: tuple[int, ...],
+    pons: tuple[int, ...],
+    minkans: tuple[int, ...],
+    ankans: tuple[int, ...],
+    bakaze: int,
+    jikaze: int,
+    riichi: bool,
+) -> _StaticHandRuleFacts:
+    """Cache exact facts that change only when the concealed hand changes."""
 
-    hand = _array(state, "tehai")
-    chis = _values(state, "chis")
-    pons = _values(state, "pons")
-    minkans = _values(state, "minkans")
-    ankans = _values(state, "ankans")
+    hand = np.asarray(hand_counts, dtype=np.uint8)
     open_melds = len(chis) + len(pons) + len(minkans) + len(ankans)
     complete = int(hand.sum()) % 3 == 2 and is_complete_hand(hand, open_melds)
     shanten = calculate_shanten(hand, open_melds)
 
-    base_hand = hand.copy()
-    if int(base_hand.sum()) % 3 == 2 and not complete:
-        # There is no single canonical 13-tile hand during a discard decision.
+    if int(hand.sum()) % 3 == 2 and not complete:
         structural_waits = np.zeros(TILE_TYPES, dtype=bool)
     else:
-        structural_waits = _waits(base_hand, open_melds)
+        structural_waits = _waits(hand.copy(), open_melds)
 
-    bakaze = 27 + int(getattr(rule_state, "bakaze", 0))
-    oya = int(getattr(rule_state, "oya", 0))
-    jikaze = 27 + ((seat - oya) % 4)
-    riichi = bool(
-        getattr(state, "self_riichi_declared", False)
-        or getattr(state, "self_riichi_accepted", False)
-    )
     ron_yaku = np.zeros(TILE_TYPES, dtype=bool)
     tsumo_yaku = np.zeros(TILE_TYPES, dtype=bool)
     for tile in np.flatnonzero(structural_waits):
-        completed = base_hand.copy()
+        completed = hand.copy()
         completed[tile] += 1
         common = {
             "chis": chis,
@@ -119,28 +125,17 @@ def analyze_hand_rules(
         ron_yaku[tile] = riichi or has_ron_yaku(completed, **common)
         tsumo_yaku[tile] = riichi or has_tsumo_yaku(completed, **common)
 
-    if rule_state is None:
-        furiten = (bool(getattr(state, "at_furiten", False)), False, False)
-    else:
-        furiten = rule_state.furiten_causes(seat, structural_waits)
-
-    remaining = _remaining(rule_state, seat, hand)
     effective_draws = np.zeros(TILE_TYPES, dtype=bool)
-    effective_remaining = np.zeros(TILE_TYPES, dtype=np.float32)
     if int(hand.sum()) % 3 == 1:
         draw_tiles = np.flatnonzero(hand < 4)
         draw_hands = np.repeat(hand[None, :], len(draw_tiles), axis=0)
         draw_hands[np.arange(len(draw_tiles)), draw_tiles] += 1
         draw_shanten = calculate_shanten_batch(draw_hands, open_melds)
-        for tile, result in zip(draw_tiles, draw_shanten, strict=True):
-            improved = int(result) < shanten
-            if improved:
-                effective_draws[tile] = True
-                effective_remaining[tile] = remaining[tile]
+        effective_draws[draw_tiles[draw_shanten < shanten]] = True
 
     discard_result = np.full(TILE_TYPES, 7, dtype=np.int8)
-    discard_ukeire = np.zeros(TILE_TYPES, dtype=np.float32)
-    discard_creates_furiten = np.zeros(TILE_TYPES, dtype=bool)
+    discard_improving = np.zeros((TILE_TYPES, TILE_TYPES), dtype=bool)
+    discard_waits = np.zeros((TILE_TYPES, TILE_TYPES), dtype=bool)
     if int(hand.sum()) % 3 == 2:
         discard_tiles = np.flatnonzero(hand)
         discard_hands = np.repeat(hand[None, :], len(discard_tiles), axis=0)
@@ -151,31 +146,91 @@ def analyze_hand_rules(
         ):
             result_shanten = int(raw_shanten)
             discard_result[discard] = max(-1, min(6, result_shanten))
-            result_waits = _waits(discarded_hand.copy(), open_melds)
+            discard_waits[discard] = _waits(discarded_hand.copy(), open_melds)
             draw_tiles = np.flatnonzero(discarded_hand < 4)
             draw_hands = np.repeat(discarded_hand[None, :], len(draw_tiles), axis=0)
             draw_hands[np.arange(len(draw_tiles)), draw_tiles] += 1
             draw_results = calculate_shanten_batch(draw_hands, open_melds)
-            improving = draw_tiles[draw_results < result_shanten]
-            discard_ukeire[discard] = float(remaining[improving].sum())
-            if rule_state is not None:
-                causes = rule_state.furiten_causes(seat, result_waits)
-                discard_creates_furiten[discard] = bool(
-                    causes[0] or TILES_34[discard] in {
-                        TILES_34[index]
-                        for index in np.flatnonzero(result_waits)
-                    }
-                )
+            discard_improving[discard, draw_tiles[draw_results < result_shanten]] = True
 
-    return HandRuleFacts(
+    for value in (
+        structural_waits,
+        ron_yaku,
+        tsumo_yaku,
+        effective_draws,
+        discard_result,
+        discard_improving,
+        discard_waits,
+    ):
+        value.flags.writeable = False
+    return _StaticHandRuleFacts(
         complete=complete,
         shanten=max(0, min(6, shanten)),
         structural_waits=structural_waits,
         ron_yaku=ron_yaku,
         tsumo_yaku=tsumo_yaku,
         effective_draws=effective_draws,
-        effective_remaining=effective_remaining,
         discard_result_shanten=discard_result,
+        discard_improving_draws=discard_improving,
+        discard_waits=discard_waits,
+    )
+
+
+def analyze_hand_rules(
+    state: Any,
+    *,
+    seat: int,
+    rule_state: Any | None,
+) -> HandRuleFacts:
+    """Derive only exact rule facts; no strategy or value judgement is added."""
+
+    hand = _array(state, "tehai")
+    chis = _values(state, "chis")
+    pons = _values(state, "pons")
+    minkans = _values(state, "minkans")
+    ankans = _values(state, "ankans")
+    bakaze = 27 + int(getattr(rule_state, "bakaze", 0))
+    oya = int(getattr(rule_state, "oya", 0))
+    jikaze = 27 + ((seat - oya) % 4)
+    riichi = bool(
+        getattr(state, "self_riichi_declared", False)
+        or getattr(state, "self_riichi_accepted", False)
+    )
+    static = _analyze_static_hand_rules(
+        tuple(int(value) for value in hand),
+        chis,
+        pons,
+        minkans,
+        ankans,
+        bakaze,
+        jikaze,
+        riichi,
+    )
+
+    if rule_state is None:
+        furiten = (bool(getattr(state, "at_furiten", False)), False, False)
+    else:
+        furiten = rule_state.furiten_causes(seat, static.structural_waits)
+
+    remaining = _remaining(rule_state, seat, hand)
+    effective_remaining = remaining * static.effective_draws
+    discard_ukeire = static.discard_improving_draws.astype(np.float32) @ remaining
+    discard_creates_furiten = np.zeros(TILE_TYPES, dtype=bool)
+    if rule_state is not None:
+        for discard in np.flatnonzero(hand):
+            result_waits = static.discard_waits[discard]
+            causes = rule_state.furiten_causes(seat, result_waits)
+            discard_creates_furiten[discard] = bool(causes[0] or result_waits[discard])
+
+    return HandRuleFacts(
+        complete=static.complete,
+        shanten=static.shanten,
+        structural_waits=static.structural_waits,
+        ron_yaku=static.ron_yaku,
+        tsumo_yaku=static.tsumo_yaku,
+        effective_draws=static.effective_draws,
+        effective_remaining=effective_remaining,
+        discard_result_shanten=static.discard_result_shanten,
         discard_ukeire=discard_ukeire,
         discard_creates_furiten=discard_creates_furiten,
         discard_furiten=furiten[0],

@@ -475,8 +475,48 @@ class ExactTargetTracker:
         self.temporary_furiten = np.zeros(4, dtype=bool)
         self.riichi_pass_furiten = np.zeros(4, dtype=bool)
         self.pending_pass: tuple[dict[str, Any], list[int]] | None = None
+        self._target_cache: dict[tuple[Any, ...], tuple[int, int, np.ndarray]] = {}
 
     def _player_target(
+        self,
+        player: int,
+        state: Any,
+    ) -> tuple[int, int, np.ndarray]:
+        hand_raw = state.tehai
+        hand_view = (
+            np.frombuffer(hand_raw, dtype=np.uint8)
+            if isinstance(hand_raw, bytes)
+            else np.asarray(hand_raw, dtype=np.uint8)
+        )
+        key = (
+            player,
+            hand_view.tobytes(),
+            tuple(int(value) for value in state.chis),
+            tuple(int(value) for value in state.pons),
+            tuple(int(value) for value in state.minkans),
+            tuple(int(value) for value in state.ankans),
+            int(state.shanten),
+            bool(state.has_next_shanten_discard),
+            bool(state.self_riichi_declared),
+            bool(state.self_riichi_accepted),
+            self.discarded[player].tobytes(),
+            bool(self.temporary_furiten[player]),
+            bool(self.riichi_pass_furiten[player]),
+            self.last_tsumo_tile if self.last_tsumo_actor == player else -1,
+            self.wall_remaining == 0 and player != self.last_tsumo_actor,
+            self.chankan_tile,
+            self.bakaze,
+            self.oya,
+        )
+        cached = self._target_cache.get(key)
+        if cached is not None:
+            return cached
+        result = self._compute_player_target(player, state)
+        result[2].flags.writeable = False
+        self._target_cache[key] = result
+        return result
+
+    def _compute_player_target(
         self,
         player: int,
         state: Any,
@@ -572,6 +612,7 @@ class ExactTargetTracker:
             self.pending_pass = None
         self.chankan_tile = None
         if kind == "start_kyoku":
+            self._target_cache.clear()
             self.bakaze = 27 + "ESWN".index(event["bakaze"])
             self.oya = int(event["oya"])
             self.wall_remaining = 70
