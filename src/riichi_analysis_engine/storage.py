@@ -400,6 +400,7 @@ def save_chunk_archive(
     *,
     event_catalog: np.ndarray | None = None,
     compression_level: int = 1,
+    archive_metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Stage one game as independently compressed sample chunks."""
 
@@ -468,6 +469,13 @@ def save_chunk_archive(
                         "eventCount": len(event_catalog),
                     }
                 )
+            if archive_metadata is not None:
+                overlap = set(meta).intersection(archive_metadata)
+                if overlap:
+                    raise ValueError(
+                        f"archive metadata cannot replace reserved fields: {sorted(overlap)}"
+                    )
+                meta.update(archive_metadata)
             archive.writestr("meta.json", json.dumps(meta, separators=(",", ":")))
         _replace_atomically(temporary, destinations)
     finally:

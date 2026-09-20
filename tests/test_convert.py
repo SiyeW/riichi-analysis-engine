@@ -14,6 +14,7 @@ from riichi_analysis_engine.convert import (
     convert_game,
     preflight_conversion,
 )
+from riichi_analysis_engine.frame_sampling import FrameSamplingPlan
 from riichi_analysis_engine.semantic_input import (
     EVENT_TILE,
     PUBLIC_EVENT_TYPE_TO_ID,
@@ -125,6 +126,41 @@ def test_conversion_reuses_each_frame_observation() -> None:
     convert_game(events, "count-observations", player_state_type=_CountingPlayerState)
 
     assert _CountingPlayerState.encode_calls == 4
+
+
+def test_conversion_keeps_decisive_frames_when_other_rates_are_zero() -> None:
+    events = [
+        {
+            "type": "start_kyoku",
+            "bakaze": "E",
+            "kyoku": 1,
+            "honba": 0,
+            "kyotaku": 0,
+            "oya": 0,
+            "dora_marker": "1m",
+            "scores": [25_000] * 4,
+            "tehais": [["1m"], [], [], []],
+        },
+        {"type": "dahai", "actor": 0, "pai": "1m"},
+        {"type": "ryukyoku", "deltas": [0, 0, 0, 0]},
+        {"type": "end_kyoku"},
+        {"type": "end_game"},
+    ]
+    converted = convert_game(
+        events,
+        "sampled-game",
+        player_state_type=_PassivePlayerState,
+        sampling_plan=FrameSamplingPlan(
+            seed=9,
+            rare_action_rate=0.0,
+            state_change_rate=0.0,
+            ordinary_rate=0.0,
+        ),
+    )
+
+    np.testing.assert_array_equal(converted.arrays["event_index"], [1])
+    assert converted.frame_counts["decisive"] == {"seen": 1, "kept": 1}
+    assert converted.frame_counts["state_change"] == {"seen": 1, "kept": 0}
 
 
 def test_conversion_preflight_performs_no_writes(tmp_path) -> None:

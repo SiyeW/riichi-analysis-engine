@@ -17,6 +17,7 @@ import numpy as np
 from .analysis_observation import IncrementalTilePlaneEncoder
 from .analysis_state import PublicHistoryState
 from .constants import OBS_VERSION, relative_players
+from .frame_sampling import FrameSamplingPlan
 from .model_input import (
     MODEL_INPUT_SCHEMA_ID,
     SHARED_MODEL_INPUT_SCHEMA_ID,
@@ -44,6 +45,7 @@ from .storage import STAGED_GAME_FORMAT, read_chunk_archive_meta, save_chunk_arc
 class ConvertedGame:
     arrays: dict[str, np.ndarray]
     event_catalog: np.ndarray
+    frame_counts: dict[str, dict[str, int]]
 
 
 def _analysis_perspective(
@@ -235,6 +237,7 @@ def convert_game(
     *,
     player_state_type: Any,
     model_format: int = 13,
+    sampling_plan: FrameSamplingPlan | None = None,
 ) -> ConvertedGame:
     annotations = annotate_game(events)
     full_state = FullState()
@@ -248,6 +251,10 @@ def convert_game(
     kyoku_index = -1
     history_start = -1
     history_length = 0
+    frame_counts = {
+        name: {"seen": 0, "kept": 0}
+        for name in ("decisive", "rare_action", "state_change", "ordinary")
+    }
 
     def append_sample(
         event_index: int,
@@ -322,6 +329,19 @@ def convert_game(
         if exact_targets is None:
             raise RuntimeError(f"missing exact targets at {source_id}:{index}")
 
+        if sampling_plan is not None:
+            stratum = sampling_plan.classify(events, index, candidates)
+            frame_counts[stratum]["seen"] += 1
+            if not sampling_plan.keep(source_id, index, stratum):
+                continue
+            frame_counts[stratum]["kept"] += 1
+        else:
+            stratum = (
+                FrameSamplingPlan(0).classify(events, index, candidates)
+            )
+            frame_counts[stratum]["seen"] += 1
+            frame_counts[stratum]["kept"] += 1
+
         sampled: set[int] = set()
         encoded: dict[int, tuple[Any, Any]] = {}
         analysis_perspective = _analysis_perspective(events, source_id, index)
@@ -394,7 +414,11 @@ def convert_game(
         raise RuntimeError(
             f"analysis supervision is not one row per frame in {source_id}"
         )
-    return ConvertedGame(arrays=arrays, event_catalog=event_history.array())
+    return ConvertedGame(
+        arrays=arrays,
+        event_catalog=event_history.array(),
+        frame_counts=frame_counts,
+    )
 
 
 def convert_record_to_archive(
@@ -406,7 +430,8 @@ def convert_record_to_archive(
     chunk_samples: int,
     compression_level: int,
     model_format: int,
-) -> tuple[int, str, int, str | None]:
+    sampling_plan: FrameSamplingPlan | None,
+) -> tuple[int, str, int, dict[str, dict[str, int]], str | None]:
     """Stage one game as independently compressed sample chunks."""
 
     destination = Path(output) / f"game-{record_index:06d}.zip"
@@ -422,8 +447,17 @@ def convert_record_to_archive(
                     else MODEL_INPUT_SCHEMA_ID
                 )
                 and meta.get("eventMemorySchema") == EVENT_MEMORY_SCHEMA_ID
+                and meta.get("frameSampling")
+                == (sampling_plan.metadata() if sampling_plan else None)
             ):
-                return record_index, record["sourceId"], int(meta["samples"]), None
+                counts = meta.get("frameCounts", {})
+                return (
+                    record_index,
+                    record["sourceId"],
+                    int(meta["samples"]),
+                    counts if isinstance(counts, dict) else {},
+                    None,
+                )
             destination.unlink()
         except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
             destination.unlink()
@@ -438,6 +472,7 @@ def convert_record_to_archive(
             record["sourceId"],
             player_state_type=PlayerState,
             model_format=model_format,
+            sampling_plan=sampling_plan,
         )
         meta = save_chunk_archive(
             destination,
@@ -445,10 +480,20 @@ def convert_record_to_archive(
             chunk_samples,
             event_catalog=converted.event_catalog,
             compression_level=compression_level,
+            archive_metadata={
+                "frameSampling": sampling_plan.metadata() if sampling_plan else None,
+                "frameCounts": converted.frame_counts,
+            },
         )
-        return record_index, record["sourceId"], int(meta["samples"]), None
+        return (
+            record_index,
+            record["sourceId"],
+            int(meta["samples"]),
+            converted.frame_counts,
+            None,
+        )
     except Exception as error:  # noqa: BLE001 -- one malformed game must not stop a batch
-        return record_index, record["sourceId"], 0, repr(error)
+        return record_index, record["sourceId"], 0, {}, repr(error)
 
 
 def main() -> None:
@@ -474,6 +519,10 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--model-format", type=int, choices=(12, 13), default=13)
+    parser.add_argument("--frame-sampling-seed", type=int)
+    parser.add_argument("--rare-action-frame-rate", type=float, default=1.0)
+    parser.add_argument("--state-change-frame-rate", type=float, default=0.5)
+    parser.add_argument("--ordinary-frame-rate", type=float, default=0.05)
     parser.add_argument(
         "--preflight-only",
         action="store_true",
@@ -506,6 +555,20 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     converted_games = 0
     converted_samples = 0
+    sampling_plan = (
+        FrameSamplingPlan(
+            seed=args.frame_sampling_seed,
+            rare_action_rate=args.rare_action_frame_rate,
+            state_change_rate=args.state_change_frame_rate,
+            ordinary_rate=args.ordinary_frame_rate,
+        )
+        if args.frame_sampling_seed is not None
+        else None
+    )
+    frame_counts = {
+        name: {"seen": 0, "kept": 0}
+        for name in ("decisive", "rare_action", "state_change", "ordinary")
+    }
     failures: list[dict[str, str]] = []
     start = time.perf_counter()
     output_root = str(args.output.resolve())
@@ -519,6 +582,7 @@ def main() -> None:
             args.chunk_samples,
             args.compression_level,
             args.model_format,
+            sampling_plan,
         )
         for index, record in indexed_records
     ]
@@ -537,6 +601,8 @@ def main() -> None:
             "chunkSamples": args.chunk_samples,
             "compressionLevel": args.compression_level,
             "workers": args.workers,
+            "frameSampling": sampling_plan.metadata() if sampling_plan else None,
+            "frameCounts": frame_counts,
             "failures": failures,
             "elapsedSeconds": time.perf_counter() - start,
         }
@@ -551,12 +617,17 @@ def main() -> None:
             temporary.unlink(missing_ok=True)
         return summary
 
-    def collect(result: tuple[int, str, int, str | None]) -> None:
+    def collect(
+        result: tuple[int, str, int, dict[str, dict[str, int]], str | None]
+    ) -> None:
         nonlocal converted_games, converted_samples
-        _index, source_id, samples, error = result
+        _index, source_id, samples, game_counts, error = result
         if error is None:
             converted_games += 1
             converted_samples += samples
+            for name, counts in game_counts.items():
+                frame_counts[name]["seen"] += counts["seen"]
+                frame_counts[name]["kept"] += counts["kept"]
         else:
             failures.append({"sourceId": source_id, "error": error})
             print(f"FAILED {source_id}: {error}", file=sys.stderr)
@@ -576,7 +647,9 @@ def main() -> None:
             ) as pool:
                 job_iter = iter(jobs)
                 pending: set[
-                    concurrent.futures.Future[tuple[int, str, int, str | None]]
+                    concurrent.futures.Future[
+                        tuple[int, str, int, dict[str, dict[str, int]], str | None]
+                    ]
                 ] = set()
 
                 def fill_pending() -> None:
