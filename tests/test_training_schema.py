@@ -9,9 +9,14 @@ import pytest
 from test_dataset import pack_directory
 
 from riichi_analysis_engine.dataset import PackDataset
+from riichi_analysis_engine.model_input import (
+    SHARED_MODEL_INPUT_CHANNELS,
+    SHARED_MODEL_INPUT_SCHEMA_ID,
+)
 from riichi_analysis_engine.observation_layout import JIKAZE_CHANNEL, WIND_TILE_START
 from riichi_analysis_engine.semantic_input import (
     EVENT_ACTOR,
+    EVENT_MEMORY_SCHEMA_ID,
     EVENT_TILE,
     EVENT_TYPE,
     PUBLIC_EVENT_TYPE_TO_ID,
@@ -99,3 +104,18 @@ def test_v12_training_schema_validates_masked_event_memory(scratch) -> None:
         batch["event_tokens"][..., EVENT_TILE][opponent_draw] = 2
         with pytest.raises(ValueError, match="leaked"):
             validate_semantic_training_batch(batch)
+
+
+def test_v13_dataset_contract_requires_engine_owned_rule_context() -> None:
+    metadata = {
+        "modelInputSchema": SHARED_MODEL_INPUT_SCHEMA_ID,
+        "observationChannels": SHARED_MODEL_INPUT_CHANNELS,
+        "eventMemorySchema": EVENT_MEMORY_SCHEMA_ID,
+    }
+
+    validate_dataset_input_contract({"train": metadata}, 13)
+
+    with pytest.raises(RuntimeError, match="model-input contract"):
+        validate_dataset_input_contract(
+            {"train": {**metadata, "modelInputSchema": "mortal-observation"}}, 13
+        )

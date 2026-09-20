@@ -47,7 +47,10 @@ from .model_input import (
     LEGACY_MODEL_INPUT_SCHEMA_ID,
     MODEL_INPUT_CHANNELS,
     MODEL_INPUT_SCHEMA_ID,
+    SHARED_MODEL_INPUT_CHANNELS,
+    SHARED_MODEL_INPUT_SCHEMA_ID,
     model_input_metadata,
+    shared_model_input_metadata,
 )
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
 from .semantic_input import EVENT_MEMORY_SCHEMA_ID, semantic_input_metadata
@@ -219,24 +222,34 @@ def validate_dataset_input_contract(
     """Fail before training when packs cannot supply the selected model input."""
 
     expected_schema = (
-        MODEL_INPUT_SCHEMA_ID
+        SHARED_MODEL_INPUT_SCHEMA_ID
+        if model_format == 13
+        else MODEL_INPUT_SCHEMA_ID
         if model_format in {9, 10, 11, 12}
         else LEGACY_MODEL_INPUT_SCHEMA_ID
     )
     expected_channels = (
-        MODEL_INPUT_CHANNELS if model_format in {9, 10, 11, 12} else OBS_CHANNELS
+        SHARED_MODEL_INPUT_CHANNELS
+        if model_format == 13
+        else MODEL_INPUT_CHANNELS
+        if model_format in {9, 10, 11, 12}
+        else OBS_CHANNELS
     )
     for split, metadata in datasets.items():
         schema = metadata.get("modelInputSchema")
         channels = metadata.get("observationChannels")
         # Manifests written before the explicit metadata fields are v8 by
         # construction. They remain readable only by legacy model formats.
-        if schema is None and channels is None and model_format not in {9, 10, 11, 12}:
+        if (
+            schema is None
+            and channels is None
+            and model_format not in {9, 10, 11, 12, 13}
+        ):
             continue
         if schema != expected_schema or channels != expected_channels:
             raise RuntimeError(f"{split} dataset uses a different model-input contract")
         event_schema = metadata.get("eventMemorySchema")
-        if model_format == 12 and event_schema != EVENT_MEMORY_SCHEMA_ID:
+        if model_format in {12, 13} and event_schema != EVENT_MEMORY_SCHEMA_ID:
             raise RuntimeError(f"{split} dataset has no compatible event memory")
 
 
@@ -244,7 +257,7 @@ def forward_batch(
     model: RiichiAnalysisModel, batch: Mapping[str, torch.Tensor]
 ) -> dict[str, torch.Tensor]:
     observation = batch["obs"].float()
-    if model.format_version == 12:
+    if model.format_version in {12, 13}:
         return model(observation, batch["event_tokens"], batch["event_mask"])
     return model(observation)
 
@@ -880,13 +893,19 @@ def save_checkpoint(
             "model": model.state_dict(),
             "modelArchitecture": architecture.to_dict(),
             **(
-                {"modelInput": model_input_metadata()}
-                if model.format_version in {9, 10, 11, 12}
+                {
+                    "modelInput": (
+                        shared_model_input_metadata()
+                        if model.format_version == 13
+                        else model_input_metadata()
+                    )
+                }
+                if model.format_version in {9, 10, 11, 12, 13}
                 else {}
             ),
             **(
                 {"semanticInput": semantic_input_metadata()}
-                if model.format_version == 12
+                if model.format_version in {12, 13}
                 else {}
             ),
             "optimizer": optimizer.state_dict(),
@@ -922,7 +941,7 @@ def main() -> None:
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(
-        "--model-format", type=int, choices=(7, 8, 9, 10, 11, 12), default=11
+        "--model-format", type=int, choices=(7, 8, 9, 10, 11, 12, 13), default=13
     )
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
@@ -1059,7 +1078,7 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
     amp_dtype = torch.float16 if device.type == "cuda" else None
 
-    if args.model_format == 12:
+    if args.model_format in {12, 13}:
         architecture = SemanticModelArchitecture(
             backbone=args.semantic_backbone,
             width=args.semantic_width,
@@ -1162,21 +1181,24 @@ def main() -> None:
         if checkpoint.get("format") != f"riichi-analysis-model-v{args.model_format}":
             raise RuntimeError("resume checkpoint has an unsupported format")
         checkpoint_architecture = checkpoint.get("modelArchitecture")
-        if args.model_format == 12:
+        if args.model_format in {12, 13}:
             checkpoint_architecture = SemanticModelArchitecture.from_dict(
                 checkpoint_architecture
             ).to_dict()
         if checkpoint_architecture != architecture.to_dict():
             raise RuntimeError("resume checkpoint uses a different model architecture")
-        if (
-            args.model_format in {9, 10, 11, 12}
-            and checkpoint.get("modelInput") != model_input_metadata()
+        if args.model_format in {9, 10, 11, 12, 13} and checkpoint.get(
+            "modelInput"
+        ) != (
+            shared_model_input_metadata()
+            if args.model_format == 13
+            else model_input_metadata()
         ):
             raise RuntimeError(
                 "resume checkpoint uses a different model-input contract"
             )
         if (
-            args.model_format == 12
+            args.model_format in {12, 13}
             and checkpoint.get("semanticInput") != semantic_input_metadata()
         ):
             raise RuntimeError(
@@ -1299,10 +1321,10 @@ def main() -> None:
         fixture = next(iter(validation_loader))
     except StopIteration:
         fixture = None
-    if args.model_format in {8, 9, 10, 11, 12}:
+    if args.model_format in {8, 9, 10, 11, 12, 13}:
         validate_fixture = (
             validate_semantic_training_batch
-            if args.model_format == 12
+            if args.model_format in {12, 13}
             else validate_v8_training_batch
         )
         if args.validate_only:

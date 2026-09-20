@@ -19,7 +19,9 @@ from .analysis_state import PublicHistoryState
 from .constants import OBS_VERSION, relative_players
 from .model_input import (
     MODEL_INPUT_SCHEMA_ID,
+    SHARED_MODEL_INPUT_SCHEMA_ID,
     compose_model_input,
+    compose_shared_model_input,
     extract_policy_context,
 )
 from .replay import (
@@ -32,6 +34,7 @@ from .replay import (
     read_events,
     rotated_future,
 )
+from .rule_context import encode_rule_context
 from .semantic_input import EVENT_MEMORY_SCHEMA_ID, PublicEventHistoryEncoder
 from .storage import STAGED_GAME_FORMAT, read_chunk_archive_meta, save_chunk_archive
 
@@ -123,8 +126,12 @@ def preflight_conversion(
         stop = min(stop, start_game + max_games)
     resolved_output = output.resolve()
     if resolved_output.exists() and not resolved_output.is_dir():
-        raise NotADirectoryError(f"conversion output is not a directory: {resolved_output}")
-    write_boundary = resolved_output if resolved_output.exists() else resolved_output.parent
+        raise NotADirectoryError(
+            f"conversion output is not a directory: {resolved_output}"
+        )
+    write_boundary = (
+        resolved_output if resolved_output.exists() else resolved_output.parent
+    )
     if not write_boundary.exists():
         ancestor = write_boundary
         while not ancestor.exists() and ancestor != ancestor.parent:
@@ -133,18 +140,22 @@ def preflight_conversion(
             raise PermissionError(f"output ancestor is not writable: {ancestor}")
     elif not os.access(write_boundary, os.W_OK):
         raise PermissionError(f"output boundary is not writable: {write_boundary}")
-    return metadata, records, {
-        "format": "riichi-analysis-conversion-preflight-v1",
-        "manifest": str(manifest_path.resolve()),
-        "output": str(resolved_output),
-        "manifestGames": len(records),
-        "selectedGames": stop - start_game,
-        "startGame": start_game,
-        "endGame": stop,
-        "sourceIdsUnique": True,
-        "sourceFilesPresent": True,
-        "writesPerformed": False,
-    }
+    return (
+        metadata,
+        records,
+        {
+            "format": "riichi-analysis-conversion-preflight-v1",
+            "manifest": str(manifest_path.resolve()),
+            "output": str(resolved_output),
+            "manifestGames": len(records),
+            "selectedGames": stop - start_game,
+            "startGame": start_game,
+            "endGame": stop,
+            "sourceIdsUnique": True,
+            "sourceFilesPresent": True,
+            "writesPerformed": False,
+        },
+    )
 
 
 def _sample_targets(
@@ -199,6 +210,7 @@ def convert_game(
     source_id: str,
     *,
     player_state_type: Any,
+    model_format: int = 13,
 ) -> ConvertedGame:
     annotations = annotate_game(events)
     full_state = FullState()
@@ -219,13 +231,25 @@ def convert_game(
         exact_targets: np.ndarray,
         mortal_observation: Any,
         action_mask: Any,
+        state: Any,
+        candidates: Any,
         *,
         policy: int,
         analysis_active: bool,
+        at_kan_select: bool = False,
     ) -> None:
-        observation = compose_model_input(
-            analysis_encoder.encode(event, perspective),
-            extract_policy_context(mortal_observation),
+        analysis = analysis_encoder.encode(event, perspective)
+        observation = (
+            compose_shared_model_input(
+                analysis,
+                encode_rule_context(
+                    state, candidates, action_mask, at_kan_select=at_kan_select
+                ),
+            )
+            if model_format == 13
+            else compose_model_input(
+                analysis, extract_policy_context(mortal_observation)
+            )
         )
         if policy >= 0 and not bool(action_mask[policy]):
             raise ValueError(
@@ -289,6 +313,8 @@ def convert_game(
                 exact_targets,
                 mortal_observation,
                 mask,
+                states[perspective],
+                cans,
                 policy=policy,
                 analysis_active=perspective == analysis_perspective,
             )
@@ -304,8 +330,11 @@ def convert_game(
                     exact_targets,
                     kan_observation,
                     kan_mask,
+                    states[perspective],
+                    cans,
                     policy=kan_tile,
                     analysis_active=False,
+                    at_kan_select=True,
                 )
 
         if analysis_perspective not in sampled:
@@ -317,6 +346,8 @@ def convert_game(
                 exact_targets,
                 mortal_observation,
                 mask,
+                states[analysis_perspective],
+                candidates[analysis_perspective],
                 policy=-1,
                 analysis_active=True,
             )
@@ -343,6 +374,7 @@ def convert_record_to_archive(
     overwrite: bool,
     chunk_samples: int,
     compression_level: int,
+    model_format: int,
 ) -> tuple[int, str, int, str | None]:
     """Stage one game as independently compressed sample chunks."""
 
@@ -352,7 +384,12 @@ def convert_record_to_archive(
             meta = read_chunk_archive_meta(destination)
             if (
                 meta.get("format") == STAGED_GAME_FORMAT
-                and meta.get("modelInputSchema") == MODEL_INPUT_SCHEMA_ID
+                and meta.get("modelInputSchema")
+                == (
+                    SHARED_MODEL_INPUT_SCHEMA_ID
+                    if model_format == 13
+                    else MODEL_INPUT_SCHEMA_ID
+                )
                 and meta.get("eventMemorySchema") == EVENT_MEMORY_SCHEMA_ID
             ):
                 return record_index, record["sourceId"], int(meta["samples"]), None
@@ -369,6 +406,7 @@ def convert_record_to_archive(
             events,
             record["sourceId"],
             player_state_type=PlayerState,
+            model_format=model_format,
         )
         meta = save_chunk_archive(
             destination,
@@ -404,6 +442,7 @@ def main() -> None:
     parser.add_argument("--summary-name", default="summary.json")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--model-format", type=int, choices=(12, 13), default=13)
     parser.add_argument(
         "--preflight-only",
         action="store_true",
@@ -448,6 +487,7 @@ def main() -> None:
             args.overwrite,
             args.chunk_samples,
             args.compression_level,
+            args.model_format,
         )
         for index, record in indexed_records
     ]
@@ -469,9 +509,7 @@ def main() -> None:
             "failures": failures,
             "elapsedSeconds": time.perf_counter() - start,
         }
-        temporary = summary_path.with_name(
-            f".{summary_path.name}.{os.getpid()}.tmp"
-        )
+        temporary = summary_path.with_name(f".{summary_path.name}.{os.getpid()}.tmp")
         try:
             temporary.write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2) + "\n",

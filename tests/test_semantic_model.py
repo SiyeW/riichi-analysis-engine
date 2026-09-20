@@ -5,8 +5,13 @@ from riichi_analysis_engine.architecture import SemanticModelArchitecture
 from riichi_analysis_engine.constants import ACTION_SPACE, TILE_TYPES
 from riichi_analysis_engine.kyoku_outcome import OUTCOME_COUNT
 from riichi_analysis_engine.model import RiichiAnalysisModel, count_parameters
-from riichi_analysis_engine.model_input import MODEL_INPUT_CHANNELS
+from riichi_analysis_engine.model_input import (
+    MODEL_INPUT_CHANNELS,
+    RULE_CONTEXT_START,
+    SHARED_MODEL_INPUT_CHANNELS,
+)
 from riichi_analysis_engine.prediction_values import DORA_VALUES, SCORE_VALUES
+from riichi_analysis_engine.rule_context import RULE_TILE_CHANNELS
 from riichi_analysis_engine.semantic_input import (
     EVENT_ACTOR,
     EVENT_FIELDS,
@@ -85,6 +90,23 @@ def test_v12_backbones_share_outputs_and_support_backward(backbone: str) -> None
         for parameter in model.parameters()
         if parameter.requires_grad
     )
+
+
+def test_v13_shared_rule_facts_reach_non_policy_outputs() -> None:
+    torch.manual_seed(3)
+    model = RiichiAnalysisModel(
+        format_version=13, architecture=_architecture("cnn")
+    ).eval()
+    _, events, mask = _inputs()
+    first = torch.zeros(2, SHARED_MODEL_INPUT_CHANNELS, TILE_TYPES)
+    second = first.clone()
+    second[:, RULE_CONTEXT_START + RULE_TILE_CHANNELS] = 1
+
+    first_outputs = model(first, events, mask)
+    second_outputs = model(second, events, mask)
+
+    assert not torch.equal(first_outputs["outcome"], second_outputs["outcome"])
+    assert not torch.equal(first_outputs["policy"], second_outputs["policy"])
     counts = count_parameters(model)
     assert counts["total"] == counts["input"] + counts["backbone"] + counts["decoder"]
 
@@ -138,7 +160,9 @@ def test_prior_transformer_supports_backward_and_ignores_event_padding() -> None
     batched = model(observation, events, mask)
 
     for name in alone:
-        torch.testing.assert_close(alone[name][0], batched[name][1], atol=2e-6, rtol=2e-5)
+        torch.testing.assert_close(
+            alone[name][0], batched[name][1], atol=2e-6, rtol=2e-5
+        )
     sum(value.float().sum() for value in batched.values()).backward()
     assert all(
         parameter.grad is not None
@@ -242,9 +266,7 @@ def test_policy_context_can_change_without_recomputing_semantic_state() -> None:
     selection_observation = observation[0:1].clone()
     selection_observation[:, -1] = 1.0
 
-    state = model.semantic_model.encode(
-        observation[0:1], events[0:1], mask[0:1]
-    )
+    state = model.semantic_model.encode(observation[0:1], events[0:1], mask[0:1])
     reused = model.semantic_model.decode_policy(state, selection_observation)
     full = model(selection_observation, events[0:1], mask[0:1])["policy"]
 

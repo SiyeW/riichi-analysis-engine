@@ -13,7 +13,11 @@ from .analysis_observation import PLANE_CHANNELS
 from .architecture import SemanticModelArchitecture
 from .constants import ACTION_SPACE, TILE_TYPES
 from .kyoku_outcome import OUTCOME_COUNT
-from .model_input import POLICY_CONTEXT_CHANNELS, POLICY_CONTEXT_START
+from .model_input import (
+    POLICY_CONTEXT_CHANNELS,
+    POLICY_CONTEXT_START,
+    RULE_CONTEXT_START,
+)
 from .physical_tile_features import (
     PHYSICAL_TILE_TYPES,
     RED_BASE_TILE_INDICES,
@@ -22,6 +26,7 @@ from .physical_tile_features import (
     physical_red_features,
 )
 from .prediction_values import DORA_VALUES, SCORE_VALUES
+from .rule_context import RULE_GLOBAL_CHANNELS, RULE_TILE_CHANNELS
 from .semantic_input import (
     EVENT_ACTOR,
     EVENT_CONSUMED_START,
@@ -40,7 +45,7 @@ class SemanticState:
     tiles: Tensor
     players: Tensor
     global_state: Tensor
-    policy_context: Tensor
+    decision_context: Tensor | None
 
 
 def _sinusoidal_positions(length: int, width: int, reference: Tensor) -> Tensor:
@@ -62,7 +67,9 @@ def _sinusoidal_positions(length: int, width: int, reference: Tensor) -> Tensor:
 class SemanticInputStem(nn.Module):
     """Turn audited planes and event fields into entity-aligned tokens."""
 
-    def __init__(self, architecture: SemanticModelArchitecture) -> None:
+    def __init__(
+        self, architecture: SemanticModelArchitecture, *, shared_rule_context: bool
+    ) -> None:
         super().__init__()
         width = architecture.width
         self.tile_stem = nn.Sequential(
@@ -86,19 +93,37 @@ class SemanticInputStem(nn.Module):
             nn.LayerNorm(event_width),
             nn.Linear(event_width, width),
         )
-        self.policy_context = nn.Sequential(
-            nn.Linear(POLICY_CONTEXT_CHANNELS, architecture.stem_width),
-            nn.GELU(),
-            nn.Linear(architecture.stem_width, width),
-        )
+        self.shared_rule_context = shared_rule_context
+        if shared_rule_context:
+            self.rule_tiles = nn.Sequential(
+                nn.Linear(RULE_TILE_CHANNELS, architecture.stem_width),
+                nn.GELU(),
+                nn.Linear(architecture.stem_width, width),
+            )
+            self.rule_global = nn.Sequential(
+                nn.Linear(RULE_GLOBAL_CHANNELS, architecture.stem_width),
+                nn.GELU(),
+                nn.Linear(architecture.stem_width, width),
+            )
+        else:
+            self.policy_context = nn.Sequential(
+                nn.Linear(POLICY_CONTEXT_CHANNELS, architecture.stem_width),
+                nn.GELU(),
+                nn.Linear(architecture.stem_width, width),
+            )
 
     def forward(
         self, observation: Tensor, event_tokens: Tensor, event_mask: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
         if observation.ndim != 3 or observation.shape[2] != TILE_TYPES:
             raise ValueError("semantic model received a malformed observation")
-        if observation.shape[1] < POLICY_CONTEXT_START + POLICY_CONTEXT_CHANNELS:
-            raise ValueError("semantic model requires the separated v9 observation")
+        required = (
+            RULE_CONTEXT_START + RULE_TILE_CHANNELS + RULE_GLOBAL_CHANNELS
+            if self.shared_rule_context
+            else POLICY_CONTEXT_START + POLICY_CONTEXT_CHANNELS
+        )
+        if observation.shape[1] < required:
+            raise ValueError("semantic model received an incompatible input contract")
         if event_tokens.ndim != 3 or event_tokens.shape[2] != EVENT_FIELDS:
             raise ValueError("semantic model received malformed event tokens")
         if event_mask.shape != event_tokens.shape[:2]:
@@ -117,6 +142,14 @@ class SemanticInputStem(nn.Module):
             physical_dora_features(analysis).stacked()
         )
         tile_state = tile_state + self.red_attributes(physical_red_features(analysis))
+        if self.shared_rule_context:
+            rule_tiles = observation[
+                :, RULE_CONTEXT_START : RULE_CONTEXT_START + RULE_TILE_CHANNELS
+            ].transpose(1, 2)
+            physical_rule_tiles = torch.cat(
+                (rule_tiles, rule_tiles[:, RED_BASE_TILE_INDICES]), dim=1
+            )
+            tile_state = tile_state + self.rule_tiles(physical_rule_tiles)
 
         fields = event_tokens.long()
         event_state = (
@@ -132,7 +165,17 @@ class SemanticInputStem(nn.Module):
             )
         event_state = self.event_output(event_state)
         event_state = event_state * event_mask.unsqueeze(-1)
-        return tile_state, event_state, self.encode_policy_context(observation)
+        context = (
+            self.encode_rule_context(observation)
+            if self.shared_rule_context
+            else self.encode_policy_context(observation)
+        )
+        return tile_state, event_state, context
+
+    def encode_rule_context(self, observation: Tensor) -> Tensor:
+        start = RULE_CONTEXT_START + RULE_TILE_CHANNELS
+        values = observation[:, start : start + RULE_GLOBAL_CHANNELS].mean(dim=-1)
+        return self.rule_global(values)
 
     def encode_policy_context(self, observation: Tensor) -> Tensor:
         if observation.ndim != 3 or observation.shape[1] < POLICY_CONTEXT_START:
@@ -176,8 +219,10 @@ class TileGraphBlock(nn.Module):
     def forward(self, value: Tensor) -> Tensor:
         normalized = self.norm(value)
         neighbors = torch.einsum("ij,bjd->bid", self.adjacency, normalized)
-        value = value + self.self_projection(normalized) + self.neighbor_projection(
-            neighbors
+        value = (
+            value
+            + self.self_projection(normalized)
+            + self.neighbor_projection(neighbors)
         )
         return value + self.feed_forward(value)
 
@@ -217,9 +262,9 @@ class MaskedCausalEventPriorBlock(nn.Module):
     def forward(self, value: Tensor, mask: Tensor) -> Tensor:
         token_mask = mask.unsqueeze(-1)
         normalized = self.norm(value) * token_mask
-        local = self.depthwise(
-            F.pad(normalized.transpose(1, 2), (2, 0))
-        ).transpose(1, 2)
+        local = self.depthwise(F.pad(normalized.transpose(1, 2), (2, 0))).transpose(
+            1, 2
+        )
         update = self.pointwise(F.gelu(local)) * token_mask
         return (value + update) * token_mask
 
@@ -230,9 +275,7 @@ class CNNBackbone(nn.Module):
         width = architecture.width
         self.tile_blocks = nn.Sequential(
             *(
-                TileGraphBlock(
-                    width, prior_version=architecture.semantic_prior_version
-                )
+                TileGraphBlock(width, prior_version=architecture.semantic_prior_version)
                 for _ in range(architecture.backbone_blocks)
             )
         )
@@ -264,7 +307,11 @@ class CNNBackbone(nn.Module):
         nn.init.normal_(self.global_query, std=width**-0.5)
 
     def forward(
-        self, tiles: Tensor, events: Tensor, event_mask: Tensor
+        self,
+        tiles: Tensor,
+        events: Tensor,
+        event_mask: Tensor,
+        shared_context: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         tiles = self.tile_blocks(tiles)
         if self.position_events:
@@ -278,6 +325,8 @@ class CNNBackbone(nn.Module):
         batch = len(tiles)
         queries = torch.cat((self.player_queries, self.global_query), dim=0)
         queries = queries.unsqueeze(0).expand(batch, -1, -1)
+        if shared_context is not None:
+            queries = queries + shared_context.unsqueeze(1)
         entities, _ = self.readout(queries, tiles, tiles, need_weights=False)
         entities_from_events, _ = self.event_fusion(
             entities,
@@ -304,20 +353,24 @@ class DualStreamTransformerBlock(nn.Module):
         )
         self.event_norm = nn.LayerNorm(width)
 
-    def forward(
-        self, state: Tensor, events: Tensor, event_mask: Tensor
-    ) -> Tensor:
+    def forward(self, state: Tensor, events: Tensor, event_mask: Tensor) -> Tensor:
         state_norm = self.state_norm(state)
-        state = state + self.state_attention(
-            state_norm, state_norm, state_norm, need_weights=False
-        )[0]
-        state = state + self.cross_attention(
-            self.state_norm(state),
-            self.event_norm(events),
-            self.event_norm(events),
-            key_padding_mask=~event_mask.bool(),
-            need_weights=False,
-        )[0]
+        state = (
+            state
+            + self.state_attention(
+                state_norm, state_norm, state_norm, need_weights=False
+            )[0]
+        )
+        state = (
+            state
+            + self.cross_attention(
+                self.state_norm(state),
+                self.event_norm(events),
+                self.event_norm(events),
+                key_padding_mask=~event_mask.bool(),
+                need_weights=False,
+            )[0]
+        )
         return state + self.state_ff(state)
 
 
@@ -329,9 +382,7 @@ class TransformerBackbone(nn.Module):
         self.global_token = nn.Parameter(torch.empty(1, width))
         self.tile_prior_blocks = nn.Sequential(
             *(
-                TileGraphBlock(
-                    width, prior_version=architecture.semantic_prior_version
-                )
+                TileGraphBlock(width, prior_version=architecture.semantic_prior_version)
                 for _ in range(architecture.transformer_tile_prior_blocks)
             )
         )
@@ -361,15 +412,25 @@ class TransformerBackbone(nn.Module):
         nn.init.normal_(self.global_token, std=width**-0.5)
 
     def forward(
-        self, tiles: Tensor, events: Tensor, event_mask: Tensor
+        self,
+        tiles: Tensor,
+        events: Tensor,
+        event_mask: Tensor,
+        shared_context: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         tiles = self.tile_prior_blocks(tiles)
         batch = len(tiles)
+        entity_tokens = (
+            torch.cat((self.player_tokens, self.global_token), dim=0)
+            .unsqueeze(0)
+            .expand(batch, -1, -1)
+        )
+        if shared_context is not None:
+            entity_tokens = entity_tokens + shared_context.unsqueeze(1)
         state = torch.cat(
             (
                 tiles,
-                self.player_tokens.unsqueeze(0).expand(batch, -1, -1),
-                self.global_token.unsqueeze(0).expand(batch, -1, -1),
+                entity_tokens,
             ),
             dim=1,
         )
@@ -413,24 +474,41 @@ class PairwiseLogits(nn.Module):
 
 
 class StructuredSemanticDecoder(nn.Module):
-    def __init__(self, architecture: SemanticModelArchitecture) -> None:
+    def __init__(
+        self, architecture: SemanticModelArchitecture, *, shared_rule_context: bool
+    ) -> None:
         super().__init__()
         width = architecture.width
         hidden = architecture.decoder_width
-        self.shanten = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, 7))
-        self.furiten = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, 1))
+        self.shanten = nn.Sequential(
+            nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, 7)
+        )
+        self.furiten = nn.Sequential(
+            nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, 1)
+        )
         self.wait = PairwiseLogits(width, hidden)
         self.hidden = PairwiseLogits(width, hidden)
         self.hidden_red = PairwiseLogits(width, hidden)
-        self.dora = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, len(DORA_VALUES)))
+        self.dora = nn.Sequential(
+            nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, len(DORA_VALUES))
+        )
         self.dora_tail = nn.Linear(width, 1)
-        self.score = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, len(SCORE_VALUES)))
-        self.outcome = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, OUTCOME_COUNT))
+        self.score = nn.Sequential(
+            nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, len(SCORE_VALUES))
+        )
+        self.outcome = nn.Sequential(
+            nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, OUTCOME_COUNT)
+        )
         self.kyoku_accounts = nn.Linear(width, 5)
-        self.placement = nn.Sequential(nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, 24))
+        self.placement = nn.Sequential(
+            nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, 24)
+        )
         self.match_score = nn.Linear(width, 4)
+        self.shared_rule_context = shared_rule_context
         self.policy_query = nn.Sequential(
-            nn.Linear(width * 2, hidden), nn.GELU(), nn.Linear(hidden, width)
+            nn.Linear(width if shared_rule_context else width * 2, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, width),
         )
         self.action_keys = nn.Embedding(ACTION_SPACE, width)
 
@@ -451,31 +529,44 @@ class StructuredSemanticDecoder(nn.Module):
             "kyoku_accounts": self.kyoku_accounts(state.global_state),
             "placement": self.placement(state.global_state),
             "match_score": self.match_score(state.global_state),
-            "policy": self.policy(state.global_state, state.policy_context),
+            "policy": self.policy(state.global_state, state.decision_context),
         }
 
-    def policy(self, global_state: Tensor, policy_context: Tensor) -> Tensor:
-        policy_query = self.policy_query(
-            torch.cat((global_state, policy_context), dim=-1)
+    def policy(self, global_state: Tensor, decision_context: Tensor | None) -> Tensor:
+        policy_input = (
+            global_state
+            if self.shared_rule_context
+            else torch.cat((global_state, decision_context), dim=-1)
         )
-        return torch.einsum(
-            "bd,ad->ba", policy_query, self.action_keys.weight
-        ) / sqrt(global_state.shape[-1])
+        policy_query = self.policy_query(policy_input)
+        return torch.einsum("bd,ad->ba", policy_query, self.action_keys.weight) / sqrt(
+            global_state.shape[-1]
+        )
 
 
 class SemanticRiichiModel(nn.Module):
     """One v12 model contract with interchangeable CNN/Transformer backbones."""
 
-    def __init__(self, architecture: SemanticModelArchitecture) -> None:
+    def __init__(
+        self,
+        architecture: SemanticModelArchitecture,
+        *,
+        shared_rule_context: bool = False,
+    ) -> None:
         super().__init__()
         self.architecture = architecture
-        self.input = SemanticInputStem(architecture)
+        self.shared_rule_context = shared_rule_context
+        self.input = SemanticInputStem(
+            architecture, shared_rule_context=shared_rule_context
+        )
         self.backbone: CNNBackbone | TransformerBackbone = (
             CNNBackbone(architecture)
             if architecture.backbone == "cnn"
             else TransformerBackbone(architecture)
         )
-        self.decoder = StructuredSemanticDecoder(architecture)
+        self.decoder = StructuredSemanticDecoder(
+            architecture, shared_rule_context=shared_rule_context
+        )
 
     def forward(
         self, observation: Tensor, event_tokens: Tensor, event_mask: Tensor
@@ -485,19 +576,30 @@ class SemanticRiichiModel(nn.Module):
     def encode(
         self, observation: Tensor, event_tokens: Tensor, event_mask: Tensor
     ) -> SemanticState:
-        tiles, events, policy = self.input(observation, event_tokens, event_mask)
-        tiles, players, global_state = self.backbone(tiles, events, event_mask)
+        tiles, events, context = self.input(observation, event_tokens, event_mask)
+        tiles, players, global_state = self.backbone(
+            tiles,
+            events,
+            event_mask,
+            context if self.shared_rule_context else None,
+        )
         return SemanticState(
             tiles=tiles,
             players=players,
             global_state=global_state,
-            policy_context=policy,
+            decision_context=context,
         )
 
     def decode(self, state: SemanticState) -> dict[str, Tensor]:
         return self.decoder(state)
 
     def decode_policy(self, state: SemanticState, observation: Tensor) -> Tensor:
+        if self.shared_rule_context:
+            current = state.decision_context
+            if current is None:
+                raise RuntimeError("shared rule context is missing from semantic state")
+            updated = self.input.encode_rule_context(observation)
+            return self.decoder.policy(state.global_state - current + updated, None)
         return self.decoder.policy(
             state.global_state,
             self.input.encode_policy_context(observation),
