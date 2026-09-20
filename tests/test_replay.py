@@ -8,6 +8,7 @@ import numpy as np
 from riichi_analysis_engine.prediction_values import SCORE_VALUE_SET, SCORE_VALUES
 from riichi_analysis_engine.replay import (
     FullState,
+    HiddenBaselineAnchorTracker,
     _ron_label_hand,
     action_label,
     annotate_game,
@@ -16,6 +17,60 @@ from riichi_analysis_engine.replay import (
     read_events,
     terminal_match_scores,
 )
+
+
+def _start_kyoku(dealer: int) -> dict[str, object]:
+    return {
+        "type": "start_kyoku",
+        "oya": dealer,
+        "bakaze": "E",
+        "dora_marker": "1m",
+        "tehais": [[], [], [], []],
+    }
+
+
+def test_hidden_baseline_anchor_ends_on_an_opponent_dealers_first_choice() -> None:
+    tracker = HiddenBaselineAnchorTracker()
+
+    assert tracker.process(_start_kyoku(1)).tolist() == [True] * 4
+    assert tracker.process({"type": "tsumo", "actor": 1, "pai": "?"}).tolist() == [
+        True,
+        True,
+        True,
+        True,
+    ]
+    choice = tracker.process({"type": "dahai", "actor": 1, "pai": "1m"})
+
+    assert choice.tolist() == [False, True, False, False]
+
+
+def test_hidden_baseline_anchor_includes_own_dealers_first_discard_only() -> None:
+    tracker = HiddenBaselineAnchorTracker()
+
+    tracker.process(_start_kyoku(0))
+    assert tracker.process({"type": "tsumo", "actor": 0, "pai": "1m"})[0]
+    assert tracker.process(
+        {"type": "ankan", "actor": 0, "consumed": ["1m"] * 4}
+    )[0]
+    assert tracker.process({"type": "dora", "dora_marker": "2m"})[0]
+    assert tracker.process({"type": "dahai", "actor": 0, "pai": "2m"})[0]
+
+    # A normal next draw proves that every eligible opponent passed the first
+    # discard, so the first frame after it is already evidence-bearing.
+    assert not tracker.process({"type": "tsumo", "actor": 1, "pai": "?"})[0]
+    assert not tracker.process({"type": "dahai", "actor": 1, "pai": "3m"})[0]
+
+
+def test_hidden_baseline_anchor_ends_immediately_on_an_opponent_ankan() -> None:
+    tracker = HiddenBaselineAnchorTracker()
+    tracker.process(_start_kyoku(2))
+    tracker.process({"type": "tsumo", "actor": 2, "pai": "?"})
+
+    frame = tracker.process(
+        {"type": "ankan", "actor": 2, "consumed": ["5p"] * 4}
+    )
+
+    assert frame.tolist() == [False, False, True, False]
 
 
 def test_read_events_detects_gzip_payload_inside_misnamed_zip_member(tmp_path) -> None:

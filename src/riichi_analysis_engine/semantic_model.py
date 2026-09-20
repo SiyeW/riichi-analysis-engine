@@ -473,6 +473,40 @@ class PairwiseLogits(nn.Module):
         return self.output(torch.nn.functional.gelu(pair)).squeeze(-1)
 
 
+class PairwiseCategoricalLogits(nn.Module):
+    """Decode one complete count distribution for every source/entity pair."""
+
+    def __init__(self, width: int, hidden: int, classes: int) -> None:
+        super().__init__()
+        self.left = nn.Linear(width, hidden)
+        self.right = nn.Linear(width, hidden)
+        self.output = nn.Linear(hidden, classes)
+        # A new v13 model must begin exactly at the analytic baseline.  The
+        # count head learns only evidence-dependent residuals from that point.
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, left: Tensor, right: Tensor) -> Tensor:
+        pair = self.left(left).unsqueeze(2) + self.right(right).unsqueeze(1)
+        return self.output(torch.nn.functional.gelu(pair))
+
+
+class JointOpponentWaitHead(nn.Module):
+    """Read all 34 waits from an integrated opponent/global representation."""
+
+    def __init__(self, width: int, hidden: int) -> None:
+        super().__init__()
+        self.output = nn.Sequential(
+            nn.Linear(width * 2, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, TILE_TYPES),
+        )
+
+    def forward(self, opponents: Tensor, global_state: Tensor) -> Tensor:
+        shared = global_state.unsqueeze(1).expand(-1, opponents.shape[1], -1)
+        return self.output(torch.cat((opponents, shared), dim=-1))
+
+
 class StructuredSemanticDecoder(nn.Module):
     def __init__(
         self, architecture: SemanticModelArchitecture, *, shared_rule_context: bool
@@ -486,9 +520,16 @@ class StructuredSemanticDecoder(nn.Module):
         self.furiten = nn.Sequential(
             nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, 1)
         )
-        self.wait = PairwiseLogits(width, hidden)
-        self.hidden = PairwiseLogits(width, hidden)
-        self.hidden_red = PairwiseLogits(width, hidden)
+        self.wait: PairwiseLogits | JointOpponentWaitHead = (
+            JointOpponentWaitHead(width, hidden)
+            if shared_rule_context
+            else PairwiseLogits(width, hidden)
+        )
+        if shared_rule_context:
+            self.hidden_count = PairwiseCategoricalLogits(width, hidden, 5)
+        else:
+            self.hidden = PairwiseLogits(width, hidden)
+            self.hidden_red = PairwiseLogits(width, hidden)
         self.dora = nn.Sequential(
             nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, len(DORA_VALUES))
         )
@@ -516,12 +557,14 @@ class StructuredSemanticDecoder(nn.Module):
         opponents = state.players[:, 1:]
         base_tiles = state.tiles[:, :TILE_TYPES]
         red_tiles = state.tiles[:, TILE_TYPES:]
-        return {
+        outputs = {
             "shanten": self.shanten(opponents),
             "furiten_no_yaku": self.furiten(opponents).squeeze(-1),
-            "deal_in_tile": self.wait(opponents, base_tiles),
-            "hidden_source_affinity": self.hidden(state.players, base_tiles),
-            "hidden_red_source": self.hidden_red(red_tiles, state.players),
+            "deal_in_tile": (
+                self.wait(opponents, state.global_state)
+                if self.shared_rule_context
+                else self.wait(opponents, base_tiles)
+            ),
             "dora_distribution": self.dora(opponents),
             "dora_tail": self.dora_tail(opponents).squeeze(-1),
             "score_distribution": self.score(opponents),
@@ -531,6 +574,14 @@ class StructuredSemanticDecoder(nn.Module):
             "match_score": self.match_score(state.global_state),
             "policy": self.policy(state.global_state, state.decision_context),
         }
+        if self.shared_rule_context:
+            outputs["hidden_count_residual"] = self.hidden_count(
+                state.players, state.tiles
+            )
+        else:
+            outputs["hidden_source_affinity"] = self.hidden(state.players, base_tiles)
+            outputs["hidden_red_source"] = self.hidden_red(red_tiles, state.players)
+        return outputs
 
     def policy(self, global_state: Tensor, decision_context: Tensor | None) -> Tensor:
         policy_input = (

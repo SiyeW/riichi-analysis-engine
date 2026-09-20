@@ -10,6 +10,7 @@ from riichi_analysis_engine.model_input import (
     RULE_CONTEXT_START,
     SHARED_MODEL_INPUT_CHANNELS,
 )
+from riichi_analysis_engine.physical_tile_features import PHYSICAL_TILE_TYPES
 from riichi_analysis_engine.prediction_values import DORA_VALUES, SCORE_VALUES
 from riichi_analysis_engine.rule_context import RULE_TILE_CHANNELS
 from riichi_analysis_engine.semantic_input import (
@@ -19,7 +20,7 @@ from riichi_analysis_engine.semantic_input import (
     EVENT_TYPE,
     PUBLIC_EVENT_TYPE_TO_ID,
 )
-from riichi_analysis_engine.semantic_model import TileGraphBlock
+from riichi_analysis_engine.semantic_model import SemanticState, TileGraphBlock
 
 
 def _architecture(backbone: str) -> SemanticModelArchitecture:
@@ -107,8 +108,47 @@ def test_v13_shared_rule_facts_reach_non_policy_outputs() -> None:
 
     assert not torch.equal(first_outputs["outcome"], second_outputs["outcome"])
     assert not torch.equal(first_outputs["policy"], second_outputs["policy"])
+    assert first_outputs["hidden_count_residual"].shape == (
+        2,
+        4,
+        PHYSICAL_TILE_TYPES,
+        5,
+    )
+    assert torch.equal(
+        first_outputs["hidden_count_residual"],
+        torch.zeros_like(first_outputs["hidden_count_residual"]),
+    )
+    assert "hidden_source_affinity" not in first_outputs
+    assert "hidden_red_source" not in first_outputs
     counts = count_parameters(model)
     assert counts["total"] == counts["input"] + counts["backbone"] + counts["decoder"]
+
+
+def test_v13_wait_head_has_no_direct_same_tile_shortcut() -> None:
+    torch.manual_seed(4)
+    model = RiichiAnalysisModel(
+        format_version=13, architecture=_architecture("cnn")
+    ).eval()
+    width = model.architecture.width
+    players = torch.randn(1, 4, width)
+    global_state = torch.randn(1, width)
+    first = SemanticState(
+        tiles=torch.zeros(1, PHYSICAL_TILE_TYPES, width),
+        players=players,
+        global_state=global_state,
+        decision_context=torch.zeros(1, width),
+    )
+    second = SemanticState(
+        tiles=torch.randn(1, PHYSICAL_TILE_TYPES, width),
+        players=players,
+        global_state=global_state,
+        decision_context=torch.zeros(1, width),
+    )
+
+    first_wait = model.semantic_model.decode(first)["deal_in_tile"]
+    second_wait = model.semantic_model.decode(second)["deal_in_tile"]
+
+    assert torch.equal(first_wait, second_wait)
 
 
 def test_v12_rejects_missing_event_memory() -> None:

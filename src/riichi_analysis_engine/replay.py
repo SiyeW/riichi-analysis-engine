@@ -39,6 +39,63 @@ FRAME_EVENTS = {
     "dora",
 }
 
+_INITIAL_PUBLIC_CHOICES = {
+    "dahai",
+    "chi",
+    "pon",
+    "daiminkan",
+    "ankan",
+    "kakan",
+    "reach",
+}
+
+
+@dataclass
+class HiddenBaselineAnchorTracker:
+    """Identify frames with provably no opponent-choice information.
+
+    An opponent dealer leaves the baseline on their first public choice.  A
+    controlled dealer may draw, declare, kan, and make the first discard
+    without revealing an opponent choice; the first following frame event
+    resolves at least one opponent response opportunity and ends the anchor.
+    """
+
+    dealer: int | None = None
+    active: np.ndarray = field(default_factory=lambda: np.ones(4, dtype=bool))
+    own_discard_waiting: np.ndarray = field(
+        default_factory=lambda: np.zeros(4, dtype=bool)
+    )
+
+    def process(self, event: dict[str, Any]) -> np.ndarray | None:
+        kind = event["type"]
+        if kind == "start_kyoku":
+            self.dealer = int(event["oya"])
+            self.active.fill(True)
+            self.own_discard_waiting.fill(False)
+            return self.active.copy()
+        if kind not in FRAME_EVENTS:
+            return None
+        if self.dealer is None:
+            raise ValueError("hidden baseline state starts before start_kyoku")
+
+        actor = event.get("actor")
+        result = self.active.copy()
+        for perspective in range(4):
+            if not self.active[perspective]:
+                continue
+            if perspective == self.dealer:
+                if self.own_discard_waiting[perspective]:
+                    self.active[perspective] = False
+                    result[perspective] = False
+                elif kind == "dahai" and actor == perspective:
+                    # The just-emitted discard frame precedes every opponent
+                    # response.  Only the following frame proves a pass/call.
+                    self.own_discard_waiting[perspective] = True
+            elif actor == self.dealer and kind in _INITIAL_PUBLIC_CHOICES:
+                self.active[perspective] = False
+                result[perspective] = False
+        return result
+
 
 def _ron_label_hand(
     hand: np.ndarray,

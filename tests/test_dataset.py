@@ -17,7 +17,10 @@ from riichi_analysis_engine.dataset import (
     audit_terminal_score_arrays,
     read_manifest,
 )
-from riichi_analysis_engine.model_input import MODEL_INPUT_CHANNELS
+from riichi_analysis_engine.model_input import (
+    MODEL_INPUT_CHANNELS,
+    SHARED_MODEL_INPUT_CHANNELS,
+)
 from riichi_analysis_engine.observation_layout import (
     JIKAZE_CHANNEL,
     MORTAL_ANALYSIS_CHANNELS,
@@ -34,7 +37,10 @@ from riichi_analysis_engine.packing import (
     write_manifest,
 )
 from riichi_analysis_engine.semantic_input import encode_public_event
-from riichi_analysis_engine.storage import save_chunk_archive
+from riichi_analysis_engine.storage import (
+    TRAINING_TARGET_SCHEMA_ID,
+    save_chunk_archive,
+)
 
 
 @pytest.fixture()
@@ -75,7 +81,11 @@ def pack_directory(
             count,
             kyoku=game,
             observation_channels=(
-                MODEL_INPUT_CHANNELS if model_format in {9, 10, 11} else OBS_CHANNELS
+                SHARED_MODEL_INPUT_CHANNELS
+                if model_format == 13
+                else MODEL_INPUT_CHANNELS
+                if model_format in {9, 10, 11, 12}
+                else OBS_CHANNELS
             ),
         )
         arrays["event_index"] = np.arange(count, dtype=np.int32) + game * 1000
@@ -89,12 +99,12 @@ def pack_directory(
             # minimum coherent observation contract for training tests here.
             jikaze = (
                 channel_index("jikaze")
-                if model_format in {9, 10, 11}
+                if model_format in {9, 10, 11, 12, 13}
                 else JIKAZE_CHANNEL
             )
             rank_start = (
                 channel_index("rank_p0_r0")
-                if model_format in {9, 10, 11}
+                if model_format in {9, 10, 11, 12, 13}
                 else MORTAL_ANALYSIS_CHANNELS
             )
             arrays["obs"][:, jikaze, WIND_TILE_START : WIND_TILE_START + 4] = 0
@@ -126,6 +136,8 @@ def pack_directory(
             )
             if model_format >= 10:
                 arrays["analysis_active"] = np.ones(count, dtype=bool)
+            if model_format == 13:
+                arrays["hidden_baseline_anchor"] = np.ones(count, dtype=bool)
         if semantic_history:
             catalog = np.stack(
                 [
@@ -154,9 +166,19 @@ def pack_directory(
                 arrays,
                 samples,
                 event_catalog=catalog,
+                training_target_schema=(
+                    TRAINING_TARGET_SCHEMA_ID if model_format == 13 else None
+                ),
             )
         else:
-            save_chunk_archive(stage / f"game-{game:06d}.zip", arrays, samples)
+            save_chunk_archive(
+                stage / f"game-{game:06d}.zip",
+                arrays,
+                samples,
+                training_target_schema=(
+                    TRAINING_TARGET_SCHEMA_ID if model_format == 13 else None
+                ),
+            )
 
     output = root / "packs"
     paths = staged_games(stage)
@@ -178,6 +200,7 @@ def pack_directory(
             "modelInputSchema": entries[0]["modelInputSchema"],
             "observationChannels": entries[0]["observationChannels"],
             "eventMemorySchema": entries[0].get("eventMemorySchema"),
+            "trainingTargetSchema": entries[0].get("trainingTargetSchema"),
         },
     )
     return output

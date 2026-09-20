@@ -10,6 +10,7 @@ TILE_TYPES = 34
 RED_TYPES = 3
 PHYSICAL_TILE_TYPES = TILE_TYPES + RED_TYPES
 FIVE_TILE_INDICES = (4, 13, 22)
+COUNT_CLASSES = 5
 
 
 def physical_hidden_counts(
@@ -186,3 +187,196 @@ def count_marginals(
         combined = base * red[:, :, suit, :1] + shifted * red[:, :, suit, 1:]
         total[:, :, tile] = combined
     return total.view(batch, HIDDEN_SOURCES, TILE_TYPES, 5), red
+
+
+def theoretical_count_baseline(
+    physical_inventory: Tensor,
+    source_capacities: Tensor,
+) -> Tensor:
+    """Return exact no-behaviour marginal count distributions.
+
+    Conditional on the publicly known physical inventory and source sizes, an
+    individual source is a draw without replacement from the remaining hidden
+    tiles.  Its count for one physical tile family is therefore
+    hypergeometric.  These marginals are the analytic baseline that the v13
+    residual head refines; the network must not relearn them from sampled
+    opening hands.
+    """
+
+    if physical_inventory.ndim != 2 or physical_inventory.shape[1] != PHYSICAL_TILE_TYPES:
+        raise ValueError("wrong physical-inventory shape")
+    if source_capacities.shape != (len(physical_inventory), HIDDEN_SOURCES):
+        raise ValueError("wrong source-capacity shape")
+    if not torch.equal(physical_inventory.sum(-1), source_capacities.sum(-1)):
+        raise ValueError("physical inventories and source capacities do not balance")
+
+    inventory = physical_inventory.float()[:, None, :, None]
+    capacities = source_capacities.float()[:, :, None, None]
+    population = physical_inventory.sum(-1).float()[:, None, None, None]
+    counts = torch.arange(
+        COUNT_CLASSES, device=physical_inventory.device, dtype=torch.float32
+    ).view(1, 1, 1, -1)
+
+    def log_choose(total: Tensor, selected: Tensor) -> Tensor:
+        return (
+            torch.lgamma(total + 1.0)
+            - torch.lgamma(selected + 1.0)
+            - torch.lgamma(total - selected + 1.0)
+        )
+
+    valid = (
+        (counts <= inventory)
+        & (counts <= capacities)
+        & (capacities - counts <= population - inventory)
+    )
+    safe_population = population.clamp_min(1.0)
+    log_probability = (
+        log_choose(inventory, counts)
+        + log_choose(population - inventory, capacities - counts)
+        - log_choose(safe_population, capacities)
+    )
+    floor = torch.finfo(log_probability.dtype).min
+    log_probability = torch.where(valid, log_probability, floor)
+    baseline = torch.softmax(log_probability, dim=-1)
+
+    empty = population == 0
+    if empty.any():
+        deterministic_zero = torch.zeros_like(baseline)
+        deterministic_zero[..., 0] = 1.0
+        baseline = torch.where(empty, deterministic_zero, baseline)
+    return baseline
+
+
+def projected_count_distributions(
+    residual_logits: Tensor,
+    physical_inventory: Tensor,
+    source_capacities: Tensor,
+    *,
+    iterations: int = 24,
+) -> tuple[Tensor, Tensor]:
+    """Apply learned residuals and restore public expectation constraints.
+
+    Unlike the historical independent-copy/binomial decoder, this operates on
+    complete 0..4 count distributions.  Alternating exponential tilts enforce
+    every source capacity and physical-tile inventory in expectation while
+    preserving arbitrary shapes such as high mass at 0 and 2 but little at 1.
+    """
+
+    expected_shape = (
+        len(physical_inventory),
+        HIDDEN_SOURCES,
+        PHYSICAL_TILE_TYPES,
+        COUNT_CLASSES,
+    )
+    if residual_logits.shape != expected_shape:
+        raise ValueError(
+            f"wrong hidden-count residual shape: {tuple(residual_logits.shape)}"
+        )
+    if iterations <= 0:
+        raise ValueError("count projection iterations must be positive")
+
+    baseline = theoretical_count_baseline(physical_inventory, source_capacities)
+    floor = torch.finfo(torch.float32).min
+    logits = torch.where(
+        baseline > 0,
+        baseline.clamp_min(torch.finfo(torch.float32).tiny).log()
+        + residual_logits.float(),
+        torch.full_like(residual_logits, floor, dtype=torch.float32),
+    )
+    count_values = torch.arange(
+        COUNT_CLASSES, device=logits.device, dtype=logits.dtype
+    ).view(1, 1, 1, -1)
+    row_bias = logits.new_zeros((len(logits), HIDDEN_SOURCES))
+    column_bias = logits.new_zeros((len(logits), PHYSICAL_TILE_TYPES))
+    row_target = source_capacities.float()
+    column_target = physical_inventory.float()
+
+    def moments() -> tuple[Tensor, Tensor, Tensor]:
+        adjusted = logits + count_values * (
+            row_bias[:, :, None, None] + column_bias[:, None, :, None]
+        )
+        probability = torch.softmax(adjusted, dim=-1)
+        mean = (probability * count_values).sum(-1)
+        variance = (
+            probability * (count_values - mean.unsqueeze(-1)).square()
+        ).sum(-1)
+        return probability, mean, variance
+
+    # Newton updates on one family of margins at a time are the moment-space
+    # counterpart of iterative proportional fitting.  Clamp only the dual
+    # update, never the learned distribution, to keep extreme early logits
+    # numerically recoverable.
+    for _ in range(iterations):
+        _probability, mean, variance = moments()
+        row_delta = (row_target - mean.sum(-1)) / variance.sum(-1).clamp_min(1e-4)
+        row_bias = row_bias + row_delta.clamp(-2.0, 2.0)
+
+        _probability, mean, variance = moments()
+        column_delta = (column_target - mean.sum(1)) / variance.sum(1).clamp_min(1e-4)
+        column_bias = column_bias + column_delta.clamp(-2.0, 2.0)
+
+    probability, _mean, _variance = moments()
+    return probability, baseline
+
+
+def hidden_count_distribution_loss(
+    probability: Tensor,
+    baseline: Tensor,
+    physical_counts: Tensor,
+    physical_inventory: Tensor,
+    baseline_anchor: Tensor,
+) -> Tensor:
+    """Train anchors from analytic soft labels and all later frames from truth."""
+
+    if probability.shape != baseline.shape:
+        raise ValueError("hidden-count prediction and baseline shapes differ")
+    if physical_counts.shape != probability.shape[:-1]:
+        raise ValueError("hidden-count targets have the wrong shape")
+    if baseline_anchor.shape != (len(probability),):
+        raise ValueError("hidden-count anchor mask has the wrong shape")
+
+    log_probability = probability.float().clamp_min(
+        torch.finfo(torch.float32).tiny
+    ).log()
+    sampled = -log_probability.gather(
+        -1, physical_counts.long().unsqueeze(-1)
+    ).squeeze(-1)
+    baseline_float = baseline.float()
+    analytic = (
+        baseline_float
+        * (
+            baseline_float.clamp_min(torch.finfo(torch.float32).tiny).log()
+            - log_probability
+        )
+    ).sum(-1)
+    per_family = torch.where(
+        baseline_anchor.bool()[:, None, None], analytic, sampled
+    )
+    active = (physical_inventory[:, None, :] > 0).expand(
+        -1, HIDDEN_SOURCES, -1
+    )
+    per_sample = (per_family * active).sum(dim=(1, 2)) / active.sum(
+        dim=(1, 2)
+    ).clamp_min(1)
+    return per_sample.mean()
+
+
+def physical_count_marginals(
+    physical_distributions: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Compose protocol base-tile and red-five marginals from 37 entities."""
+
+    if physical_distributions.ndim != 4 or physical_distributions.shape[1:] != (
+        HIDDEN_SOURCES,
+        PHYSICAL_TILE_TYPES,
+        COUNT_CLASSES,
+    ):
+        raise ValueError("wrong physical count-distribution shape")
+    normal = physical_distributions[:, :, :TILE_TYPES]
+    red = physical_distributions[:, :, TILE_TYPES:, :2]
+    total = normal.clone()
+    for suit, tile in enumerate(FIVE_TILE_INDICES):
+        base = normal[:, :, tile]
+        shifted = torch.cat((torch.zeros_like(base[..., :1]), base[..., :-1]), dim=-1)
+        total[:, :, tile] = base * red[:, :, suit, :1] + shifted * red[:, :, suit, 1:]
+    return total, red

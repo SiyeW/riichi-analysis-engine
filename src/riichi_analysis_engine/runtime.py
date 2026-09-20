@@ -34,6 +34,8 @@ from .hidden_transport import (
     balanced_source_probabilities,
     count_marginals,
     physical_affinities,
+    physical_count_marginals,
+    projected_count_distributions,
 )
 from .kyoku_outcome import OUTCOME_CLASSES, outcome_marginals
 from .model import RiichiAnalysisModel
@@ -628,19 +630,31 @@ class AnalysisRuntime:
             physical_inventory, source_capacities = (
                 rule_state.hidden_transport_constraints(controlled_seat)
             )
-            affinity = physical_affinities(
-                outputs["hidden_source_affinity"].unsqueeze(0),
-                outputs["hidden_red_source"].unsqueeze(0),
-            )
-            source_probability = balanced_source_probabilities(
-                affinity,
-                torch.from_numpy(physical_inventory).unsqueeze(0),
-                torch.from_numpy(source_capacities).unsqueeze(0),
-            )
-            hidden_counts, hidden_red = count_marginals(
-                source_probability,
-                torch.from_numpy(physical_inventory).unsqueeze(0),
-            )
+            inventory_tensor = torch.from_numpy(physical_inventory).unsqueeze(0)
+            capacity_tensor = torch.from_numpy(source_capacities).unsqueeze(0)
+            if "hidden_count_residual" in outputs:
+                physical_distribution, _baseline = projected_count_distributions(
+                    outputs["hidden_count_residual"].unsqueeze(0),
+                    inventory_tensor,
+                    capacity_tensor,
+                )
+                hidden_counts, hidden_red = physical_count_marginals(
+                    physical_distribution
+                )
+            else:
+                affinity = physical_affinities(
+                    outputs["hidden_source_affinity"].unsqueeze(0),
+                    outputs["hidden_red_source"].unsqueeze(0),
+                )
+                source_probability = balanced_source_probabilities(
+                    affinity,
+                    inventory_tensor,
+                    capacity_tensor,
+                )
+                hidden_counts, hidden_red = count_marginals(
+                    source_probability,
+                    inventory_tensor,
+                )
             hidden_counts = hidden_counts[0].numpy()
             hidden_red = hidden_red[0].numpy()
             concealed = hidden_counts[:3]

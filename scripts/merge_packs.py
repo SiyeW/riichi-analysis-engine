@@ -75,6 +75,7 @@ def merge(
             "modelInputSchema",
             "observationChannels",
             "eventMemorySchema",
+            "trainingTargetSchema",
         ):
             if key in shared and manifest.get(key) != shared[key]:
                 raise ValueError(f"segment {name} was packed with a different {key}")
@@ -138,6 +139,7 @@ def merge(
         "modelInputSchema": shared.get("modelInputSchema"),
         "observationChannels": shared.get("observationChannels"),
         "eventMemorySchema": shared.get("eventMemorySchema"),
+        "trainingTargetSchema": shared.get("trainingTargetSchema"),
     }
     write_manifest(root / "manifest.json", manifest)
     report = audit_packs(root, manifest, merged)

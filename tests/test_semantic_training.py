@@ -73,3 +73,53 @@ def test_v12_real_losses_complete_one_cpu_optimizer_step(
     assert torch.isfinite(total)
     assert set(losses) == set(LOSS_TERMS_V8)
     assert any(active.values())
+
+
+def test_v13_residual_count_losses_complete_one_cpu_optimizer_step(
+    scratch: Path,
+) -> None:
+    packs = pack_directory(
+        scratch,
+        games=2,
+        chunks=1,
+        samples=2,
+        pack_samples=4,
+        training_targets=True,
+        model_format=13,
+        semantic_history=True,
+    )
+    batch = next(iter(PackDataset(packs, batch_size=4)))
+    batch["hidden_baseline_anchor"][::2] = False
+    batch["concealed_count"][:, 0, 0] = 1
+    batch["concealed_count"][:, 1, 0] = 1
+    batch["concealed_count"][:, 2, 1] = 1
+    batch["wall_count"][:, 1] = 2
+    validate_semantic_training_batch(
+        batch, require_hidden_baseline_anchor=True
+    )
+    architecture = SemanticModelArchitecture(
+        backbone="cnn",
+        width=16,
+        stem_width=24,
+        event_width=12,
+        backbone_blocks=1,
+        event_blocks=1,
+        decoder_width=20,
+        attention_heads=4,
+    )
+    model = RiichiAnalysisModel(format_version=13, architecture=architecture)
+    balancer = LearnedUncertaintyBalancer(LOSS_TERMS_V8)
+    optimizer = torch.optim.AdamW(
+        [*model.parameters(), *balancer.parameters()], lr=1e-4
+    )
+
+    outputs = forward_batch(model, batch)
+    total, losses, active, _weights = multitask_loss(outputs, batch, balancer)
+    total.backward()
+    optimizer.step()
+
+    assert torch.isfinite(total)
+    assert outputs["hidden_count_residual"].shape == (4, 4, 37, 5)
+    assert set(losses) == set(LOSS_TERMS_V8)
+    assert active["hidden_allocation"]
+    assert model.semantic_model.decoder.hidden_count.output.weight.grad is not None

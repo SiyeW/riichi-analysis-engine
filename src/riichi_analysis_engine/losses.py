@@ -9,9 +9,11 @@ from torch.nn import functional as F
 from .analysis_observation import channel_index as analysis_channel_index
 from .hidden_transport import (
     balanced_source_probabilities,
+    hidden_count_distribution_loss,
     hidden_transport_nll,
     physical_affinities,
     physical_hidden_counts,
+    projected_count_distributions,
 )
 from .model_input import MODEL_INPUT_CHANNELS, SHARED_MODEL_INPUT_CHANNELS
 from .observation_layout import JIKAZE_CHANNEL, WIND_TILE_START
@@ -188,16 +190,31 @@ def _structured_multitask_losses(
         batch["concealed_red_count"],
         batch["wall_red_count"],
     )
-    source_probability = balanced_source_probabilities(
-        physical_affinities(
-            outputs["hidden_source_affinity"], outputs["hidden_red_source"]
-        ),
-        inventory,
-        capacities,
-    )
-    losses["hidden_allocation"] = hidden_transport_nll(
-        source_probability, physical_counts
-    )
+    if "hidden_count_residual" in outputs:
+        probability, baseline = projected_count_distributions(
+            outputs["hidden_count_residual"], inventory, capacities
+        )
+        anchor = batch.get("hidden_baseline_anchor")
+        if anchor is None:
+            raise ValueError("v13 hidden-count training requires baseline anchors")
+        losses["hidden_allocation"] = hidden_count_distribution_loss(
+            probability,
+            baseline,
+            physical_counts,
+            inventory,
+            anchor.bool(),
+        )
+    else:
+        source_probability = balanced_source_probabilities(
+            physical_affinities(
+                outputs["hidden_source_affinity"], outputs["hidden_red_source"]
+            ),
+            inventory,
+            capacities,
+        )
+        losses["hidden_allocation"] = hidden_transport_nll(
+            source_probability, physical_counts
+        )
     active["hidden_allocation"] = True
 
     winner_mask = batch["winner_mask"].bool()
@@ -279,7 +296,7 @@ def multitask_losses(
     essential for dora/score heads, which have no label in a no-win batch.
     """
 
-    if "hidden_source_affinity" in outputs:
+    if "hidden_source_affinity" in outputs or "hidden_count_residual" in outputs:
         return _structured_multitask_losses(outputs, batch)
 
     losses: dict[str, Tensor] = {}

@@ -21,6 +21,7 @@ from riichi_analysis_engine.semantic_input import (
     EVENT_TYPE,
     PUBLIC_EVENT_TYPE_TO_ID,
 )
+from riichi_analysis_engine.storage import TRAINING_TARGET_SCHEMA_ID
 from riichi_analysis_engine.train import (
     dataset_metadata,
     validate_dataset_input_contract,
@@ -111,6 +112,7 @@ def test_v13_dataset_contract_requires_engine_owned_rule_context() -> None:
         "modelInputSchema": SHARED_MODEL_INPUT_SCHEMA_ID,
         "observationChannels": SHARED_MODEL_INPUT_CHANNELS,
         "eventMemorySchema": EVENT_MEMORY_SCHEMA_ID,
+        "trainingTargetSchema": TRAINING_TARGET_SCHEMA_ID,
     }
 
     validate_dataset_input_contract({"train": metadata}, 13)
@@ -118,4 +120,30 @@ def test_v13_dataset_contract_requires_engine_owned_rule_context() -> None:
     with pytest.raises(RuntimeError, match="model-input contract"):
         validate_dataset_input_contract(
             {"train": {**metadata, "modelInputSchema": "mortal-observation"}}, 13
+        )
+
+    with pytest.raises(RuntimeError, match="training targets"):
+        validate_dataset_input_contract(
+            {"train": {**metadata, "trainingTargetSchema": None}}, 13
+        )
+
+
+def test_v13_training_schema_requires_the_hidden_baseline_anchor(scratch) -> None:
+    packs = pack_directory(
+        scratch,
+        training_targets=True,
+        model_format=13,
+        semantic_history=True,
+    )
+    batch = next(iter(PackDataset(packs, batch_size=4)))
+
+    result = validate_semantic_training_batch(
+        batch, require_hidden_baseline_anchor=True
+    )
+    assert result["hiddenBaselineAnchors"] == 4
+
+    del batch["hidden_baseline_anchor"]
+    with pytest.raises(ValueError, match="hidden_baseline_anchor"):
+        validate_semantic_training_batch(
+            batch, require_hidden_baseline_anchor=True
         )

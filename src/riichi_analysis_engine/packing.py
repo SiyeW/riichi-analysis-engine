@@ -30,10 +30,12 @@ from pathlib import Path
 import numpy as np
 
 from .constants import OBS_CHANNELS
+from .model_input import SHARED_MODEL_INPUT_SCHEMA_ID
 from .semantic_input import EVENT_MEMORY_SCHEMA_ID
 from .storage import (
     PACK_CATALOG_FIELDS,
     SUPPORTED_STORAGE_FORMATS,
+    TRAINING_TARGET_SCHEMA_ID,
     concatenate_packed,
     normalize_packed_metadata,
     permute_packed,
@@ -384,6 +386,8 @@ def build_pack(
     }
     if "event_memory_schema" in permuted:
         meta["eventMemorySchema"] = permuted["event_memory_schema"].item()
+    if "training_target_schema" in permuted:
+        meta["trainingTargetSchema"] = permuted["training_target_schema"].item()
     return meta, int(permuted["source_game"][-1])
 
 
@@ -476,6 +480,8 @@ def audit_packs(
     observation_channels: int | None = None
     event_memory_schema: str | None = None
     event_schema_initialized = False
+    training_target_schema: str | None = None
+    target_schema_initialized = False
     for entry in entries:
         assert isinstance(entry, dict)
         name = str(entry["pack"])
@@ -493,6 +499,16 @@ def audit_packs(
                 if "obs_channels" in source.files
                 else OBS_CHANNELS
             )
+            pack_target_schema = (
+                str(source["training_target_schema"].item())
+                if "training_target_schema" in source.files
+                else None
+            )
+            if pack_target_schema is not None and (
+                pack_schema != SHARED_MODEL_INPUT_SCHEMA_ID
+                or pack_target_schema != TRAINING_TARGET_SCHEMA_ID
+            ):
+                raise ValueError(f"{name} has an unsupported training-target schema")
             catalog_fields = PACK_CATALOG_FIELDS.intersection(source.files)
             if catalog_fields:
                 if catalog_fields != PACK_CATALOG_FIELDS:
@@ -548,6 +564,20 @@ def audit_packs(
             event_schema_initialized = True
         elif pack_event_schema != event_memory_schema:
             raise ValueError("packs do not share one event-memory contract")
+        entry_target_schema = (
+            str(entry["trainingTargetSchema"])
+            if "trainingTargetSchema" in entry
+            else None
+        )
+        if entry_target_schema != pack_target_schema:
+            raise ValueError(
+                f"{name} training-target metadata disagrees with its payload"
+            )
+        if not target_schema_initialized:
+            training_target_schema = pack_target_schema
+            target_schema_initialized = True
+        elif pack_target_schema != training_target_schema:
+            raise ValueError("packs do not share one training-target contract")
         if len(games) != int(entry["samples"]):
             raise ValueError(f"{name} holds {len(games)} samples, manifest says {entry['samples']}")
         if len(games) == 0:
@@ -577,4 +607,5 @@ def audit_packs(
         "modelInputSchema": input_schema,
         "observationChannels": observation_channels,
         "eventMemorySchema": event_memory_schema,
+        "trainingTargetSchema": training_target_schema,
     }
