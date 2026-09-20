@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from test_storage import sample_arrays
 
+from riichi_analysis_engine.model_input import SHARED_MODEL_INPUT_CHANNELS
 from riichi_analysis_engine.packing import (
     MANIFEST_FORMAT,
     PackSlot,
@@ -31,6 +32,7 @@ from riichi_analysis_engine.semantic_input import encode_public_event
 from riichi_analysis_engine.storage import (
     LEGACY_STAGED_GAME_FORMATS,
     PACKED_METADATA_FIELDS,
+    TRAINING_TARGET_SCHEMA_ID,
     read_packed_shard,
     save_chunk_archive,
     write_packed_shard,
@@ -213,6 +215,33 @@ def test_pack_deduplicates_and_rebases_per_game_event_catalogs(scratch: Path) ->
         plan,
     )
     assert audit["verified"] is True
+
+
+def test_pack_preserves_and_audits_v13_training_target_contract(scratch: Path) -> None:
+    stage = scratch / "stage"
+    for game in range(2):
+        arrays = sample_arrays(4, observation_channels=SHARED_MODEL_INPUT_CHANNELS)
+        save_chunk_archive(
+            stage / f"game-{game:06d}.zip",
+            arrays,
+            2,
+            training_target_schema=TRAINING_TARGET_SCHEMA_ID,
+        )
+    paths = staged_games(stage)
+    plan = plan_corpus(paths, 17)
+    output = scratch / "packs"
+
+    meta, _ = build_pack(
+        paths, output, plan, PackSlot(0, 0, len(plan["length"])), 17, None
+    )
+    packed = read_packed_shard(output / str(meta["pack"]))
+    audit = audit_packs(
+        output, {"format": MANIFEST_FORMAT, "packs": [meta]}, plan
+    )
+
+    assert meta["trainingTargetSchema"] == TRAINING_TARGET_SCHEMA_ID
+    assert packed["training_target_schema"].item() == TRAINING_TARGET_SCHEMA_ID
+    assert audit["trainingTargetSchema"] == TRAINING_TARGET_SCHEMA_ID
 
 
 def test_external_storage_check_accepts_deduplicated_event_catalogs(

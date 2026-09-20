@@ -35,12 +35,14 @@ LEGACY_STAGED_GAME_FORMATS = frozenset(
     {"riichi-analysis-staged-game-v2", "riichi-analysis-staged-game-v1"}
 )
 PACK_FORMAT = "riichi-analysis-global-pack-v3"
+TRAINING_TARGET_SCHEMA_ID = "riichi-analysis-training-target-v13"
 PACKED_METADATA_FIELDS = frozenset(
     {
         "storage_format",
         "obs_channels",
         "model_input_schema",
         "event_memory_schema",
+        "training_target_schema",
     }
 )
 PACK_CATALOG_FIELDS = frozenset(
@@ -160,6 +162,7 @@ def unpack_shard_arrays(packed: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     channels = int(arrays.pop("obs_channels", np.asarray(OBS_CHANNELS)).item())
     arrays.pop("model_input_schema", None)
     arrays.pop("event_memory_schema", None)
+    arrays.pop("training_target_schema", None)
     arrays["obs"] = unpack_observations(
         PackedObservations(
             arrays.pop("obs_nonzero"),
@@ -401,6 +404,7 @@ def save_chunk_archive(
     event_catalog: np.ndarray | None = None,
     compression_level: int = 1,
     archive_metadata: dict[str, object] | None = None,
+    training_target_schema: str | None = None,
 ) -> dict[str, object]:
     """Stage one game as independently compressed sample chunks."""
 
@@ -420,6 +424,8 @@ def save_chunk_archive(
     elif event_catalog is not None:
         raise ValueError("event catalog was supplied without sample references")
     packed = pack_shard_arrays(arrays)
+    if training_target_schema is not None:
+        packed["training_target_schema"] = np.asarray(training_target_schema)
     total = _sample_count(packed)
     destinations = Path(path)
     destinations.parent.mkdir(parents=True, exist_ok=True)
@@ -469,6 +475,8 @@ def save_chunk_archive(
                         "eventCount": len(event_catalog),
                     }
                 )
+            if training_target_schema is not None:
+                meta["trainingTargetSchema"] = training_target_schema
             if archive_metadata is not None:
                 overlap = set(meta).intersection(archive_metadata)
                 if overlap:

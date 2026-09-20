@@ -128,6 +128,41 @@ def test_conversion_reuses_each_frame_observation() -> None:
     assert _CountingPlayerState.encode_calls == 4
 
 
+def test_conversion_records_perspective_relative_hidden_baseline_anchors() -> None:
+    events = [
+        {
+            "type": "start_kyoku",
+            "bakaze": "E",
+            "kyoku": 1,
+            "honba": 0,
+            "kyotaku": 0,
+            "oya": 0,
+            "dora_marker": "9p",
+            "scores": [25_000] * 4,
+            "tehais": [["1m"], [], [], []],
+        },
+        {"type": "dahai", "actor": 0, "pai": "1m"},
+        {"type": "tsumo", "actor": 1, "pai": "2m"},
+        {"type": "ryukyoku", "deltas": [0, 0, 0, 0]},
+        {"type": "end_kyoku"},
+        {"type": "end_game"},
+    ]
+
+    converted = convert_game(
+        events,
+        "baseline-anchor-game",
+        player_state_type=_PassivePlayerState,
+        model_format=13,
+    )
+
+    anchors = converted.arrays["hidden_baseline_anchor"]
+    perspectives = converted.arrays["perspective"]
+    np.testing.assert_array_equal(converted.arrays["event_index"], [0, 1, 2])
+    assert bool(anchors[0])
+    assert bool(anchors[1]) == bool(perspectives[1] == 0)
+    assert not bool(anchors[2])
+
+
 def test_conversion_keeps_decisive_frames_when_other_rates_are_zero() -> None:
     events = [
         {

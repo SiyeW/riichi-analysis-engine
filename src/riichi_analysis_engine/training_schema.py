@@ -247,7 +247,10 @@ def validate_v8_training_batch(
 
 
 def validate_semantic_training_batch(
-    batch: Mapping[str, Tensor], *, require_analysis_active: bool = True
+    batch: Mapping[str, Tensor],
+    *,
+    require_analysis_active: bool = True,
+    require_hidden_baseline_anchor: bool = False,
 ) -> dict[str, int]:
     """Validate the v12 event-memory extension without weakening v8 targets."""
 
@@ -285,8 +288,22 @@ def validate_semantic_training_batch(
     ) & (tokens[..., EVENT_ACTOR] != 1) & mask
     if (tokens[..., EVENT_TILE][opponent_draw] != 0).any():
         _fail("opponent draw identity leaked into semantic event memory")
+    anchor = batch.get("hidden_baseline_anchor")
+    if require_hidden_baseline_anchor and anchor is None:
+        _fail("missing field: hidden_baseline_anchor")
+    if anchor is not None:
+        anchor = _shape(batch, "hidden_baseline_anchor", ())
+        if len(anchor) != result["samples"]:
+            _fail("hidden_baseline_anchor batch length differs from obs")
+        if not ((anchor == 0) | (anchor == 1)).all():
+            _fail("hidden_baseline_anchor must be binary")
     return {
         **result,
         "eventTokens": int(mask.sum()),
         "maxEventHistory": int(mask.sum(dim=1).max()),
+        **(
+            {"hiddenBaselineAnchors": int(anchor.bool().sum())}
+            if anchor is not None
+            else {}
+        ),
     }

@@ -29,6 +29,7 @@ from .replay import (
     FRAME_EVENTS,
     ExactTargetTracker,
     FullState,
+    HiddenBaselineAnchorTracker,
     action_label,
     annotate_game,
     passive_perspective,
@@ -38,7 +39,12 @@ from .replay import (
 from .rule_certainties import PublicRuleState
 from .rule_context import encode_rule_context
 from .semantic_input import EVENT_MEMORY_SCHEMA_ID, PublicEventHistoryEncoder
-from .storage import STAGED_GAME_FORMAT, read_chunk_archive_meta, save_chunk_archive
+from .storage import (
+    STAGED_GAME_FORMAT,
+    TRAINING_TARGET_SCHEMA_ID,
+    read_chunk_archive_meta,
+    save_chunk_archive,
+)
 
 
 @dataclass(frozen=True)
@@ -245,6 +251,7 @@ def convert_game(
     rule_state = PublicRuleState()
     analysis_encoder = IncrementalTilePlaneEncoder()
     exact_tracker = ExactTargetTracker()
+    hidden_anchor_tracker = HiddenBaselineAnchorTracker()
     event_history = PublicEventHistoryEncoder()
     states = [player_state_type(player) for player in range(4)]
     samples: dict[str, list[Any]] = {}
@@ -268,6 +275,7 @@ def convert_game(
         *,
         policy: int,
         analysis_active: bool,
+        hidden_baseline_anchor: bool,
         at_kan_select: bool = False,
     ) -> None:
         analysis = analysis_encoder.encode(event, perspective)
@@ -310,6 +318,8 @@ def convert_game(
             "history_length": np.uint16(history_length),
             **targets,
         }
+        if model_format == 13:
+            values["hidden_baseline_anchor"] = np.bool_(hidden_baseline_anchor)
         for name, value in values.items():
             samples.setdefault(name, []).append(value)
 
@@ -322,12 +332,15 @@ def convert_game(
         public_state.process(event)
         rule_state.process(event)
         exact_targets = exact_tracker.process(event, states)
+        hidden_baseline_anchors = hidden_anchor_tracker.process(event)
         if event["type"] not in FRAME_EVENTS:
             continue
         history_start, history_length = event_history.advance(event)
         analysis_encoder.advance(event, public_state)
         if exact_targets is None:
             raise RuntimeError(f"missing exact targets at {source_id}:{index}")
+        if hidden_baseline_anchors is None:
+            raise RuntimeError(f"missing hidden baseline state at {source_id}:{index}")
 
         if sampling_plan is not None:
             stratum = sampling_plan.classify(events, index, candidates)
@@ -368,6 +381,7 @@ def convert_game(
                 cans,
                 policy=policy,
                 analysis_active=perspective == analysis_perspective,
+                hidden_baseline_anchor=bool(hidden_baseline_anchors[perspective]),
             )
             sampled.add(perspective)
             if kan_tile is not None:
@@ -385,6 +399,9 @@ def convert_game(
                     cans,
                     policy=kan_tile,
                     analysis_active=False,
+                    hidden_baseline_anchor=bool(
+                        hidden_baseline_anchors[perspective]
+                    ),
                     at_kan_select=True,
                 )
 
@@ -401,6 +418,9 @@ def convert_game(
                 candidates[analysis_perspective],
                 policy=-1,
                 analysis_active=True,
+                hidden_baseline_anchor=bool(
+                    hidden_baseline_anchors[analysis_perspective]
+                ),
             )
 
     if not samples:
@@ -447,6 +467,11 @@ def convert_record_to_archive(
                     else MODEL_INPUT_SCHEMA_ID
                 )
                 and meta.get("eventMemorySchema") == EVENT_MEMORY_SCHEMA_ID
+                and (
+                    model_format != 13
+                    or meta.get("trainingTargetSchema")
+                    == TRAINING_TARGET_SCHEMA_ID
+                )
                 and meta.get("frameSampling")
                 == (sampling_plan.metadata() if sampling_plan else None)
             ):
@@ -484,6 +509,9 @@ def convert_record_to_archive(
                 "frameSampling": sampling_plan.metadata() if sampling_plan else None,
                 "frameCounts": converted.frame_counts,
             },
+            training_target_schema=(
+                TRAINING_TARGET_SCHEMA_ID if model_format == 13 else None
+            ),
         )
         return (
             record_index,

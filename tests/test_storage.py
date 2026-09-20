@@ -16,6 +16,7 @@ from riichi_analysis_engine.model_input import (
 )
 from riichi_analysis_engine.semantic_input import encode_public_event
 from riichi_analysis_engine.storage import (
+    TRAINING_TARGET_SCHEMA_ID,
     PackedObservations,
     concatenate_packed,
     load_shard,
@@ -209,6 +210,24 @@ def test_chunk_archive_round_trip(scratch: Path) -> None:
     np.testing.assert_allclose(restored["obs"], arrays["obs"], rtol=0, atol=5e-4)
     for name in ("action_mask", "policy", "perspective", "event_index", "kyoku_index"):
         np.testing.assert_array_equal(restored[name], arrays[name])
+
+
+def test_chunk_archive_carries_training_target_contract(scratch: Path) -> None:
+    arrays = sample_arrays(3, observation_channels=SHARED_MODEL_INPUT_CHANNELS)
+    path = scratch / "game-000000.zip"
+
+    meta = save_chunk_archive(
+        path,
+        arrays,
+        2,
+        training_target_schema=TRAINING_TARGET_SCHEMA_ID,
+    )
+
+    assert meta["trainingTargetSchema"] == TRAINING_TARGET_SCHEMA_ID
+    with np.load(io.BytesIO(read_chunk_payload(path, 0)), allow_pickle=False) as source:
+        assert source["training_target_schema"].item() == TRAINING_TARGET_SCHEMA_ID
+        restored = unpack_shard_arrays({name: source[name] for name in source.files})
+    assert "training_target_schema" not in restored
 
 
 def test_chunk_archive_uses_requested_compression_level(scratch: Path) -> None:

@@ -4,8 +4,12 @@ from riichi_analysis_engine.hidden_transport import (
     FIVE_TILE_INDICES,
     balanced_source_probabilities,
     count_marginals,
+    hidden_count_distribution_loss,
     hidden_transport_nll,
+    physical_count_marginals,
     physical_hidden_counts,
+    projected_count_distributions,
+    theoretical_count_baseline,
 )
 
 
@@ -89,4 +93,100 @@ def test_protocol_marginals_support_a_real_training_batch() -> None:
     assert total.shape == (32, 4, 34, 5)
     assert red.shape == (32, 4, 3, 2)
     assert torch.allclose(total.sum(-1), torch.ones_like(total[..., 0]), atol=1e-6)
+    assert torch.allclose(red.sum(-1), torch.ones_like(red[..., 0]), atol=1e-6)
+
+
+def test_theoretical_baseline_is_normalized_and_already_has_exact_margins() -> None:
+    _physical, inventory, capacities = physical_hidden_counts(*_example())
+
+    baseline = theoretical_count_baseline(inventory, capacities)
+    values = torch.arange(5, dtype=baseline.dtype)
+    expected = (baseline * values).sum(-1)
+
+    assert torch.allclose(baseline.sum(-1), torch.ones_like(baseline[..., 0]))
+    assert torch.allclose(expected.sum(-1), capacities.float(), atol=1e-5)
+    assert torch.allclose(expected.sum(1), inventory.float(), atol=1e-5)
+
+
+def test_zero_residual_reproduces_the_theoretical_baseline() -> None:
+    _physical, inventory, capacities = physical_hidden_counts(*_example())
+    residual = torch.zeros(1, 4, 37, 5)
+
+    probability, baseline = projected_count_distributions(
+        residual, inventory, capacities
+    )
+
+    assert torch.allclose(probability, baseline, atol=1e-6)
+
+
+def test_complete_count_residual_can_represent_a_non_binomial_shape() -> None:
+    inventory = torch.zeros(1, 37, dtype=torch.long)
+    inventory[0, 0] = 2
+    inventory[0, 1] = 2
+    capacities = torch.tensor([[2, 2, 0, 0]])
+    residual = torch.zeros(1, 4, 37, 5, requires_grad=True)
+    with torch.no_grad():
+        residual[0, 0, 0, 0] = 4
+        residual[0, 0, 0, 1] = -4
+        residual[0, 0, 0, 2] = 4
+        residual[0, 1, 0, 0] = 4
+        residual[0, 1, 0, 1] = -4
+        residual[0, 1, 0, 2] = 4
+
+    probability, _baseline = projected_count_distributions(
+        residual, inventory, capacities, iterations=48
+    )
+    selected = probability[0, 0, 0]
+
+    assert selected[0] > selected[1]
+    assert selected[2] > selected[1]
+    values = torch.arange(5, dtype=probability.dtype)
+    expected = (probability * values).sum(-1)
+    assert torch.allclose(expected.sum(-1), capacities.float(), atol=1e-4)
+    assert torch.allclose(expected.sum(1), inventory.float(), atol=1e-4)
+    probability[..., 0].mean().backward()
+    assert residual.grad is not None
+    assert torch.isfinite(residual.grad).all()
+
+
+def test_anchor_loss_uses_theory_instead_of_the_sampled_allocation() -> None:
+    physical, inventory, capacities = physical_hidden_counts(*_example())
+    residual = torch.randn(1, 4, 37, 5)
+    probability, baseline = projected_count_distributions(
+        residual, inventory, capacities
+    )
+    alternate = physical.roll(1, dims=1)
+
+    first = hidden_count_distribution_loss(
+        probability, baseline, physical, inventory, torch.tensor([True])
+    )
+    second = hidden_count_distribution_loss(
+        probability, baseline, alternate, inventory, torch.tensor([True])
+    )
+
+    assert torch.allclose(first, second)
+
+    exact, exact_baseline = projected_count_distributions(
+        torch.zeros(1, 4, 37, 5), inventory, capacities
+    )
+    exact_loss = hidden_count_distribution_loss(
+        exact, exact_baseline, physical, inventory, torch.tensor([True])
+    )
+    assert exact_loss.abs() < 1e-6
+
+
+def test_physical_count_marginals_add_red_fives_to_the_base_family() -> None:
+    _physical, inventory, capacities = physical_hidden_counts(*_example())
+    distribution, _baseline = projected_count_distributions(
+        torch.zeros(1, 4, 37, 5), inventory, capacities
+    )
+
+    total, red = physical_count_marginals(distribution)
+    values = torch.arange(5, dtype=total.dtype)
+    expected_total = (total * values).sum(-1)
+    total_inventory = inventory[:, :34].clone()
+    for suit, tile in enumerate(FIVE_TILE_INDICES):
+        total_inventory[:, tile] += inventory[:, 34 + suit]
+
+    assert torch.allclose(expected_total.sum(1), total_inventory.float(), atol=1e-5)
     assert torch.allclose(red.sum(-1), torch.ones_like(red[..., 0]), atol=1e-6)

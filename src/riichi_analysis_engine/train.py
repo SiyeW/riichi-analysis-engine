@@ -31,7 +31,9 @@ from .hidden_transport import (
     balanced_source_probabilities,
     count_marginals,
     physical_affinities,
+    physical_count_marginals,
     physical_hidden_counts,
+    projected_count_distributions,
 )
 from .kyoku_outcome import OUTCOME_DEAL_IN_INDICATORS, OUTCOME_WINNER_INDICATORS
 from .losses import (
@@ -54,6 +56,7 @@ from .model_input import (
 )
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
 from .semantic_input import EVENT_MEMORY_SCHEMA_ID, semantic_input_metadata
+from .storage import TRAINING_TARGET_SCHEMA_ID
 from .structured_outputs import (
     conditional_deal_in_probabilities,
     fixed_total_values,
@@ -211,6 +214,7 @@ def dataset_metadata(root: Path) -> dict[str, object]:
         "modelInputSchema": manifest.get("modelInputSchema"),
         "observationChannels": manifest.get("observationChannels"),
         "eventMemorySchema": manifest.get("eventMemorySchema"),
+        "trainingTargetSchema": manifest.get("trainingTargetSchema"),
         "verified": audit.get("verified") if isinstance(audit, dict) else None,
         "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
     }
@@ -251,6 +255,9 @@ def validate_dataset_input_contract(
         event_schema = metadata.get("eventMemorySchema")
         if model_format in {12, 13} and event_schema != EVENT_MEMORY_SCHEMA_ID:
             raise RuntimeError(f"{split} dataset has no compatible event memory")
+        target_schema = metadata.get("trainingTargetSchema")
+        if model_format == 13 and target_schema != TRAINING_TARGET_SCHEMA_ID:
+            raise RuntimeError(f"{split} dataset has no compatible training targets")
 
 
 def forward_batch(
@@ -447,7 +454,10 @@ def validate(
             ).square(),
             batch["shanten"] == 0,
         )
-        structured = "hidden_source_affinity" in outputs
+        structured = (
+            "hidden_source_affinity" in outputs
+            or "hidden_count_residual" in outputs
+        )
         deal_in_probability = (
             conditional_deal_in_probabilities(outputs)
             if structured
@@ -474,15 +484,63 @@ def validate(
                 batch["concealed_red_count"],
                 batch["wall_red_count"],
             )
-            source_probability = balanced_source_probabilities(
-                physical_affinities(
-                    outputs["hidden_source_affinity"], outputs["hidden_red_source"]
-                ),
-                inventory,
-                capacities,
-            )
-            hidden_count, hidden_red = count_marginals(source_probability, inventory)
-            expected_physical = source_probability * inventory.unsqueeze(1)
+            if "hidden_count_residual" in outputs:
+                physical_distribution, baseline = projected_count_distributions(
+                    outputs["hidden_count_residual"], inventory, capacities
+                )
+                hidden_count, hidden_red = physical_count_marginals(
+                    physical_distribution
+                )
+                count_values = torch.arange(
+                    5, device=device, dtype=physical_distribution.dtype
+                )
+                expected_physical = (physical_distribution * count_values).sum(-1)
+                anchor = batch["hidden_baseline_anchor"].bool()
+                active_family = (inventory[:, None, :] > 0).expand(
+                    -1, 4, -1
+                )
+                model_nll = -physical_distribution.clamp_min(1e-12).log().gather(
+                    -1, _physical_counts.long().unsqueeze(-1)
+                ).squeeze(-1)
+                theory_nll = -baseline.clamp_min(1e-12).log().gather(
+                    -1, _physical_counts.long().unsqueeze(-1)
+                ).squeeze(-1)
+                add_metric("hiddenCountNll", model_nll, active_family)
+                add_metric("hiddenTheoryNll", theory_nll, active_family)
+                evidence_family = active_family & ~anchor[:, None, None]
+                add_metric(
+                    "hiddenEvidenceNllGain",
+                    theory_nll - model_nll,
+                    evidence_family,
+                )
+                if anchor.any():
+                    anchor_probability = physical_distribution[anchor]
+                    anchor_baseline = baseline[anchor]
+                    anchor_kl = (
+                        anchor_baseline
+                        * (
+                            anchor_baseline.clamp_min(1e-12).log()
+                            - anchor_probability.clamp_min(1e-12).log()
+                        )
+                    ).sum(-1)
+                    add_metric(
+                        "hiddenBaselineAnchorKl",
+                        anchor_kl,
+                        active_family[anchor],
+                    )
+            else:
+                source_probability = balanced_source_probabilities(
+                    physical_affinities(
+                        outputs["hidden_source_affinity"],
+                        outputs["hidden_red_source"],
+                    ),
+                    inventory,
+                    capacities,
+                )
+                hidden_count, hidden_red = count_marginals(
+                    source_probability, inventory
+                )
+                expected_physical = source_probability * inventory.unsqueeze(1)
             add_metric(
                 "hiddenSourceConservationError",
                 (expected_physical.sum(-1) - capacities.float()).abs(),
@@ -1322,11 +1380,17 @@ def main() -> None:
     except StopIteration:
         fixture = None
     if args.model_format in {8, 9, 10, 11, 12, 13}:
-        validate_fixture = (
-            validate_semantic_training_batch
-            if args.model_format in {12, 13}
-            else validate_v8_training_batch
-        )
+        def validate_fixture(value: Mapping[str, torch.Tensor]) -> dict[str, int]:
+            if args.model_format in {12, 13}:
+                return validate_semantic_training_batch(
+                    value,
+                    require_analysis_active=args.model_format >= 10,
+                    require_hidden_baseline_anchor=args.model_format == 13,
+                )
+            return validate_v8_training_batch(
+                value, require_analysis_active=args.model_format >= 10
+            )
+
         if args.validate_only:
             saved_contract = checkpoint.get("trainingContract")
             training_contract = (
@@ -1335,9 +1399,7 @@ def main() -> None:
                 else {
                     "train": None,
                     "validation": (
-                        validate_fixture(
-                            fixture, require_analysis_active=args.model_format >= 10
-                        )
+                        validate_fixture(fixture)
                         if fixture is not None
                         else None
                     ),
@@ -1349,13 +1411,9 @@ def main() -> None:
             except StopIteration as error:
                 raise RuntimeError("training data contains no samples") from error
             training_contract = {
-                "train": validate_fixture(
-                    train_fixture, require_analysis_active=args.model_format >= 10
-                ),
+                "train": validate_fixture(train_fixture),
                 "validation": (
-                    validate_fixture(
-                        fixture, require_analysis_active=args.model_format >= 10
-                    )
+                    validate_fixture(fixture)
                     if fixture is not None
                     else None
                 ),
