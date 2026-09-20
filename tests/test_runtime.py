@@ -15,7 +15,10 @@ from riichi_analysis_engine.constants import (
     TILE_TYPES,
 )
 from riichi_analysis_engine.model import RiichiAnalysisModel
-from riichi_analysis_engine.model_input import model_input_metadata
+from riichi_analysis_engine.model_input import (
+    model_input_metadata,
+    shared_model_input_metadata,
+)
 from riichi_analysis_engine.observation_layout import ANALYSIS_CHANNELS
 from riichi_analysis_engine.prediction_values import DORA_VALUES, SCORE_VALUES
 from riichi_analysis_engine.runtime import (
@@ -492,6 +495,48 @@ def test_v12_runtime_reconstructs_semantic_contract(tmp_path, monkeypatch) -> No
     assert runtime.model.architecture == architecture
 
 
+def test_v13_runtime_reconstructs_engine_owned_input_contract(
+    tmp_path, monkeypatch
+) -> None:
+    architecture = SemanticModelArchitecture(
+        backbone="cnn",
+        width=16,
+        stem_width=24,
+        event_width=12,
+        backbone_blocks=1,
+        event_blocks=1,
+        decoder_width=20,
+        attention_heads=4,
+    )
+    checkpoint = tmp_path / "weights-v13.pt"
+    torch.save(
+        {
+            "format": "riichi-analysis-model-v13",
+            "model": RiichiAnalysisModel(
+                format_version=13, architecture=architecture
+            ).state_dict(),
+            "architecture": {
+                "model": architecture.to_dict(),
+                "modelInput": shared_model_input_metadata(),
+                "semanticInput": semantic_input_metadata(),
+                "predictionValues": {
+                    "dora": list(DORA_VALUES),
+                    "score": list(SCORE_VALUES),
+                },
+            },
+        },
+        checkpoint,
+    )
+    monkeypatch.setattr(
+        "riichi_analysis_engine.runtime._load_player_state", lambda: object
+    )
+
+    runtime = AnalysisRuntime(checkpoint, "cpu")
+
+    assert runtime.format_version == 13
+    assert runtime.model.architecture == architecture
+
+
 def test_v12_kan_selection_reuses_primary_semantic_state() -> None:
     class FakePlayerState:
         def __init__(self, player_id: int) -> None:
@@ -535,9 +580,7 @@ def test_v12_kan_selection_reuses_primary_semantic_state() -> None:
         nonlocal backbone_calls
         backbone_calls += 1
 
-    handle = runtime.model.semantic_model.backbone.register_forward_hook(
-        count_backbone
-    )
+    handle = runtime.model.semantic_model.backbone.register_forward_hook(count_backbone)
     events = [
         {
             "type": "start_kyoku",

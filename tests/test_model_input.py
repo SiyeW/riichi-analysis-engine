@@ -8,11 +8,14 @@ from riichi_analysis_engine.model_input import (
     ANALYSIS_CHANNELS,
     MODEL_INPUT_CHANNELS,
     POLICY_CONTEXT_CHANNELS,
+    SHARED_MODEL_INPUT_CHANNELS,
     compose_model_input,
+    compose_shared_model_input,
     extract_policy_context,
     range_indices,
     split_model_input,
 )
+from riichi_analysis_engine.rule_context import RULE_CONTEXT_CHANNELS
 
 
 def test_policy_context_has_one_named_non_overlapping_layout() -> None:
@@ -41,3 +44,14 @@ def test_model_input_round_trip_preserves_both_logical_inputs() -> None:
     )
     np.testing.assert_array_equal(actual_analysis[0].numpy(), analysis)
     np.testing.assert_array_equal(actual_policy[0].numpy(), policy)
+
+
+def test_shared_model_input_contains_no_mortal_observation_slice() -> None:
+    analysis = np.zeros((ANALYSIS_CHANNELS, TILE_TYPES), dtype=np.float32)
+    rules = np.ones((RULE_CONTEXT_CHANNELS, TILE_TYPES), dtype=np.float32)
+
+    combined = compose_shared_model_input(analysis, rules)
+
+    assert combined.shape == (SHARED_MODEL_INPUT_CHANNELS, TILE_TYPES)
+    np.testing.assert_array_equal(combined[:ANALYSIS_CHANNELS], analysis)
+    np.testing.assert_array_equal(combined[ANALYSIS_CHANNELS:], rules)

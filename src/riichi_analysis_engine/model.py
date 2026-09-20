@@ -338,7 +338,7 @@ class RiichiAnalysisModel(nn.Module):
         ) = None,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
+        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}:
             raise ValueError(f"unsupported model format version: {format_version}")
         if architecture is not None and format_version not in {
             6,
@@ -348,15 +348,19 @@ class RiichiAnalysisModel(nn.Module):
             10,
             11,
             12,
+            13,
         }:
             raise ValueError(
                 "only model formats v6 and later accept architecture metadata"
             )
         self.format_version = format_version
         self.architecture: (
-            ModelArchitecture | StructuredModelArchitecture | SemanticModelArchitecture | None
+            ModelArchitecture
+            | StructuredModelArchitecture
+            | SemanticModelArchitecture
+            | None
         ) = None
-        if format_version == 12:
+        if format_version in {12, 13}:
             if any(
                 value is not None
                 for value in (channels, blocks, state_width, future_width)
@@ -366,9 +370,13 @@ class RiichiAnalysisModel(nn.Module):
                 )
             configured = architecture or SemanticModelArchitecture()
             if not isinstance(configured, SemanticModelArchitecture):
-                raise TypeError("model format v12 requires SemanticModelArchitecture")
+                raise TypeError(
+                    "semantic model formats require SemanticModelArchitecture"
+                )
             self.architecture = configured
-            self.semantic_model = SemanticRiichiModel(configured)
+            self.semantic_model = SemanticRiichiModel(
+                configured, shared_rule_context=format_version == 13
+            )
             return
         if format_version in {8, 9, 10, 11}:
             if any(
@@ -587,7 +595,7 @@ class RiichiAnalysisModel(nn.Module):
         event_tokens: Tensor | None = None,
         event_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        if self.format_version == 12:
+        if self.format_version in {12, 13}:
             if event_tokens is None or event_mask is None:
                 raise ValueError("model format v12 requires semantic event memory")
             return self.semantic_model(observation, event_tokens, event_mask)
@@ -929,7 +937,7 @@ class RiichiAnalysisModel(nn.Module):
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
-    if model.format_version == 12:
+    if model.format_version in {12, 13}:
         groups = {
             "input": model.semantic_model.input,
             "backbone": model.semantic_model.backbone,

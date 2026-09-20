@@ -16,6 +16,8 @@ from .model_input import (
     LEGACY_MODEL_INPUT_SCHEMA_ID,
     MODEL_INPUT_CHANNELS,
     MODEL_INPUT_SCHEMA_ID,
+    SHARED_MODEL_INPUT_CHANNELS,
+    SHARED_MODEL_INPUT_SCHEMA_ID,
 )
 from .semantic_input import EVENT_FIELDS, EVENT_MEMORY_SCHEMA_ID
 
@@ -129,7 +131,9 @@ def pack_shard_arrays(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         raise ValueError(f"missing arrays: {sorted(missing)}")
     payload = dict(arrays)
     obs = pack_observations(payload.pop("obs"))
-    if obs.channels == MODEL_INPUT_CHANNELS:
+    if obs.channels == SHARED_MODEL_INPUT_CHANNELS:
+        input_schema = SHARED_MODEL_INPUT_SCHEMA_ID
+    elif obs.channels == MODEL_INPUT_CHANNELS:
         input_schema = MODEL_INPUT_SCHEMA_ID
     elif obs.channels == OBS_CHANNELS:
         input_schema = LEGACY_MODEL_INPUT_SCHEMA_ID

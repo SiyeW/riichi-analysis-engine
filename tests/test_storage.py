@@ -11,6 +11,8 @@ from riichi_analysis_engine.constants import ACTION_SPACE, OBS_CHANNELS, TILE_TY
 from riichi_analysis_engine.model_input import (
     MODEL_INPUT_CHANNELS,
     MODEL_INPUT_SCHEMA_ID,
+    SHARED_MODEL_INPUT_CHANNELS,
+    SHARED_MODEL_INPUT_SCHEMA_ID,
 )
 from riichi_analysis_engine.semantic_input import encode_public_event
 from riichi_analysis_engine.storage import (
@@ -93,6 +95,20 @@ def test_v9_observation_width_and_schema_round_trip() -> None:
     packed = pack_shard_arrays(arrays)
     assert packed["model_input_schema"].item() == MODEL_INPUT_SCHEMA_ID
     assert int(packed["obs_channels"].item()) == MODEL_INPUT_CHANNELS
+    restored = unpack_shard_arrays(packed)
+    np.testing.assert_allclose(restored["obs"], source, rtol=0, atol=5e-4)
+
+
+def test_v13_observation_width_and_schema_round_trip() -> None:
+    source = np.zeros((2, SHARED_MODEL_INPUT_CHANNELS, TILE_TYPES), dtype=np.float32)
+    source[0, -1, 33] = 0.25
+    arrays = sample_arrays(2)
+    arrays["obs"] = source
+
+    packed = pack_shard_arrays(arrays)
+
+    assert packed["model_input_schema"].item() == SHARED_MODEL_INPUT_SCHEMA_ID
+    assert int(packed["obs_channels"].item()) == SHARED_MODEL_INPUT_CHANNELS
     restored = unpack_shard_arrays(packed)
     np.testing.assert_allclose(restored["obs"], source, rtol=0, atol=5e-4)
 

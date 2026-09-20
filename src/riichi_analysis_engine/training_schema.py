@@ -17,7 +17,7 @@ from .analysis_observation import channel_index as analysis_channel_index
 from .constants import ACTION_SPACE, OBS_CHANNELS, RANK_FEATURE_CHANNELS, TILE_TYPES
 from .hidden_transport import physical_hidden_counts
 from .kyoku_outcome import OUTCOME_COUNT
-from .model_input import MODEL_INPUT_CHANNELS
+from .model_input import MODEL_INPUT_CHANNELS, SHARED_MODEL_INPUT_CHANNELS
 from .observation_layout import (
     JIKAZE_CHANNEL,
     MORTAL_ANALYSIS_CHANNELS,
@@ -86,7 +86,7 @@ def _observation_contract(observation: Tensor) -> Tensor:
             f"obs has shape {tuple(observation.shape)}, expected a supported structured input"
         )
     channels = int(observation.shape[1])
-    if channels == MODEL_INPUT_CHANNELS:
+    if channels in {MODEL_INPUT_CHANNELS, SHARED_MODEL_INPUT_CHANNELS}:
         jikaze = analysis_channel_index("jikaze")
         rank_start = analysis_channel_index("rank_p0_r0")
     elif channels == OBS_CHANNELS:

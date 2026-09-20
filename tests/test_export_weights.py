@@ -13,7 +13,10 @@ from riichi_analysis_engine.export_weights import (
     training_source_revision,
 )
 from riichi_analysis_engine.model import RiichiAnalysisModel
-from riichi_analysis_engine.model_input import model_input_metadata
+from riichi_analysis_engine.model_input import (
+    model_input_metadata,
+    shared_model_input_metadata,
+)
 from riichi_analysis_engine.prediction_values import DORA_VALUES, SCORE_VALUES
 from riichi_analysis_engine.semantic_input import semantic_input_metadata
 
@@ -143,6 +146,19 @@ def test_training_revision_uses_checkpoint_environment() -> None:
                 attention_heads=4,
             ),
         ),
+        (
+            13,
+            SemanticModelArchitecture(
+                backbone="cnn",
+                width=16,
+                stem_width=24,
+                event_width=12,
+                backbone_blocks=1,
+                event_blocks=1,
+                decoder_width=20,
+                attention_heads=4,
+            ),
+        ),
     ],
 )
 def test_export_preserves_model_architecture(
@@ -169,9 +185,13 @@ def test_export_preserves_model_architecture(
             "complete": False,
         },
     }
-    if format_version in {9, 10, 11, 12}:
-        checkpoint["modelInput"] = model_input_metadata()
-    if format_version == 12:
+    if format_version in {9, 10, 11, 12, 13}:
+        checkpoint["modelInput"] = (
+            shared_model_input_metadata()
+            if format_version == 13
+            else model_input_metadata()
+        )
+    if format_version in {12, 13}:
         checkpoint["semanticInput"] = semantic_input_metadata()
     torch.save(checkpoint, source)
     monkeypatch.setattr(sys, "argv", ["export_weights", str(source), str(destination)])
@@ -181,9 +201,13 @@ def test_export_preserves_model_architecture(
     exported = torch.load(destination, map_location="cpu", weights_only=True)
     assert exported["format"] == f"riichi-analysis-model-v{format_version}"
     assert exported["architecture"]["model"] == architecture.to_dict()
-    if format_version in {9, 10, 11, 12}:
-        assert exported["architecture"]["modelInput"] == model_input_metadata()
-    if format_version == 12:
+    if format_version in {9, 10, 11, 12, 13}:
+        assert exported["architecture"]["modelInput"] == (
+            shared_model_input_metadata()
+            if format_version == 13
+            else model_input_metadata()
+        )
+    if format_version in {12, 13}:
         assert exported["architecture"]["semanticInput"] == semantic_input_metadata()
     assert exported["training"]["step"] == 10
     assert exported["training"]["samplesSeen"] == 320
