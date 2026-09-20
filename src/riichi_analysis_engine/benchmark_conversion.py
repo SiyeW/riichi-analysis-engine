@@ -23,7 +23,7 @@ from typing import Any
 
 from .storage import read_chunk_archive_meta
 
-BENCHMARK_FORMAT = "riichi-analysis-conversion-benchmark-v1"
+BENCHMARK_FORMAT = "riichi-analysis-conversion-benchmark-v2"
 DEFAULT_MAX_WORKERS = 16
 
 
@@ -31,30 +31,44 @@ DEFAULT_MAX_WORKERS = 16
 class BenchmarkCase:
     workers: int
     compression_level: int
+    chunk_samples: int = 16
 
     @property
     def key(self) -> str:
-        return f"workers-{self.workers}-compression-{self.compression_level}"
+        return (
+            f"workers-{self.workers}-compression-{self.compression_level}"
+            f"-chunk-{self.chunk_samples}"
+        )
 
 
 def parse_case(value: str) -> BenchmarkCase:
     try:
-        workers_text, compression_text = value.split(":", 1)
+        parts = value.split(":")
+        if len(parts) not in {2, 3}:
+            raise ValueError
+        workers_text, compression_text = parts[:2]
         workers = int(workers_text)
         compression_level = int(compression_text)
+        chunk_samples = int(parts[2]) if len(parts) == 3 else 16
     except (TypeError, ValueError) as error:
-        raise argparse.ArgumentTypeError("case must be WORKERS:COMPRESSION") from error
+        raise argparse.ArgumentTypeError(
+            "case must be WORKERS:COMPRESSION[:CHUNK_SAMPLES]"
+        ) from error
     if workers <= 0:
         raise argparse.ArgumentTypeError("case workers must be positive")
     if not 0 <= compression_level <= 9:
         raise argparse.ArgumentTypeError("case compression must be in 0..9")
-    return BenchmarkCase(workers, compression_level)
+    if chunk_samples <= 0:
+        raise argparse.ArgumentTypeError("case chunk samples must be positive")
+    return BenchmarkCase(workers, compression_level, chunk_samples)
 
 
 def default_cases(
-    max_games: int, logical_cpu_count: int | None = None
+    max_games: int,
+    logical_cpu_count: int | None = None,
+    chunk_samples: int = 16,
 ) -> list[BenchmarkCase]:
-    """Use a bounded power-of-two ladder, then compare normal compression."""
+    """Benchmark worker scaling, compression, and a small chunk-size sweep."""
 
     limit = min(
         max_games,
@@ -64,9 +78,13 @@ def default_cases(
     cases: list[BenchmarkCase] = []
     workers = 1
     while workers <= limit:
-        cases.append(BenchmarkCase(workers, 1))
+        cases.append(BenchmarkCase(workers, 1, chunk_samples))
         workers *= 2
-    cases.append(BenchmarkCase(cases[-1].workers, 6))
+    largest = cases[-1].workers
+    cases.append(BenchmarkCase(largest, 6, chunk_samples))
+    for candidate in (64, 128, 256):
+        if candidate != chunk_samples:
+            cases.append(BenchmarkCase(largest, 1, candidate))
     return cases
 
 
@@ -121,9 +139,9 @@ def _case_metrics(output: Path) -> dict[str, Any]:
             path.stat().st_size for path in output.rglob("*") if path.is_file()
         ),
         "chunkSamples": sorted({int(meta["chunkSamples"]) for meta in metas}),
-        "compressionLevels": sorted(
-            {int(meta["compressionLevel"]) for meta in metas}
-        ),
+        "compressionLevels": sorted({int(meta["compressionLevel"]) for meta in metas}),
+        "frameSampling": summary.get("frameSampling"),
+        "frameCounts": summary.get("frameCounts"),
     }
 
 
@@ -136,7 +154,9 @@ def validate_comparable(rows: list[dict[str, Any]], expected_games: int) -> None
         if row.get("converterStatus") != "complete" or row.get("failures"):
             raise ValueError(f"converter reported a failure: {row.get('case')}")
         if row.get("completedGames") != expected_games:
-            raise ValueError(f"benchmark case converted the wrong game count: {row.get('case')}")
+            raise ValueError(
+                f"benchmark case converted the wrong game count: {row.get('case')}"
+            )
     sample_counts = {int(row["samples"]) for row in rows}
     if len(sample_counts) != 1:
         raise ValueError("benchmark cases produced different sample counts")
@@ -155,11 +175,14 @@ def parse_args() -> argparse.Namespace:
         action="append",
         type=parse_case,
         help=(
-            "WORKERS:COMPRESSION; repeat to choose cases (default: a power-of-two "
-            "worker ladder through min(max-games, logical CPUs, 16), then level 6 "
-            "compression at the largest worker count)"
+            "WORKERS:COMPRESSION[:CHUNK_SAMPLES]; repeat to choose cases "
+            "(default: worker ladder, level-6 compression, and 64/128/256 chunks)"
         ),
     )
+    parser.add_argument("--frame-sampling-seed", type=int)
+    parser.add_argument("--rare-action-frame-rate", type=float, default=1.0)
+    parser.add_argument("--state-change-frame-rate", type=float, default=0.5)
+    parser.add_argument("--ordinary-frame-rate", type=float, default=0.05)
     parser.add_argument(
         "--keep-outputs",
         action="store_true",
@@ -183,7 +206,9 @@ def main() -> None:
         raise FileExistsError(f"benchmark output root is not empty: {output_root}")
     output_root.mkdir(parents=True, exist_ok=True)
     report_path = output_root / "benchmark.json"
-    cases = args.case or default_cases(args.max_games, os.cpu_count())
+    cases = args.case or default_cases(
+        args.max_games, os.cpu_count(), args.chunk_samples
+    )
     if len({case.key for case in cases}) != len(cases):
         raise ValueError("benchmark cases must be unique")
     report: dict[str, Any] = {
@@ -202,6 +227,16 @@ def main() -> None:
         "startGame": args.start_game,
         "maxGames": args.max_games,
         "chunkSamples": args.chunk_samples,
+        "frameSampling": (
+            {
+                "seed": args.frame_sampling_seed,
+                "rareActionRate": args.rare_action_frame_rate,
+                "stateChangeRate": args.state_change_frame_rate,
+                "ordinaryRate": args.ordinary_frame_rate,
+            }
+            if args.frame_sampling_seed is not None
+            else None
+        ),
         "cases": [],
     }
     _write_report(report_path, report)
@@ -223,12 +258,25 @@ def main() -> None:
                 "--max-games",
                 str(args.max_games),
                 "--chunk-samples",
-                str(args.chunk_samples),
+                str(case.chunk_samples),
                 "--workers",
                 str(case.workers),
                 "--compression-level",
                 str(case.compression_level),
             ]
+            if args.frame_sampling_seed is not None:
+                command.extend(
+                    [
+                        "--frame-sampling-seed",
+                        str(args.frame_sampling_seed),
+                        "--rare-action-frame-rate",
+                        str(args.rare_action_frame_rate),
+                        "--state-change-frame-rate",
+                        str(args.state_change_frame_rate),
+                        "--ordinary-frame-rate",
+                        str(args.ordinary_frame_rate),
+                    ]
+                )
             print(f"benchmarking {case.key}", flush=True)
             started = time.perf_counter()
             completed = subprocess.run(command, check=False)
@@ -237,6 +285,7 @@ def main() -> None:
                 "case": case.key,
                 "workers": case.workers,
                 "compressionLevel": case.compression_level,
+                "chunkSamplesRequested": case.chunk_samples,
                 "durationSeconds": duration,
                 "exitCode": completed.returncode,
                 "status": "failed" if completed.returncode else "complete",

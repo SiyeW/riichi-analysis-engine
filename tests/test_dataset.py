@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 from test_storage import sample_arrays
+from torch.utils.data import DataLoader
 
 from riichi_analysis_engine import dataset
 from riichi_analysis_engine.analysis_observation import channel_index
@@ -141,9 +142,7 @@ def pack_directory(
         if semantic_history:
             catalog = np.stack(
                 [
-                    encode_public_event(
-                        {"type": "start_kyoku", "dora_marker": "1m"}
-                    ),
+                    encode_public_event({"type": "start_kyoku", "dora_marker": "1m"}),
                     encode_public_event(
                         {"type": "tsumo", "actor": game % 4, "pai": "5mr"}
                     ),
@@ -206,6 +205,27 @@ def pack_directory(
     return output
 
 
+def test_one_loader_worker_preserves_a_resumed_sample_cursor(scratch: Path) -> None:
+    root = pack_directory(scratch, games=2, chunks=2, samples=4, pack_samples=8)
+    data = PackDataset(root, batch_size=4, start_sample=3, max_samples=5)
+    loader = DataLoader(
+        data,
+        batch_size=None,
+        num_workers=1,
+        prefetch_factor=2,
+    )
+
+    tags = torch.cat([batch["sample_tag"] for batch in loader])
+    expected = torch.cat(
+        [
+            batch["sample_tag"]
+            for batch in PackDataset(root, batch_size=4, start_sample=3, max_samples=5)
+        ]
+    )
+
+    assert torch.equal(tags, expected)
+
+
 def stored_tags(root: Path) -> np.ndarray:
     """Every sample tag the packs hold, read straight from the files."""
 
@@ -248,7 +268,10 @@ def test_semantic_event_history_is_materialized_and_padded_per_batch(
     batches = collect(PackDataset(root, batch_size=3))
 
     assert [len(batch["policy"]) for batch in batches] == [3, 3, 2]
-    assert all(batch["event_tokens"].shape[:2] == batch["event_mask"].shape for batch in batches)
+    assert all(
+        batch["event_tokens"].shape[:2] == batch["event_mask"].shape
+        for batch in batches
+    )
     lengths = np.concatenate([batch["event_mask"].sum(axis=1) for batch in batches])
     assert sorted(lengths.tolist()) == sorted([1, 2, 3, 1] * 2)
     assert all("history_start" not in batch for batch in batches)

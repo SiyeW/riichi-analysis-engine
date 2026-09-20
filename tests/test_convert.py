@@ -47,7 +47,9 @@ class _PassivePlayerState:
             can_ron_agari=False,
         )
 
-    def encode_obs(self, _version: int, _kan_select: bool) -> tuple[np.ndarray, np.ndarray]:
+    def encode_obs(
+        self, _version: int, _kan_select: bool
+    ) -> tuple[np.ndarray, np.ndarray]:
         return (
             np.zeros((MORTAL_OBS_CHANNELS, TILE_TYPES), dtype=np.float32),
             np.zeros(ACTION_SPACE, dtype=bool),
@@ -57,19 +59,24 @@ class _PassivePlayerState:
 class _CountingPlayerState(_PassivePlayerState):
     encode_calls = 0
 
-    def encode_obs(self, version: int, kan_select: bool) -> tuple[np.ndarray, np.ndarray]:
+    def encode_obs(
+        self, version: int, kan_select: bool
+    ) -> tuple[np.ndarray, np.ndarray]:
         type(self).encode_calls += 1
         return super().encode_obs(version, kan_select)
 
 
-def test_terminal_preceding_frame_uses_the_actual_winner() -> None:
-    events = [
-        {"type": "dahai", "actor": 0, "pai": "4s"},
-        {"type": "hora", "actor": 3, "target": 0},
-        {"type": "end_kyoku"},
-    ]
+def test_analysis_perspective_is_identity_deterministic() -> None:
+    first = [_analysis_perspective("game", index) for index in range(16)]
 
-    assert _analysis_perspective(events, "game", 0) == 3
+    assert first == [_analysis_perspective("game", index) for index in range(16)]
+    assert all(0 <= perspective < 4 for perspective in first)
+
+
+def test_analysis_perspective_prefers_an_exact_baseline_anchor() -> None:
+    anchors = np.asarray([False, False, True, False])
+
+    assert _analysis_perspective("game", 4, anchors) == 2
 
 
 def test_conversion_references_one_shared_full_event_catalog() -> None:
@@ -163,7 +170,7 @@ def test_conversion_records_perspective_relative_hidden_baseline_anchors() -> No
     assert not bool(anchors[2])
 
 
-def test_conversion_keeps_decisive_frames_when_other_rates_are_zero() -> None:
+def test_conversion_keeps_only_exact_analysis_anchors_at_zero_rates() -> None:
     events = [
         {
             "type": "start_kyoku",
@@ -193,9 +200,12 @@ def test_conversion_keeps_decisive_frames_when_other_rates_are_zero() -> None:
         ),
     )
 
-    np.testing.assert_array_equal(converted.arrays["event_index"], [1])
-    assert converted.frame_counts["decisive"] == {"seen": 1, "kept": 1}
-    assert converted.frame_counts["state_change"] == {"seen": 1, "kept": 0}
+    np.testing.assert_array_equal(converted.arrays["event_index"], [0, 1])
+    assert converted.frame_counts["analysis_baseline_anchor"] == {
+        "seen": 2,
+        "kept": 2,
+    }
+    assert converted.frame_counts["analysis_ordinary"] == {"seen": 0, "kept": 0}
 
 
 def test_conversion_preflight_performs_no_writes(tmp_path) -> None:

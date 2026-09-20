@@ -12,6 +12,9 @@ from riichi_analysis_engine.benchmark_conversion import (
 
 def test_parse_conversion_benchmark_case() -> None:
     assert parse_case("2:6") == BenchmarkCase(workers=2, compression_level=6)
+    assert parse_case("2:6:128") == BenchmarkCase(
+        workers=2, compression_level=6, chunk_samples=128
+    )
 
 
 def test_default_conversion_benchmark_cases_are_bounded_by_work() -> None:
@@ -22,16 +25,24 @@ def test_default_conversion_benchmark_cases_are_bounded_by_work() -> None:
         BenchmarkCase(8, 1),
         BenchmarkCase(16, 1),
         BenchmarkCase(16, 6),
+        BenchmarkCase(16, 1, 64),
+        BenchmarkCase(16, 1, 128),
+        BenchmarkCase(16, 1, 256),
     ]
     assert default_cases(max_games=4, logical_cpu_count=32) == [
         BenchmarkCase(1, 1),
         BenchmarkCase(2, 1),
         BenchmarkCase(4, 1),
         BenchmarkCase(4, 6),
+        BenchmarkCase(4, 1, 64),
+        BenchmarkCase(4, 1, 128),
+        BenchmarkCase(4, 1, 256),
     ]
 
 
-@pytest.mark.parametrize("value", ["", "2", "0:1", "1:-1", "1:10", "a:1"])
+@pytest.mark.parametrize(
+    "value", ["", "2", "0:1", "1:-1", "1:10", "a:1", "1:1:0", "1:1:2:3"]
+)
 def test_rejects_invalid_conversion_benchmark_case(value: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError):
         parse_case(value)

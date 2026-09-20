@@ -4,7 +4,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
-SAMPLING_SCHEMA = "riichi-analysis-frame-sampling-v1"
+SAMPLING_SCHEMA = "riichi-analysis-frame-sampling-v2"
 
 STATE_CHANGE_EVENTS = frozenset(
     {
@@ -32,6 +32,14 @@ RARE_ACTION_FIELDS = (
     "can_ron_agari",
     "can_ryukyoku",
 )
+SAMPLING_STRATA = (
+    "analysis_baseline_anchor",
+    "analysis_state_change",
+    "analysis_ordinary",
+    "policy_rare_action",
+    "policy_state_change",
+    "policy_ordinary",
+)
 
 
 def _value(candidate: Any, name: str) -> bool:
@@ -39,30 +47,22 @@ def _value(candidate: Any, name: str) -> bool:
     return bool(value() if callable(value) else value)
 
 
-def is_terminal_preceding(events: list[dict[str, Any]], event_index: int) -> bool:
-    """Return whether this frame is immediately followed by a terminal result."""
+def has_rare_legal_action(candidate: Any) -> bool:
+    """Return whether one controlled player's current choice is uncommon."""
 
-    for event in events[event_index + 1 :]:
-        kind = event.get("type")
-        if kind in {"hora", "ryukyoku", "end_kyoku"}:
-            return True
-        if kind in STATE_CHANGE_EVENTS or kind in {"tsumo", "dahai"}:
-            return False
-        if kind == "end_game":
-            return False
-    return False
-
-
-def has_rare_legal_action(candidates: list[Any]) -> bool:
-    return any(
-        _value(candidate, field)
-        for candidate in candidates
-        for field in RARE_ACTION_FIELDS
-    )
+    return any(_value(candidate, field) for field in RARE_ACTION_FIELDS)
 
 
 @dataclass(frozen=True)
 class FrameSamplingPlan:
+    """Deterministically sample policy decisions and analysis states separately.
+
+    Policy retention may use the controlled player's legal actions. Analysis
+    retention only uses current public state plus the exact no-information anchor;
+    neither stream is selected from a future result or another player's private
+    legal-action candidates.
+    """
+
     seed: int
     rare_action_rate: float = 1.0
     state_change_rate: float = 0.5
@@ -81,34 +81,48 @@ class FrameSamplingPlan:
         return {
             "schema": SAMPLING_SCHEMA,
             "seed": self.seed,
-            "rates": {
-                "decisive": 1.0,
+            "policyRates": {
                 "rare_action": self.rare_action_rate,
+                "state_change": self.state_change_rate,
+                "ordinary": self.ordinary_rate,
+            },
+            "analysisRates": {
+                "baseline_anchor": 1.0,
                 "state_change": self.state_change_rate,
                 "ordinary": self.ordinary_rate,
             },
         }
 
-    def classify(
-        self,
-        events: list[dict[str, Any]],
-        event_index: int,
-        candidates: list[Any],
-    ) -> str:
-        if is_terminal_preceding(events, event_index):
-            return "decisive"
-        if has_rare_legal_action(candidates):
-            return "rare_action"
-        if events[event_index]["type"] in STATE_CHANGE_EVENTS:
-            return "state_change"
-        return "ordinary"
+    @staticmethod
+    def analysis_stratum(event: dict[str, Any], *, baseline_anchor: bool) -> str:
+        if baseline_anchor:
+            return "analysis_baseline_anchor"
+        if event["type"] in STATE_CHANGE_EVENTS:
+            return "analysis_state_change"
+        return "analysis_ordinary"
 
-    def keep(self, source_id: str, event_index: int, stratum: str) -> bool:
+    @staticmethod
+    def policy_stratum(event: dict[str, Any], candidate: Any) -> str:
+        if has_rare_legal_action(candidate):
+            return "policy_rare_action"
+        if event["type"] in STATE_CHANGE_EVENTS:
+            return "policy_state_change"
+        return "policy_ordinary"
+
+    def keep(
+        self,
+        source_id: str,
+        event_index: int,
+        perspective: int,
+        stratum: str,
+    ) -> bool:
         rates = {
-            "decisive": 1.0,
-            "rare_action": self.rare_action_rate,
-            "state_change": self.state_change_rate,
-            "ordinary": self.ordinary_rate,
+            "analysis_baseline_anchor": 1.0,
+            "analysis_state_change": self.state_change_rate,
+            "analysis_ordinary": self.ordinary_rate,
+            "policy_rare_action": self.rare_action_rate,
+            "policy_state_change": self.state_change_rate,
+            "policy_ordinary": self.ordinary_rate,
         }
         try:
             rate = rates[stratum]
@@ -119,7 +133,9 @@ class FrameSamplingPlan:
         if rate <= 0.0:
             return False
         digest = hashlib.blake2b(
-            f"{self.seed}\0{source_id}\0{event_index}\0{stratum}".encode(),
+            (
+                f"{self.seed}\0{source_id}\0{event_index}\0{perspective}\0{stratum}"
+            ).encode(),
             digest_size=8,
         ).digest()
         return int.from_bytes(digest, "little") < int(float(rate) * 2**64)

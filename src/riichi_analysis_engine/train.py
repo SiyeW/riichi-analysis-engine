@@ -995,6 +995,19 @@ def main() -> None:
     parser.add_argument("--validation", type=Path, required=True)
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument(
+        "--loader-workers",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="one worker overlaps pack decoding with GPU work; zero is synchronous",
+    )
+    parser.add_argument(
+        "--loader-prefetch",
+        type=int,
+        default=2,
+        help="batches prefetched when --loader-workers=1",
+    )
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -1106,6 +1119,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_steps < 0:
         raise ValueError("max steps must be non-negative")
+    if args.loader_prefetch <= 0:
+        raise ValueError("loader prefetch must be positive")
     if args.max_analysis_samples < 0:
         raise ValueError("maximum analysis samples must be non-negative")
     if args.checkpoint_every_samples < 0:
@@ -1230,6 +1245,10 @@ def main() -> None:
     }
     validate_dataset_input_contract(datasets, args.model_format)
     environment = environment_metadata(device)
+    environment["dataLoader"] = {
+        "workers": args.loader_workers,
+        "prefetchBatches": args.loader_prefetch if args.loader_workers else 0,
+    }
     if args.resume is not None:
         resume_path = resolve_resume_path(args.resume)
         print(json.dumps({"resumedFrom": str(resume_path)}))
@@ -1359,22 +1378,20 @@ def main() -> None:
         max_samples=args.max_validation_samples,
         batch_size=args.batch_size,
     )
-    train_loader = (
-        DataLoader(
-            train_data,
-            batch_size=None,
-            num_workers=0,
-            pin_memory=device.type == "cuda",
+    loader_options: dict[str, object] = {
+        "batch_size": None,
+        "num_workers": args.loader_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if args.loader_workers:
+        loader_options.update(
+            prefetch_factor=args.loader_prefetch,
+            persistent_workers=True,
         )
-        if train_data is not None
-        else ()
+    train_loader = (
+        DataLoader(train_data, **loader_options) if train_data is not None else ()
     )
-    validation_loader = DataLoader(
-        validation_data,
-        batch_size=None,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
-    )
+    validation_loader = DataLoader(validation_data, **loader_options)
     try:
         fixture = next(iter(validation_loader))
     except StopIteration:
