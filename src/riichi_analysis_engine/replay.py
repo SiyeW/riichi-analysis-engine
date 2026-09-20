@@ -67,12 +67,16 @@ def read_events(source: str) -> list[dict[str, Any]]:
     if source.startswith("zip://"):
         archive_path, member = source[6:].split("!", 1)
         with zipfile.ZipFile(archive_path) as archive:
-            text = archive.read(member).decode("utf-8")
-        return [json.loads(line) for line in text.splitlines() if line.strip()]
-    path = Path(source)
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rt", encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+            payload = archive.read(member)
+    else:
+        payload = Path(source).read_bytes()
+    # Some source yearly archives store gzip members under a misleading
+    # ``.mjson`` name.  Detect the payload format at the byte boundary instead
+    # of trusting either the outer ZIP member name or the filesystem suffix.
+    if payload.startswith(b"\x1f\x8b"):
+        payload = gzip.decompress(payload)
+    text = payload.decode("utf-8")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 def _remove_one(counter: Counter[str], tile: str) -> None:

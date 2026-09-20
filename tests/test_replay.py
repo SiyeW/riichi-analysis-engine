@@ -1,3 +1,6 @@
+import gzip
+import json
+import zipfile
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,8 +13,29 @@ from riichi_analysis_engine.replay import (
     annotate_game,
     hand_score,
     placement_label,
+    read_events,
     terminal_match_scores,
 )
+
+
+def test_read_events_detects_gzip_payload_inside_misnamed_zip_member(tmp_path) -> None:
+    events = [{"type": "start_game"}, {"type": "end_game"}]
+    payload = "".join(json.dumps(event) + "\n" for event in events).encode()
+    archive_path = tmp_path / "year.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("game.mjson", gzip.compress(payload))
+
+    assert read_events(f"zip://{archive_path}!game.mjson") == events
+
+
+def test_read_events_detects_gzip_payload_without_gz_suffix(tmp_path) -> None:
+    events = [{"type": "start_game"}, {"type": "end_game"}]
+    source = tmp_path / "game.mjson"
+    source.write_bytes(
+        gzip.compress("".join(json.dumps(event) + "\n" for event in events).encode())
+    )
+
+    assert read_events(str(source)) == events
 
 
 def test_wall_and_red_dora_tracking() -> None:
