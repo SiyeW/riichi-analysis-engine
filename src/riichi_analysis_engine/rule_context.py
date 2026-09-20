@@ -3,7 +3,7 @@
 The v12 model inherited slices of Mortal's observation as a policy-only
 context.  That made exact facts such as self shanten, furiten and a currently
 legal win invisible to the kyoku heads.  This module replaces those opaque
-channel ranges with a small contract built from PlayerState's public getters.
+channel ranges with a small contract built by the engine's shared rule kernel.
 
 Candidate identity remains a policy concern: the shared context describes the
 position and which classes of action are legal, while the policy decoder still
@@ -18,13 +18,17 @@ from typing import Any
 import numpy as np
 
 from .constants import ACTION_SPACE, TILE34_TO_INDEX, TILE_TYPES, deaka
+from .hand_rules import analyze_hand_rules
 
-RULE_CONTEXT_SCHEMA_ID = "riichi-analysis-rule-context-v1"
+RULE_CONTEXT_SCHEMA_ID = "riichi-analysis-rule-context-v2"
 
 RULE_GLOBAL_FEATURE_NAMES = (
     "shanten_complete",
     *(f"shanten_{value}" for value in range(7)),
     "furiten",
+    "discard_furiten",
+    "temporary_furiten",
+    "riichi_furiten",
     "riichi_declared",
     "riichi_accepted",
     "phase_discard",
@@ -45,10 +49,16 @@ RULE_GLOBAL_FEATURE_NAMES = (
     "can_ryukyoku",
 )
 RULE_TILE_FEATURE_NAMES = (
-    "completion_wait",
+    "structural_wait",
+    "ron_yaku",
+    "tsumo_yaku",
+    "effective_draw",
+    "effective_remaining",
     "legal_discard",
-    "keep_shanten_discard",
-    "lower_shanten_discard",
+    "discard_result_complete",
+    *(f"discard_result_shanten_{value}" for value in range(7)),
+    "discard_ukeire",
+    "discard_creates_furiten",
     "ankan_candidate",
     "kakan_candidate",
 )
@@ -86,6 +96,8 @@ def encode_rule_context(
     action_mask: Any,
     *,
     at_kan_select: bool = False,
+    seat: int | None = None,
+    rule_state: Any | None = None,
 ) -> np.ndarray:
     """Encode exact self-state facts without depending on Mortal channel ids."""
 
@@ -95,16 +107,25 @@ def encode_rule_context(
     if mask.shape != (ACTION_SPACE,):
         raise ValueError(f"wrong action-mask shape for rule context: {mask.shape}")
 
+    resolved_seat = int(
+        seat if seat is not None else _value(state, "player_id", 0)
+    )
+    facts = analyze_hand_rules(state, seat=resolved_seat, rule_state=rule_state)
     can_tsumo = bool(_value(candidates, "can_tsumo_agari", False))
     can_ron = bool(_value(candidates, "can_ron_agari", False))
-    raw_shanten = int(_value(state, "shanten", 6))
     shanten_name = (
         "shanten_complete"
-        if can_tsumo or can_ron
-        else f"shanten_{max(0, min(6, raw_shanten))}"
+        if facts.complete
+        else f"shanten_{facts.shanten}"
     )
     global_values[_GLOBAL[shanten_name]] = 1.0
-    global_values[_GLOBAL["furiten"]] = _bool(getattr(state, "at_furiten", False))
+    furiten = (
+        facts.discard_furiten or facts.temporary_furiten or facts.riichi_furiten
+    )
+    global_values[_GLOBAL["furiten"]] = _bool(furiten)
+    global_values[_GLOBAL["discard_furiten"]] = _bool(facts.discard_furiten)
+    global_values[_GLOBAL["temporary_furiten"]] = _bool(facts.temporary_furiten)
+    global_values[_GLOBAL["riichi_furiten"]] = _bool(facts.riichi_furiten)
     global_values[_GLOBAL["riichi_declared"]] = _bool(
         getattr(state, "self_riichi_declared", False)
     )
@@ -135,23 +156,23 @@ def encode_rule_context(
     for name, value in candidate_features.items():
         global_values[_GLOBAL[name]] = _bool(value)
 
-    waits = np.asarray(_value(state, "waits", np.zeros(TILE_TYPES)), dtype=np.float32)
-    keep = np.asarray(
-        _value(state, "keep_shanten_discards", np.zeros(TILE_TYPES)),
-        dtype=np.float32,
-    )
-    lower = np.asarray(
-        _value(state, "next_shanten_discards", np.zeros(TILE_TYPES)),
-        dtype=np.float32,
-    )
     for name, values in (
-        ("completion_wait", waits),
-        ("keep_shanten_discard", keep),
-        ("lower_shanten_discard", lower),
+        ("structural_wait", facts.structural_waits),
+        ("ron_yaku", facts.ron_yaku),
+        ("tsumo_yaku", facts.tsumo_yaku),
+        ("effective_draw", facts.effective_draws),
+        ("effective_remaining", facts.effective_remaining / 4.0),
+        ("discard_ukeire", facts.discard_ukeire / 136.0),
+        ("discard_creates_furiten", facts.discard_creates_furiten),
     ):
         if values.shape != (TILE_TYPES,):
             raise ValueError(f"wrong {name} shape: {values.shape}")
         tile_values[_TILE[name]] = values
+    for tile, result_shanten in enumerate(facts.discard_result_shanten):
+        if result_shanten == -1:
+            tile_values[_TILE["discard_result_complete"], tile] = 1.0
+        elif 0 <= result_shanten <= 6:
+            tile_values[_TILE[f"discard_result_shanten_{result_shanten}"], tile] = 1.0
 
     # The action space keeps red fives distinct; shared tile semantics use the
     # corresponding base tile, while candidate embeddings preserve red identity.

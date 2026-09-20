@@ -9,7 +9,11 @@ from riichi_analysis_engine.constants import (
     MORTAL_OBS_CHANNELS,
     TILE_TYPES,
 )
-from riichi_analysis_engine.convert import convert_game, preflight_conversion
+from riichi_analysis_engine.convert import (
+    _analysis_perspective,
+    convert_game,
+    preflight_conversion,
+)
 from riichi_analysis_engine.semantic_input import (
     EVENT_TILE,
     PUBLIC_EVENT_TYPE_TO_ID,
@@ -55,6 +59,16 @@ class _CountingPlayerState(_PassivePlayerState):
     def encode_obs(self, version: int, kan_select: bool) -> tuple[np.ndarray, np.ndarray]:
         type(self).encode_calls += 1
         return super().encode_obs(version, kan_select)
+
+
+def test_terminal_preceding_frame_uses_the_actual_winner() -> None:
+    events = [
+        {"type": "dahai", "actor": 0, "pai": "4s"},
+        {"type": "hora", "actor": 3, "target": 0},
+        {"type": "end_kyoku"},
+    ]
+
+    assert _analysis_perspective(events, "game", 0) == 3
 
 
 def test_conversion_references_one_shared_full_event_catalog() -> None:

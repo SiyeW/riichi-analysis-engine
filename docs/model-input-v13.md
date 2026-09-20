@@ -20,10 +20,11 @@ other heads had to infer the same rules from sparse outcome labels.
 
 ## v13 boundary
 
-The persisted v13 observation contains only two engine-owned components:
+The persisted v13 observation uses `riichi-analysis-model-input-v3` and
+contains only two engine-owned components:
 
 1. the audited public-analysis planes;
-2. `riichi-analysis-rule-context-v1`, whose named features describe exact
+2. `riichi-analysis-rule-context-v2`, whose named features describe exact
    self-state and legal-action facts.
 
 No Mortal observation channel is persisted or consumed by the v13 model.
@@ -31,11 +32,17 @@ No Mortal observation channel is persisted or consumed by the v13 model.
 its public getters calculate rule facts and its action mask validates labels,
 but its observation tensor is not part of the v13 contract.
 
-Per-tile rule features cover waits, legal discards, shanten-preserving and
-shanten-lowering discards, and kan candidates. Global rule features cover exact
-shanten, furiten and riichi state, interaction phase, and legal action classes.
-These features enter the shared tile and global representations, so every
-prediction family can use them.
+Per-tile rule features distinguish structural completion waits from ordinary
+ron-yaku and tsumo-yaku legality. They also include effective draws, visible
+remaining copies, legal discards, each discard's resulting shanten and ukeire,
+whether it creates discard furiten, and kan candidates. Global rule features
+cover exact shanten, separate discard/temporary/riichi furiten, riichi state,
+interaction phase, and legal action classes. These features enter the shared
+tile and global representations, so every prediction family can use them.
+
+The exact shanten and ukeire kernel uses the same audited libriichi lookup-table
+method as the established reference opponent model. Conversion and runtime call the
+same implementation; neither path asks the network to approximate these rules.
 
 Concrete candidate identity remains policy-specific. The policy decoder scores
 the fixed action vocabulary and the authoritative action mask removes illegal
@@ -48,9 +55,12 @@ recomputing public history.
 - Runtime post-processing does not manufacture a high win probability; the
   model receives the fact and learns how it changes future outcomes.
 - Mortal's opaque single-player value tables are not copied into v13.
-- General non-tenpai ukeire is not added through a second Python shanten
-  implementation. It should be added only when the rules backend exposes one
-  audited, efficient calculation shared by conversion and runtime.
+- The rule context contains no heuristic EV, danger judgement, or preferred
+  discard. It supplies facts and leaves strategic consequences to the model.
 
-Training policy, decisive-state sampling, and loss weighting are intentionally
-outside this input-contract change and must be selected before v13 training.
+Terminal `hora` and `ryukyoku` events remain labels rather than model inputs.
+For the frame immediately before a win, analysis supervision is assigned to an
+actual winner instead of a random seat; a multiple-ron frame selects one winner
+deterministically so every frame still contributes exactly one analysis row.
+Training policy and any broader sampling or loss weighting remain separate
+decisions to make before v13 training.
