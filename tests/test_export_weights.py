@@ -10,7 +10,6 @@ from riichi_analysis_engine.architecture import (
 )
 from riichi_analysis_engine.export_weights import (
     main,
-    public_dataset_metadata,
     training_source_revision,
 )
 from riichi_analysis_engine.model import RiichiAnalysisModel
@@ -19,17 +18,9 @@ from riichi_analysis_engine.prediction_values import DORA_VALUES, SCORE_VALUES
 from riichi_analysis_engine.semantic_input import semantic_input_metadata
 
 
-def test_exported_provenance_omits_local_paths() -> None:
+def test_training_revision_uses_checkpoint_environment() -> None:
     checkpoint = {
-        "datasets": {
-            "train": {"path": "private-training-corpus", "games": 10},
-            "validation": {"path": "private-validation-corpus", "games": 2},
-        },
         "environment": {"sourceRevision": "abc123", "sourceDirty": False},
-    }
-    assert public_dataset_metadata(checkpoint) == {
-        "train": {"games": 10},
-        "validation": {"games": 2},
     }
     assert training_source_revision(checkpoint) == "abc123"
 
@@ -202,4 +193,7 @@ def test_export_preserves_model_architecture(
         "nextSample": 320,
         "complete": False,
     }
+    assert "datasets" not in exported["training"]
+    assert "trainingData" not in exported["training"]
+    assert "validationData" not in exported["training"]
     assert "epoch" not in exported["training"]

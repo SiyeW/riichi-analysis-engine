@@ -41,18 +41,6 @@ def source_revision() -> str | None:
         return None
 
 
-def public_dataset_metadata(checkpoint: dict[str, object]) -> object:
-    datasets = checkpoint.get("datasets")
-    if not isinstance(datasets, dict):
-        return None
-    return {
-        split: {key: value for key, value in metadata.items() if key != "path"}
-        if isinstance(metadata, dict)
-        else metadata
-        for split, metadata in datasets.items()
-    }
-
-
 def training_source_revision(checkpoint: dict[str, object]) -> str | None:
     environment = checkpoint.get("environment")
     if isinstance(environment, dict):
@@ -66,8 +54,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Export inference-only model weights.")
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--training-data", default="2025-train")
-    parser.add_argument("--validation-data", default="2026-md5-holdout")
     args = parser.parse_args()
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
@@ -113,9 +99,6 @@ def main() -> None:
         "analysisSamplesSeen": int(
             checkpoint.get("analysisSamplesSeen", checkpoint.get("samplesSeen", 0))
         ),
-        "trainingData": args.training_data,
-        "validationData": args.validation_data,
-        "datasets": public_dataset_metadata(checkpoint),
         "environment": checkpoint.get("environment"),
         "validation": checkpoint.get("validation"),
         "sourceRevision": training_source_revision(checkpoint),

@@ -1,6 +1,6 @@
 """Merge the segments of a corpus that was built in pieces.
 
-A full 2025 corpus does not fit on the build disk twice: the staged games and
+A full corpus may not fit on the build disk twice: the staged games and
 the packs together need more room than the machine has. The corpus is therefore
 converted and packed in segments, and each segment's staged games are deleted as
 soon as that segment is packed.

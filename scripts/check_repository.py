@@ -23,7 +23,7 @@ def public_files() -> list[Path]:
     return [
         ROOT / item
         for item in result.stdout.decode("utf-8").split("\0")
-        if item
+        if item and (ROOT / item).is_file()
     ]
 
 
@@ -55,14 +55,29 @@ def main() -> None:
     require(not environment_files, "local environment file found in the source tree")
 
     local_path = re.compile(r"(?i)\b[a-z]:[\\/]")
+    private_training_markers = (
+        "data_" + "provenance.md",
+        "ten" + "hou-to-mjai",
+        "nikke" + "tryhard",
+        "train-" + "2025",
+        "holdout-" + "2025",
+        "validation-" + "2026",
+        "2023-" + "2025",
+    )
     for path in files:
         if path.suffix.lower() not in {".json", ".md", ".ps1", ".py", ".toml"}:
             continue
         text = path.read_text(encoding="utf-8")
         relative = path.relative_to(ROOT)
         require(not local_path.search(text), f"local Windows path found in {relative}")
+        lowered = text.lower()
+        exposed = [marker for marker in private_training_markers if marker in lowered]
+        require(
+            not exposed,
+            f"private training provenance found in {relative}: {exposed}",
+        )
         retired_name = "uni" + "fied"
-        require(retired_name not in text.lower(), f"retired project name found in {relative}")
+        require(retired_name not in lowered, f"retired project name found in {relative}")
 
     print("OK: manifest, project name, public paths, data, and weight boundaries")
 

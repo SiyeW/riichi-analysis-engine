@@ -258,7 +258,7 @@ def hand_score(event: dict[str, Any], state: FullState, *, first_winner: bool) -
     # one assumed payer: 包牌 (pao, liability) makes the player who supplied the
     # tile that completed daisangen or daisuushii responsible for part or all of
     # the payment, so one ron can be paid by two players. See
-    # regression-fixture, where a daisangen was completed from
+    # A regression fixture where a daisangen was completed from
     # player 0's discard and won on player 3's.
     value = int(deltas[int(event["actor"])])
     if first_winner:

@@ -35,12 +35,12 @@ Each supervised objective is balanced with a learned uncertainty weight during t
 - Final placement is learned as a joint distribution over all 24 placement permutations.
 - Policy labels use Mortal v4's 46 internal actions and legal-action masks. The engine composes conditional internal actions into complete legal protocol candidates before returning them.
 
-## Dataset split
+## Training-data interface
 
-Training inputs are supplied through a private external manifest.
+Training and validation inputs are supplied through local manifests. The public repository does not include data acquisition, source records, concrete splits, or a training corpus.
 
 Each public event uses one deterministic perspective to train the analysis outputs. When an action can be supervised, the acting player or explicit-pass perspective is also used to train the policy. Observations are compressed using two bitmaps and sparse `float16` values. Repeated dora indicators are counted repeatedly, while honba and deposits are excluded from hand-value labels.
 
-## Running the test training job
+## Running training
 
-Create the Python 3.11 training environment, pass a locally prepared manifest to the converter, and train from the resulting packs.
+Create the Python 3.11 training environment, pass a locally prepared manifest to the converter, and train from the resulting packs. Data acquisition and split-generation tools are not published in this repository.

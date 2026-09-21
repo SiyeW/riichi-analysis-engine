@@ -29,7 +29,6 @@ test = [
 ]
 
 [project.scripts]
-riichi-analysis-prepare = "riichi_analysis_engine.prepare:main"
 riichi-analysis-convert = "riichi_analysis_engine.convert:main"
 riichi-analysis-benchmark-conversion = "riichi_analysis_engine.benchmark_conversion:main"
 riichi-analysis-train = "riichi_analysis_engine.train:main"
