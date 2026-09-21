@@ -8,79 +8,57 @@
 
 ---
 
+<div lang="zh-CN">
+
 ## 中文
 
 ### Riichi Analysis Engine
 
-一个面向立直麻将研究与分析的多任务引擎，兼容 [Riichi Engine Protocol](https://github.com/SiyeW/riichi-engine-protocol)。
+一款兼容 [Riichi Engine Protocol 2.2](https://github.com/SiyeW/riichi-engine-protocol) 的立直麻将分析引擎。
 
-项目尝试使用同一个模型，从牌局中的可见信息出发，同时完成动作推荐、对手状态分析、隐藏信息估计和牌局结果预测等任务，为牌谱研究和外部麻将程序提供统一的分析能力。
+同一个模型根据牌局信息提供动作推荐、对手向听、牌张放铳率、对手暗牌、牌山、对手宝牌与打点、小局结果与收支、终局顺位与分数预测。
 
-> 项目仍处于开发和实验阶段。模型结构、训练方法、协议接口和输出格式仍可能调整。
-
-### 主要能力
-
-Riichi Analysis Engine 目前围绕以下几类任务进行开发：
+### 分析输出
 
 | 类别 | 输出 |
 | --- | --- |
-| 决策分析 | 当前局面的动作推荐 |
-| 对手分析 | 对手向听状态、牌张放铳风险 |
-| 隐藏信息估计 | 对手暗牌、剩余牌山 |
-| 手牌价值分析 | 对手宝牌数量与打点相关预测 |
-| 小局预测 | 小局结果与分数收支 |
-| 全局预测 | 最终顺位与终局分数 |
+| 动作 | 候选动作与动作推荐 |
+| 对手状态 | 三名对手的向听状态 |
+| 放铳风险 | 各牌张对三名对手的放铳风险 |
+| 对手暗牌 | 三名对手的手牌预测 |
+| 牌山 | 剩余牌山预测 |
+| 手牌价值 | 对手宝牌数量与打点预测 |
+| 小局结果 | 小局结果与分数收支预测 |
+| 整场结果 | 终局顺位与分数预测 |
 
-这些任务由同一个模型共同完成，使不同分析目标能够共享对牌局状态、玩家行为和隐藏信息的表示。
+这些输出由同一个模型提供，共用牌局状态表示和时序信息。
 
-### 项目定位
-
-立直麻将是一种不完全信息游戏。对于牌谱分析而言，仅判断“当前应该打什么”并不能完整描述牌局。
-
-Riichi Analysis Engine 希望进一步分析例如：
-
-- 对手目前更可能处于什么向听状态？
-- 某张牌对不同对手分别具有多大的放铳风险？
-- 根据已经公开的舍牌、副露、立直等信息，对手可能持有哪些牌？
-- 当前公开信息下，剩余牌山可能呈现怎样的分布？
-- 当前小局更可能以怎样的方式结束？
-- 局部状态和结果最终会如何影响整场对局的顺位与得点？
-
-因此，本项目并不只将模型视为一个麻将策略网络，而是尝试构建一个能够同时描述**决策、对手、隐藏状态和结果**的统一分析模型。
-
-更具体的输入表示、模型结构、输出头和训练接口见[模型文档](docs/model.zh-CN.md)。
+具体的输入编码、模型结构、输出头和通用训练接口见[模型文档](docs/model.zh-CN.md)。
 
 ### 与 Riichi Mahjong Studio 的关系
 
-[Riichi Mahjong Studio](https://github.com/SiyeW/riichi-mahjong-studio) 是一个用于立直麻将牌谱复盘、研究和对局练习的桌面程序，并支持通过 Riichi Engine Protocol 加载外部分析引擎。
+[Riichi Mahjong Studio](https://github.com/SiyeW/riichi-mahjong-studio) 是用于牌谱研究和对局练习的桌面程序，可以通过 Riichi Engine Protocol 加载外部引擎。
 
-Riichi Analysis Engine 计划作为其中可选的分析引擎之一，为研究和分析提供动作推荐、对手分析、隐藏信息估计和结果预测等能力。
+Riichi Analysis Engine 计划作为其中的分析引擎之一，将模型输出提供给 Studio 的牌局和研究界面。
 
-两个项目彼此独立：Riichi Analysis Engine 负责模型推理与分析能力，Riichi Mahjong Studio 负责牌局交互、研究界面和结果展示。其他兼容 Riichi Engine Protocol 的程序也可以独立接入本引擎。
+引擎本身也可以由其他兼容 Riichi Engine Protocol 的程序调用。
 
 ### 当前状态
 
-项目目前仍处于模型、数据处理和训练流程的开发阶段。
+模型、数据转换和训练流程正在开发。
 
-仓库当前主要包含：
+仓库目前包含：
 
-- 分析引擎实现；
-- 模型结构与训练代码；
-- 数据转换与训练流程；
-- 测试与仓库检查工具；
-- Windows 引擎包构建脚本；
-- 模型与开发文档。
+- 引擎运行代码
+- 模型结构与训练代码
+- 数据转换工具
+- 测试与仓库检查工具
+- Windows 引擎包构建脚本
+- 模型文档
 
-目前暂不提供：
-
-- 正式发布的模型权重；
-- 训练数据。
-
-因此，当前仓库主要面向模型实验、引擎开发和协议集成，尚不是开箱即用的最终版本。
+目前不提供训练数据和正式模型权重。
 
 ### 开发
-
-#### 环境
 
 建议使用 Python 3.11。
 
@@ -89,119 +67,93 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[train,test,build]"
 ```
 
-#### 运行测试
+运行测试：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-#### 仓库检查
+运行仓库检查：
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
-#### 构建 Windows 引擎包
+运行：
 
 ```powershell
 .\build.ps1
 ```
 
-构建结果不包含模型权重。
+可以生成不含模型权重的 Windows 引擎包。
 
 ### 文档
 
-- [模型结构与训练接口](docs/model.zh-CN.md)
+- [模型结构与通用训练接口](docs/model.zh-CN.md)
 - [Riichi Engine Protocol](https://github.com/SiyeW/riichi-engine-protocol)
 - [第三方组件声明](THIRD_PARTY_NOTICES.md)
-
-随着模型和协议继续开发，相关文档也会同步更新。
 
 ### 许可证
 
 源代码采用 [GNU Affero General Public License v3.0 or later](LICENSE)。
 
-训练数据、模型权重以及第三方组件不当然适用本仓库的源代码许可证，其使用条件分别以对应来源和发布说明为准。
+训练数据、模型权重和第三方组件适用各自的许可条款。
 
-Riichi Analysis Engine 仍处于早期开发阶段。欢迎通过 Issue 反馈问题、讨论模型设计、协议接口和分析任务，也欢迎参与代码贡献。
+</div>
 
 ---
+
+<div lang="ja">
 
 ## 日本語
 
 ### Riichi Analysis Engine
 
-[Riichi Engine Protocol](https://github.com/SiyeW/riichi-engine-protocol) に対応する、リーチ麻雀の研究・解析を目的としたマルチタスク解析エンジンです。
+[Riichi Engine Protocol 2.2](https://github.com/SiyeW/riichi-engine-protocol) に対応するリーチ麻雀解析エンジンです。
 
-1つのモデルから、打牌・行動の推薦、対戦相手の状態分析、非公開情報の推定、局や半荘の結果予測などを同時に行い、牌譜検討や外部麻雀アプリケーションに統一的な解析機能を提供することを目指しています。
+1つのモデルから、行動推薦、対戦相手のシャンテン状態、牌ごとの放銃リスク、相手手牌、牌山、相手のドラ枚数と打点、局の結果と得失点、最終順位と持ち点を予測します。
 
-> 現在も開発・実験段階にあり、モデル構成、学習方法、プロトコルインターフェース、出力形式などは今後変更される可能性があります。
-
-### 主な機能
-
-Riichi Analysis Engine では、現在以下のようなタスクを対象に開発を進めています。
+### 解析出力
 
 | 分類 | 出力 |
 | --- | --- |
-| 意思決定解析 | 現在の局面における推奨行動 |
-| 対戦相手解析 | 相手のシャンテン状態、牌ごとの放銃リスク |
-| 非公開情報推定 | 相手の手牌、残りの山 |
-| 手牌価値解析 | 相手のドラ枚数、打点に関する予測 |
-| 局結果予測 | 局の結果、得失点 |
-| 半荘結果予測 | 最終順位、最終持ち点 |
+| 行動 | 候補行動と推奨行動 |
+| 相手状態 | 3人の相手のシャンテン状態 |
+| 放銃リスク | 各牌について3人の相手それぞれに対する放銃リスク |
+| 相手手牌 | 3人の相手の手牌予測 |
+| 牌山 | 残りの牌山の予測 |
+| 手牌価値 | 相手のドラ枚数と打点の予測 |
+| 局結果 | 局の結果と得失点の予測 |
+| 半荘結果 | 最終順位と持ち点の予測 |
 
-これらのタスクを1つのモデルで扱うことで、局面、プレイヤーの行動、非公開情報に関する表現を複数の解析タスク間で共有します。
+これらの出力は1つのモデルから生成され、局面表現と時系列情報を共有します。
 
-### プロジェクトの目的
-
-リーチ麻雀は不完全情報ゲームであり、牌譜を解析する上では「この局面で何を切るべきか」だけでは局面全体を十分に説明できません。
-
-Riichi Analysis Engine では、さらに次のような情報を解析することを目指しています。
-
-- 相手は現在どの程度のシャンテン状態にある可能性が高いか
-- 各牌がそれぞれの相手に対してどの程度の放銃リスクを持つか
-- 公開されている捨て牌、副露、立直などの情報から、相手がどのような牌を持っている可能性があるか
-- 現在の公開情報から、残りの山がどのような分布になっている可能性があるか
-- 現在の局がどのような結果で終了する可能性が高いか
-- 局単位の状態や結果が、最終的な順位や持ち点にどのような影響を与えるか
-
-そのため、本プロジェクトではモデルを単なる麻雀の方策ネットワークとして扱うのではなく、**意思決定・対戦相手・非公開状態・結果**を同時に表現する統一的な解析モデルの構築を目指しています。
-
-入力表現、モデル構成、各出力ヘッド、学習インターフェースの詳細については、[モデル資料](docs/model.ja-JP.md)を参照してください。
+入力エンコード、モデル構成、各出力ヘッド、共通の学習インターフェースについては[モデル資料](docs/model.ja-JP.md)を参照してください。
 
 ### Riichi Mahjong Studio との関係
 
-[Riichi Mahjong Studio](https://github.com/SiyeW/riichi-mahjong-studio) は、リーチ麻雀の牌譜検討・研究・対局練習を行うためのデスクトップアプリケーションで、Riichi Engine Protocol を通じて外部解析エンジンを利用できます。
+[Riichi Mahjong Studio](https://github.com/SiyeW/riichi-mahjong-studio) は、牌譜研究と対局練習のためのデスクトップアプリケーションです。Riichi Engine Protocol を通じて外部エンジンを読み込めます。
 
-Riichi Analysis Engine は、その選択可能な解析エンジンの一つとして、行動推薦、対戦相手解析、非公開情報推定、結果予測などを提供することを想定しています。
+Riichi Analysis Engine は、その解析エンジンの一つとして、モデルの出力を Studio の対局画面や研究画面に提供することを想定しています。
 
-両プロジェクトはそれぞれ独立しています。Riichi Analysis Engine はモデル推論と解析機能を担当し、Riichi Mahjong Studio は対局操作、研究用インターフェース、解析結果の表示を担当します。
-
-Riichi Engine Protocol に対応する他のアプリケーションから本エンジンを利用することもできます。
+Riichi Engine Protocol に対応する他のプログラムから利用することもできます。
 
 ### 開発状況
 
-現在は、モデル、データ処理、学習パイプラインの開発段階です。
+モデル、データ変換、学習処理を現在開発しています。
 
-このリポジトリには主に以下が含まれています。
+リポジトリには以下が含まれています。
 
-- 解析エンジンの実装
+- エンジンの実行コード
 - モデル構成と学習コード
-- データ変換および学習パイプライン
-- テストとリポジトリ検査ツール
-- Windows向けエンジンパッケージのビルドスクリプト
-- モデルおよび開発ドキュメント
+- データ変換ツール
+- テストとリポジトリチェック用ツール
+- Windows エンジンパッケージのビルドスクリプト
+- モデル資料
 
-現時点では、以下は公開していません。
-
-- 正式リリース用の学習済みモデル重み
-- 学習データ
-
-そのため、現在のリポジトリは主にモデル実験、エンジン開発、プロトコル統合を目的としており、完成した状態ですぐに利用できる最終版ではありません。
+現在、学習データと正式なモデル重みは公開していません。
 
 ### 開発
-
-#### 環境
 
 Python 3.11 を推奨します。
 
@@ -210,119 +162,93 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[train,test,build]"
 ```
 
-#### テスト
+テスト：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-#### リポジトリチェック
+リポジトリチェック：
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
-#### Windows エンジンパッケージのビルド
+以下を実行すると、
 
 ```powershell
 .\build.ps1
 ```
 
-生成されるパッケージにはモデルの重みは含まれません。
+モデル重みを含まない Windows エンジンパッケージを作成できます。
 
 ### ドキュメント
 
-- [モデル構成と学習インターフェース](docs/model.ja-JP.md)
+- [モデル構成と共通の学習インターフェース](docs/model.ja-JP.md)
 - [Riichi Engine Protocol](https://github.com/SiyeW/riichi-engine-protocol)
 - [サードパーティーコンポーネントに関する表記](THIRD_PARTY_NOTICES.md)
 
-モデルとプロトコルの開発に合わせて、関連ドキュメントも更新していく予定です。
-
 ### ライセンス
 
-ソースコードは [GNU Affero General Public License v3.0 or later](LICENSE) の下で提供します。
+ソースコードは [GNU Affero General Public License v3.0 or later](LICENSE) で提供します。
 
-学習データ、モデルの重み、サードパーティー製コンポーネントには、本リポジトリのソースコードライセンスが自動的に適用されるものではなく、それぞれの提供元および公開時の条件が適用されます。
+学習データ、モデル重み、サードパーティー製コンポーネントには、それぞれのライセンスが適用されます。
 
-Riichi Analysis Engine は現在も開発初期段階にあります。Issue での不具合報告、モデル設計・プロトコルインターフェース・解析タスクに関する議論、コードへの貢献を歓迎します。
+</div>
 
 ---
+
+<div lang="en">
 
 ## English
 
 ### Riichi Analysis Engine
 
-A multi-task engine for Riichi Mahjong research and analysis, compatible with the [Riichi Engine Protocol](https://github.com/SiyeW/riichi-engine-protocol).
+A Riichi Mahjong analysis engine compatible with [Riichi Engine Protocol 2.2](https://github.com/SiyeW/riichi-engine-protocol).
 
-The project explores a shared model that uses visible game information to perform action recommendation, opponent-state analysis, hidden-information estimation, and game-outcome prediction simultaneously, providing a common analysis backend for game-record review and external Mahjong applications.
+A single model provides action recommendations, opponent shanten estimates, tile-specific deal-in risk, opponent hand and wall predictions, opponent dora and hand-value estimates, kyoku outcome and score-change predictions, and final placement and score predictions.
 
-> The project is still under active development and experimentation. Model architecture, training methods, protocol interfaces, and output formats may change.
+### Analysis Outputs
 
-### Capabilities
-
-Riichi Analysis Engine is currently being developed around the following groups of tasks:
-
-| Category | Outputs |
+| Category | Output |
 | --- | --- |
-| Decision analysis | Recommended actions for the current state |
-| Opponent analysis | Opponent shanten state and tile-specific deal-in risk |
-| Hidden-information estimation | Opponent concealed hands and the remaining wall |
-| Hand-value analysis | Opponent dora count and hand-value related predictions |
-| Kyoku prediction | Kyoku result and score change |
-| Match prediction | Final placement and final score |
+| Actions | Candidate and recommended actions |
+| Opponent state | Shanten state of each opponent |
+| Deal-in risk | Tile-specific deal-in risk against each opponent |
+| Opponent hands | Predicted concealed hands of the three opponents |
+| Wall | Prediction of the remaining wall |
+| Hand value | Opponent dora count and hand-value predictions |
+| Kyoku result | Kyoku outcome and score-change predictions |
+| Match result | Final placement and score predictions |
 
-These tasks are handled by a shared model so that different analysis objectives can reuse representations of the game state, player behavior, and hidden information.
+The outputs are produced by a single model and share the same game-state representation and temporal information.
 
-### Project Scope
+See the [model documentation](docs/model.en-US.md) for input encoding, model architecture, output heads, and the common training interface.
 
-Riichi Mahjong is an imperfect-information game. For game-record analysis, answering only “what should be played here?” does not fully describe the state of the game.
+### Riichi Mahjong Studio
 
-Riichi Analysis Engine aims to investigate questions such as:
+[Riichi Mahjong Studio](https://github.com/SiyeW/riichi-mahjong-studio) is a desktop application for game-record study and game practice. It can load external engines through the Riichi Engine Protocol.
 
-- What shanten state is each opponent likely to be in?
-- How much deal-in risk does a particular tile carry against each opponent?
-- Given visible discards, calls, riichi declarations, and other public information, what tiles is an opponent likely to hold?
-- What distribution of tiles may remain in the wall given the currently available information?
-- How is the current kyoku likely to end?
-- How may local states and outcomes affect final placement and score?
+Riichi Analysis Engine is intended to provide its model outputs to Studio as one of its analysis engines.
 
-The project therefore does not treat the model merely as a Mahjong policy network. Instead, it aims to build a multi-task analysis model that jointly represents **decisions, opponents, hidden state, and outcomes**.
-
-For details on input representation, model architecture, output heads, and training interfaces, see the [model documentation](docs/model.en-US.md).
-
-### Relationship with Riichi Mahjong Studio
-
-[Riichi Mahjong Studio](https://github.com/SiyeW/riichi-mahjong-studio) is a desktop application for Riichi Mahjong game-record review, research, and practice. It can load external analysis engines through the Riichi Engine Protocol.
-
-Riichi Analysis Engine is intended to serve as one of its optional analysis engines, providing action recommendations, opponent analysis, hidden-information estimation, and outcome prediction.
-
-The two projects remain independent: Riichi Analysis Engine provides model inference and analysis capabilities, while Riichi Mahjong Studio handles game interaction, research workflows, and visualization of analysis results.
-
-Other applications compatible with the Riichi Engine Protocol can also integrate this engine independently.
+It can also be used by other programs compatible with the Riichi Engine Protocol.
 
 ### Status
 
-The model, data-processing components, and training pipeline are still under development.
+The model, data conversion, and training pipeline are under development.
 
-The repository currently includes:
+The repository currently contains:
 
-- analysis-engine implementation;
-- model architecture and training code;
-- data-conversion and training pipelines;
-- tests and repository validation tools;
-- Windows engine-package build scripts;
-- model and development documentation.
+- engine runtime code
+- model architecture and training code
+- data-conversion tools
+- tests and repository checks
+- Windows engine-package build scripts
+- model documentation
 
-The repository currently does not include:
-
-- officially released trained model weights;
-- training datasets.
-
-At this stage, the repository is primarily intended for model experimentation, engine development, and protocol integration rather than as a ready-to-use final release.
+Training data and release model weights are not currently provided.
 
 ### Development
-
-#### Environment
 
 Python 3.11 is recommended.
 
@@ -331,38 +257,36 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[train,test,build]"
 ```
 
-#### Run tests
+Run the tests:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-#### Repository checks
+Run the repository checks:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
-#### Build the Windows engine package
+Run:
 
 ```powershell
 .\build.ps1
 ```
 
-The generated package does not include model weights.
+to create a Windows engine package without model weights.
 
 ### Documentation
 
-- [Model architecture and training interfaces](docs/model.en-US.md)
+- [Model architecture and common training interface](docs/model.en-US.md)
 - [Riichi Engine Protocol](https://github.com/SiyeW/riichi-engine-protocol)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
-
-Documentation will continue to evolve alongside the model and protocol.
 
 ### License
 
 Source code is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE).
 
-Training data, model weights, and third-party components are not automatically covered by the source-code license of this repository and remain subject to the terms associated with their respective sources and releases.
+Training data, model weights, and third-party components are subject to their respective terms.
 
-Riichi Analysis Engine is still in an early stage of development. Bug reports, discussion of model design, protocol interfaces and analysis tasks, and code contributions are welcome.
+</div>
