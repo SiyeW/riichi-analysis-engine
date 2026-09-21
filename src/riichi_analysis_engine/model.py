@@ -570,7 +570,7 @@ class RiichiAnalysisModel(nn.Module):
         )
 
     def _init_reference_weights(self) -> None:
-        """Match the explicit initialization used by the proven reference model."""
+        """Match the explicit initialization used by the validated reference model."""
 
         for module in self.modules():
             if isinstance(module, nn.Conv1d):

@@ -134,7 +134,7 @@ def _read_event_payload(source: str) -> bytes:
 
 
 def _decode_event_payload(payload: bytes) -> list[dict[str, Any]]:
-    # Some source yearly archives store gzip members under a misleading
+    # Some source archives store gzip members under a misleading
     # ``.mjson`` name.  Detect the payload format at the byte boundary instead
     # of trusting either the outer ZIP member name or the filesystem suffix.
     if payload.startswith(b"\x1f\x8b"):
@@ -443,7 +443,7 @@ def annotate_game(events: list[dict[str, Any]]) -> dict[int, FutureAnnotation]:
 def terminal_match_scores(scores: np.ndarray, kyotaku: int) -> np.ndarray:
     """Return final net-mahjong scores after assigning unclaimed riichi sticks.
 
-    source-style MJAI logs can end immediately after a drawn last hand. In
+    Some MJAI logs can end immediately after a drawn last hand. In
     that case the final ``ryukyoku`` settlement leaves the sticks outside the
     four player accounts and no later event records their award. RMS uses the
     common online rule that the current first-place player receives that pool.

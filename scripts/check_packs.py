@@ -7,8 +7,8 @@ and how many different games a window of the order actually contains. It exits
 non-zero on the first violation, so a pipeline can refuse to start a long run
 on a corpus that is not what it claims to be.
 
-    python scripts/check_packs.py --packs data/processed-v4/packs-train \
-        --stage data/processed-v4/staged-train --batch-size 64
+    python scripts/check_packs.py --packs data/processed/packs-train \
+        --stage data/processed/staged-train --batch-size 64
 """
 
 from __future__ import annotations

@@ -68,7 +68,7 @@ def read_manifest(root: str | Path) -> dict[str, object]:
 def _settle_legacy_terminal_scores(arrays: dict[str, np.ndarray]) -> None:
     """Repair old packs whose terminal MJAI event left riichi sticks unassigned.
 
-    New conversion writes ``system_total`` explicitly. Historical source packs
+    New conversion writes ``system_total`` explicitly. Historical packs
     predate that field and always use four 25,000-point accounts, so 100,000 is
     their compatibility total. The correction is deterministic from the final
     scores and the stored absolute perspective; it does not inspect a target
