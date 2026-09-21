@@ -41,7 +41,7 @@ interaction phase, and legal action classes. These features enter the shared
 tile and global representations, so every prediction family can use them.
 
 The exact shanten and ukeire kernel uses the same audited libriichi lookup-table
-method as the established reference opponent model. Conversion and runtime call the
+method as the validated reference opponent model. Conversion and runtime call the
 same implementation; neither path asks the network to approximate these rules.
 
 Concrete candidate identity remains policy-specific. The policy decoder scores

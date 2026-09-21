@@ -10,7 +10,7 @@ segments through one manifest and one concatenated plan.  The packs stay in
 their segment directories: validating every input before writing the merged
 metadata makes a failed merge non-destructive and keeps restarts cheap.
 
-    python scripts/merge_packs.py --root data/processed/v4/packs-train
+    python scripts/merge_packs.py --root data/processed/packs-train
 """
 
 from __future__ import annotations

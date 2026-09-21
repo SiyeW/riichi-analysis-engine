@@ -25,7 +25,7 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
-模型结构和通用训练接口见[模型文档](docs/model.zh-CN.md)。
+模型结构和通用训练接口见[模型文档](docs/model.zh-CN.md)。数据获取与划分不属于本仓库的公开接口。
 
 运行 `build.ps1` 可生成不含模型权重的 Windows 引擎包。
 
@@ -60,7 +60,7 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
-モデル構成と共通の学習インターフェースは[モデル資料](docs/model.ja-JP.md)を参照してください。
+モデル構成と共通の学習インターフェースは[モデル資料](docs/model.ja-JP.md)を参照してください。データの取得と分割は、このリポジトリの公開インターフェースには含まれません。
 
 `build.ps1` を実行すると、モデルの重みを含まない Windows エンジンパッケージを作成できます。
 
@@ -95,7 +95,7 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe scripts\check_repository.py
 ```
 
-See the [model documentation](docs/model.en-US.md) for the architecture and generic training interface.
+See the [model documentation](docs/model.en-US.md) for the architecture and generic training interface. Dataset acquisition and splitting are outside this repository's public interface.
 
 Run `build.ps1` to create a Windows engine package without model weights.
 
