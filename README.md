@@ -1,7 +1,7 @@
 # Riichi Analysis Engine
 
 <p align="center">
-  <img src="docs/assets/architecture-overview.png" alt="Riichi Analysis Engine architecture overview">
+  <img src="docs/assets/architecture-overview.webp" alt="Riichi Analysis Engine architecture overview">
 </p>
 
 ### [中文](#中文) | [日本語](#日本語) | [English](#english)
