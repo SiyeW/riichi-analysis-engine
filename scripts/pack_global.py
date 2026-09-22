@@ -94,6 +94,11 @@ def build_arguments() -> argparse.Namespace:
             "requires its existing plan.npz"
         ),
     )
+    parser.add_argument(
+        "--verify-resume-only",
+        action="store_true",
+        help="verify reusable packs and exit without writing missing packs",
+    )
     parser.add_argument("--audit-only", action="store_true")
     return parser.parse_args()
 
@@ -189,6 +194,8 @@ def _existing_pack_meta(
 
 def main() -> None:
     arguments = build_arguments()
+    if arguments.verify_resume_only and not arguments.resume:
+        raise ValueError("--verify-resume-only requires --resume")
     plan_path = arguments.output / "plan.npz"
     started = time.perf_counter()
 
@@ -258,6 +265,19 @@ def main() -> None:
             if meta is not None:
                 existing[slot.index] = meta
         print(f"verified {len(existing)} existing packs", file=sys.stderr)
+        if arguments.verify_resume_only:
+            print(
+                json.dumps(
+                    {
+                        "verifiedExistingPacks": len(existing),
+                        "missingPacks": len(slots) - len(existing),
+                        "totalPacks": len(slots),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return
     pending = [slot for slot in slots if slot.index not in existing]
     entries: list[dict[str, object]] = list(existing.values())
     if arguments.workers > 1:

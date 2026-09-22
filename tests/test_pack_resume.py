@@ -126,3 +126,37 @@ def test_resume_completes_the_missing_slots_without_rewriting_verified_packs(
     assert before == after
     assert '"verified": true' in manifest
     assert len(list(output.glob("pack-*.npz"))) == len(pack_slots(plan["length"], 64))
+
+
+def test_verify_resume_only_does_not_write_missing_slots(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stage = stage_corpus(scratch)
+    output = scratch / "packs"
+    games = staged_games(stage)
+    plan = plan_corpus(games, 314159)
+    first = pack_slots(plan["length"], 64)[0]
+    write_plan(output / "plan.npz", plan)
+    build_pack(games, output, plan, first, 314159, seam_game(plan, first))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(PACK_SCRIPT),
+            "--stage",
+            str(stage),
+            "--output",
+            str(output),
+            "--seed",
+            "314159",
+            "--pack-samples",
+            "64",
+            "--resume",
+            "--verify-resume-only",
+        ],
+    )
+
+    pack_global.main()
+
+    assert [path.name for path in output.glob("pack-*.npz")] == ["pack-00000.npz"]
+    assert not (output / "manifest.json").exists()
