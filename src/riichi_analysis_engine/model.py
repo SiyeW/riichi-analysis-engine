@@ -368,7 +368,9 @@ class RiichiAnalysisModel(nn.Module):
                 raise ValueError(
                     "semantic architecture must be configured through its metadata"
                 )
-            configured = architecture or SemanticModelArchitecture()
+            configured = architecture or SemanticModelArchitecture(
+                semantic_design_version=2 if format_version == 13 else 1
+            )
             if not isinstance(configured, SemanticModelArchitecture):
                 raise TypeError(
                     "semantic model formats require SemanticModelArchitecture"

@@ -191,6 +191,12 @@ def test_legacy_v13_architecture_metadata_keeps_original_wait_head() -> None:
     assert "semantic_model.decoder.wait.output.2.weight" in model.state_dict()
 
 
+def test_new_v13_constructor_defaults_to_design_two() -> None:
+    model = RiichiAnalysisModel(format_version=13)
+    assert model.architecture.semantic_design_version == 2
+    assert "semantic_model.decoder.wait.right.weight" in model.state_dict()
+
+
 def test_v12_rejects_missing_event_memory() -> None:
     model = RiichiAnalysisModel(format_version=12, architecture=_architecture("cnn"))
     observation, _events, _mask = _inputs()

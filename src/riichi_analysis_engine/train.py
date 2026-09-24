@@ -504,11 +504,22 @@ def validate(
         conditional_loss_counts["deal_in_tile"] += int(eligible_cells.sum())
         add_metric("dealInEligiblePositiveMean", deal_in_probability, positive_cells)
         add_metric("dealInEligibleNegativeMean", deal_in_probability, negative_cells)
+        conditional_wait_probability = outputs["deal_in_tile"].sigmoid()
+        add_metric(
+            "dealInEligibleConditionalPositiveMean",
+            conditional_wait_probability,
+            positive_cells,
+        )
+        add_metric(
+            "dealInEligibleConditionalNegativeMean",
+            conditional_wait_probability,
+            negative_cells,
+        )
         wait_nll = F.binary_cross_entropy_with_logits(
             outputs["deal_in_tile"], batch["deal_in_tile"].float(), reduction="none"
         )
-        add_metric("dealInEligiblePositiveNll", wait_nll, positive_cells)
-        add_metric("dealInEligibleNegativeNll", wait_nll, negative_cells)
+        add_metric("dealInEligibleConditionalPositiveNll", wait_nll, positive_cells)
+        add_metric("dealInEligibleConditionalNegativeNll", wait_nll, negative_cells)
         honor_cells = torch.zeros_like(eligible_cells)
         honor_cells[..., 27:] = True
         add_metric(

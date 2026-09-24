@@ -414,3 +414,6 @@ def test_validation_metrics_use_only_the_canonical_analysis_rows() -> None:
         metrics["deal_in_tile"]
     )
     assert metrics_with_empty_batch["metric/dealInEligibleCells"] == 34
+    assert "metric/dealInEligibleConditionalPositiveMean" in metrics
+    assert "metric/dealInEligibleConditionalNegativeMean" in metrics
+    assert "metric/dealInEligibleConditionalNegativeNll" in metrics

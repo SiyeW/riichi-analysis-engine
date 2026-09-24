@@ -50,8 +50,13 @@ def main() -> None:
     parser.add_argument("--semantic-transformer-tile-prior-blocks", type=int, default=0)
     parser.add_argument("--semantic-transformer-event-prior-blocks", type=int, default=0)
     parser.add_argument("--semantic-prior-version", type=int, choices=(1, 2), default=2)
+    parser.add_argument(
+        "--semantic-design-version", type=int, choices=(1, 2),
+        help="v13 architecture revision; defaults to 2 for new models",
+    )
     args = parser.parse_args()
     if args.model_format in {12, 13}:
+        design_version = args.semantic_design_version or (2 if args.model_format == 13 else 1)
         architecture = SemanticModelArchitecture(
             backbone=args.semantic_backbone,
             width=args.semantic_width,
@@ -65,6 +70,7 @@ def main() -> None:
             transformer_tile_prior_blocks=args.semantic_transformer_tile_prior_blocks,
             transformer_event_prior_blocks=args.semantic_transformer_event_prior_blocks,
             semantic_prior_version=args.semantic_prior_version,
+            semantic_design_version=design_version,
         )
     elif args.model_format >= 8:
         family_latent_width = args.family_latent_width or (
