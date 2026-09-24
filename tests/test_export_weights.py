@@ -159,6 +159,20 @@ def test_training_revision_uses_checkpoint_environment() -> None:
                 attention_heads=4,
             ),
         ),
+        (
+            13,
+            SemanticModelArchitecture(
+                backbone="cnn",
+                width=16,
+                stem_width=24,
+                event_width=12,
+                backbone_blocks=1,
+                event_blocks=1,
+                decoder_width=20,
+                attention_heads=4,
+                semantic_design_version=2,
+            ),
+        ),
     ],
 )
 def test_export_preserves_model_architecture(

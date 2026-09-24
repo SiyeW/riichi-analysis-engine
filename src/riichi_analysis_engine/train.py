@@ -373,6 +373,10 @@ def validate(
     metric_counts: dict[str, int] = {}
     deal_in_positive_histogram = np.zeros(1_000, dtype=np.int64)
     deal_in_negative_histogram = np.zeros(1_000, dtype=np.int64)
+    eligible_positive_histogram = np.zeros(1_000, dtype=np.int64)
+    eligible_negative_histogram = np.zeros(1_000, dtype=np.int64)
+    conditional_loss_sums = {"furiten_no_yaku": 0.0, "deal_in_tile": 0.0}
+    conditional_loss_counts = {"furiten_no_yaku": 0, "deal_in_tile": 0}
 
     def add_metric(
         name: str, values: torch.Tensor, mask: torch.Tensor | None = None
@@ -476,6 +480,52 @@ def validate(
         )
         deal_in_negative_histogram += (
             torch.bincount(deal_in_bins[~deal_in_target], minlength=1_000).cpu().numpy()
+        )
+        tenpai = batch["shanten"] == 0
+        eligible_wait = tenpai & ~batch["furiten_no_yaku"].bool()
+        eligible_cells = eligible_wait.unsqueeze(-1).expand_as(deal_in_target)
+        positive_cells = eligible_cells & deal_in_target
+        negative_cells = eligible_cells & ~deal_in_target
+        conditional_loss_sums["furiten_no_yaku"] += float(
+            F.binary_cross_entropy_with_logits(
+                outputs["furiten_no_yaku"][tenpai],
+                batch["furiten_no_yaku"][tenpai].float(),
+                reduction="sum",
+            )
+        )
+        conditional_loss_counts["furiten_no_yaku"] += int(tenpai.sum())
+        conditional_loss_sums["deal_in_tile"] += float(
+            F.binary_cross_entropy_with_logits(
+                outputs["deal_in_tile"][eligible_cells],
+                batch["deal_in_tile"][eligible_cells].float(),
+                reduction="sum",
+            )
+        )
+        conditional_loss_counts["deal_in_tile"] += int(eligible_cells.sum())
+        add_metric("dealInEligiblePositiveMean", deal_in_probability, positive_cells)
+        add_metric("dealInEligibleNegativeMean", deal_in_probability, negative_cells)
+        wait_nll = F.binary_cross_entropy_with_logits(
+            outputs["deal_in_tile"], batch["deal_in_tile"].float(), reduction="none"
+        )
+        add_metric("dealInEligiblePositiveNll", wait_nll, positive_cells)
+        add_metric("dealInEligibleNegativeNll", wait_nll, negative_cells)
+        honor_cells = torch.zeros_like(eligible_cells)
+        honor_cells[..., 27:] = True
+        add_metric(
+            "dealInHonorPositiveMean", deal_in_probability,
+            positive_cells & honor_cells,
+        )
+        add_metric(
+            "dealInHonorNegativeMean", deal_in_probability,
+            negative_cells & honor_cells,
+        )
+        eligible_positive_histogram += (
+            torch.bincount(deal_in_bins[positive_cells], minlength=1_000)
+            .cpu().numpy()
+        )
+        eligible_negative_histogram += (
+            torch.bincount(deal_in_bins[negative_cells], minlength=1_000)
+            .cpu().numpy()
         )
         if structured:
             _physical_counts, inventory, capacities = physical_hidden_counts(
@@ -666,6 +716,9 @@ def validate(
     if should_stop is not None and should_stop():
         raise TrainingInterrupted
     result = {name: value / max(1, batches) for name, value in totals.items()}
+    for name, count in conditional_loss_counts.items():
+        if name in result and count:
+            result[name] = conditional_loss_sums[name] / count
     nulls = {
         "policy": _label_entropy(policy_labels),
         "shanten": _label_entropy(shanten_labels),
@@ -690,6 +743,21 @@ def validate(
         result["metric/dealInAveragePrecisionApprox"] = float(
             np.sum(precision * recall_increment)
         )
+    eligible_positive_descending = eligible_positive_histogram[::-1].cumsum()
+    eligible_negative_descending = eligible_negative_histogram[::-1].cumsum()
+    eligible_positive_count = int(eligible_positive_histogram.sum())
+    if eligible_positive_count:
+        precision = eligible_positive_descending / np.maximum(
+            1, eligible_positive_descending + eligible_negative_descending
+        )
+        recall_increment = eligible_positive_histogram[::-1] / eligible_positive_count
+        result["metric/dealInEligibleAveragePrecisionApprox"] = float(
+            np.sum(precision * recall_increment)
+        )
+    result["metric/dealInEligibleCells"] = float(
+        conditional_loss_counts["deal_in_tile"]
+    )
+    result["metric/dealInEligiblePositiveCells"] = float(eligible_positive_count)
     result.update(
         {
             f"metric/{name}": metric_sums[name] / max(1, metric_counts[name])
@@ -1048,6 +1116,10 @@ def main() -> None:
     )
     parser.add_argument("--semantic-prior-version", type=int, choices=(1, 2), default=2)
     parser.add_argument(
+        "--semantic-design-version", type=int, choices=(1, 2),
+        help="v13 architecture revision; defaults to 2 for new runs",
+    )
+    parser.add_argument(
         "--analysis-channels", type=int, default=288, help=argparse.SUPPRESS
     )
     parser.add_argument(
@@ -1152,6 +1224,7 @@ def main() -> None:
     amp_dtype = torch.float16 if device.type == "cuda" else None
 
     if args.model_format in {12, 13}:
+        design_version = args.semantic_design_version or (2 if args.model_format == 13 else 1)
         architecture = SemanticModelArchitecture(
             backbone=args.semantic_backbone,
             width=args.semantic_width,
@@ -1165,6 +1238,7 @@ def main() -> None:
             transformer_tile_prior_blocks=args.semantic_transformer_tile_prior_blocks,
             transformer_event_prior_blocks=args.semantic_transformer_event_prior_blocks,
             semantic_prior_version=args.semantic_prior_version,
+            semantic_design_version=design_version,
         )
         available_loss_terms = LOSS_TERMS_V8
     elif args.model_format in {8, 9, 10, 11}:

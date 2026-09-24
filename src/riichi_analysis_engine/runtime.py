@@ -541,6 +541,8 @@ class AnalysisRuntime:
     ) -> tuple[dict[str, dict[str, Any]], float]:
         started = time.perf_counter()
         session = self._prepare_session(events, controlled_seat, session_id)
+        if session.terminal:
+            raise ValueError("terminal round events have no prediction frame")
         request_key = json.dumps(
             [protocol_minor, requested],
             ensure_ascii=False,
@@ -996,13 +998,18 @@ class AnalysisRuntime:
                     torch.from_numpy(selection_observation).unsqueeze(0).to(self.device)
                 )
                 with torch.inference_mode():
-                    selection_policy = (
-                        self.model.semantic_model.decode_policy(
+                    if semantic_state is not None and self.format_version == 13:
+                        # Rule facts enter the v13 readout queries. Replacing a
+                        # context vector after encoding is not equivalent.
+                        selection_policy = self.model.semantic_model(
+                            selection_tensor, *semantic_memory
+                        )["policy"]
+                    elif semantic_state is not None:
+                        selection_policy = self.model.semantic_model.decode_policy(
                             semantic_state, selection_tensor
                         )
-                        if semantic_state is not None
-                        else self.model(selection_tensor)["policy"]
-                    )
+                    else:
+                        selection_policy = self.model(selection_tensor)["policy"]
                     kan_selection_logits = selection_policy[0].float().cpu().numpy()
             values = complete_candidate_policy(
                 outputs["policy"].numpy(),

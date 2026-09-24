@@ -151,6 +151,46 @@ def test_v13_wait_head_has_no_direct_same_tile_shortcut() -> None:
     assert torch.equal(first_wait, second_wait)
 
 
+def test_v13_design_two_restores_tile_wait_path_and_direct_rule_context() -> None:
+    torch.manual_seed(19)
+    architecture = SemanticModelArchitecture(
+        **{**_architecture("cnn").to_dict(), "semantic_design_version": 2}
+    )
+    model = RiichiAnalysisModel(format_version=13, architecture=architecture).eval()
+    _, events, mask = _inputs()
+    observation = torch.zeros(2, SHARED_MODEL_INPUT_CHANNELS, TILE_TYPES)
+    encoded = model.semantic_model.encode(observation, events, mask)
+    torch.testing.assert_close(
+        encoded.global_state - encoded.decision_context,
+        model.semantic_model.backbone(
+            *model.semantic_model.input(observation, events, mask)[:2],
+            mask,
+            encoded.decision_context,
+        )[2],
+    )
+    changed_tiles = SemanticState(
+        tiles=encoded.tiles.clone(), players=encoded.players,
+        global_state=encoded.global_state,
+        decision_context=encoded.decision_context,
+    )
+    changed_tiles.tiles[:, 31] += 2
+    original_wait = model.semantic_model.decode(encoded)["deal_in_tile"]
+    changed_wait = model.semantic_model.decode(changed_tiles)["deal_in_tile"]
+    assert not torch.equal(original_wait, changed_wait)
+    sum(value.float().sum() for value in model(observation, events, mask).values()).backward()
+    assert model.semantic_model.decoder.wait.right.weight.grad is not None
+    assert model.semantic_model.input.rule_global[0].weight.grad is not None
+
+
+def test_legacy_v13_architecture_metadata_keeps_original_wait_head() -> None:
+    old = _architecture("cnn").to_dict()
+    old.pop("semantic_design_version")
+    restored = SemanticModelArchitecture.from_dict(old)
+    assert restored.semantic_design_version == 1
+    model = RiichiAnalysisModel(format_version=13, architecture=restored)
+    assert "semantic_model.decoder.wait.output.2.weight" in model.state_dict()
+
+
 def test_v12_rejects_missing_event_memory() -> None:
     model = RiichiAnalysisModel(format_version=12, architecture=_architecture("cnn"))
     observation, _events, _mask = _inputs()
@@ -311,3 +351,15 @@ def test_policy_context_can_change_without_recomputing_semantic_state() -> None:
     full = model(selection_observation, events[0:1], mask[0:1])["policy"]
 
     torch.testing.assert_close(reused, full)
+
+
+def test_v13_policy_context_cannot_use_v12_fast_substitution() -> None:
+    model = RiichiAnalysisModel(
+        format_version=13, architecture=_architecture("cnn")
+    ).eval()
+    _, events, mask = _inputs()
+    observation = torch.zeros(2, SHARED_MODEL_INPUT_CHANNELS, TILE_TYPES)
+    state = model.semantic_model.encode(observation, events, mask)
+
+    with pytest.raises(ValueError, match="exact re-encoding"):
+        model.semantic_model.decode_policy(state, observation)

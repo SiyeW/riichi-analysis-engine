@@ -520,9 +520,10 @@ class StructuredSemanticDecoder(nn.Module):
         self.furiten = nn.Sequential(
             nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, 1)
         )
+        self.joint_wait = shared_rule_context and architecture.semantic_design_version == 1
         self.wait: PairwiseLogits | JointOpponentWaitHead = (
             JointOpponentWaitHead(width, hidden)
-            if shared_rule_context
+            if self.joint_wait
             else PairwiseLogits(width, hidden)
         )
         if shared_rule_context:
@@ -562,7 +563,7 @@ class StructuredSemanticDecoder(nn.Module):
             "furiten_no_yaku": self.furiten(opponents).squeeze(-1),
             "deal_in_tile": (
                 self.wait(opponents, state.global_state)
-                if self.shared_rule_context
+                if self.joint_wait
                 else self.wait(opponents, base_tiles)
             ),
             "dora_distribution": self.dora(opponents),
@@ -607,6 +608,9 @@ class SemanticRiichiModel(nn.Module):
         super().__init__()
         self.architecture = architecture
         self.shared_rule_context = shared_rule_context
+        self.direct_rule_context = (
+            shared_rule_context and architecture.semantic_design_version >= 2
+        )
         self.input = SemanticInputStem(
             architecture, shared_rule_context=shared_rule_context
         )
@@ -634,6 +638,11 @@ class SemanticRiichiModel(nn.Module):
             event_mask,
             context if self.shared_rule_context else None,
         )
+        if self.direct_rule_context:
+            # The original v13 CNN only put this context in attention queries;
+            # it had no guaranteed path into the resulting entity values.
+            players = players + context.unsqueeze(1)
+            global_state = global_state + context
         return SemanticState(
             tiles=tiles,
             players=players,
@@ -646,11 +655,7 @@ class SemanticRiichiModel(nn.Module):
 
     def decode_policy(self, state: SemanticState, observation: Tensor) -> Tensor:
         if self.shared_rule_context:
-            current = state.decision_context
-            if current is None:
-                raise RuntimeError("shared rule context is missing from semantic state")
-            updated = self.input.encode_rule_context(observation)
-            return self.decoder.policy(state.global_state - current + updated, None)
+            raise ValueError("v13 policy context changes require exact re-encoding")
         return self.decoder.policy(
             state.global_state,
             self.input.encode_policy_context(observation),

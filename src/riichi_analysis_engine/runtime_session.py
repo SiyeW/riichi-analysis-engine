@@ -41,6 +41,7 @@ class RuntimeSession:
     frame: dict[str, Any] | None = None
     event_reference: tuple[int, int] | None = None
     start_kyoku: dict[str, Any] | None = None
+    terminal: bool = False
     rule_state: PublicRuleState = field(default_factory=PublicRuleState)
     result_cache: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
 
@@ -52,15 +53,20 @@ class RuntimeSession:
         )
 
     def append(self, event: dict[str, Any], event_key: str) -> None:
+        event_type = event.get("type")
+        if event_type == "start_kyoku":
+            self.terminal = False
+        elif event_type in {"hora", "ryukyoku", "end_kyoku"}:
+            self.terminal = True
         self.player_state.update(event_key)
         self.score_state.process(event)
         self.public_state.process(event)
         self.rule_state.process(event)
-        if event.get("type") in FRAME_EVENTS:
+        if event_type in FRAME_EVENTS:
             self.tile_encoder.advance(event, self.public_state)
             self.event_reference = self.event_encoder.advance(event)
             self.frame = event
-        if event.get("type") == "start_kyoku":
+        if event_type == "start_kyoku":
             self.start_kyoku = event
         self.event_keys.append(event_key)
 

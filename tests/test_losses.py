@@ -397,3 +397,20 @@ def test_validation_metrics_use_only_the_canonical_analysis_rows() -> None:
     )
 
     assert metrics["metric/shantenNll"] == pytest.approx(float(expected))
+
+    inactive_batch = {
+        name: value[1:2]
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and len(value) == 2
+        else value
+        for name, value in batch.items()
+    }
+    metrics_with_empty_batch = validate(
+        model,
+        LearnedUncertaintyBalancer(LOSS_TERMS_V8),
+        [batch, inactive_batch],
+        torch.device("cpu"),
+    )
+    assert metrics_with_empty_batch["deal_in_tile"] == pytest.approx(
+        metrics["deal_in_tile"]
+    )
+    assert metrics_with_empty_batch["metric/dealInEligibleCells"] == 34

@@ -373,6 +373,8 @@ class RiichiAnalysisModel(nn.Module):
                 raise TypeError(
                     "semantic model formats require SemanticModelArchitecture"
                 )
+            if format_version == 12 and configured.semantic_design_version != 1:
+                raise ValueError("v12 requires semantic design version 1")
             self.architecture = configured
             self.semantic_model = SemanticRiichiModel(
                 configured, shared_rule_context=format_version == 13

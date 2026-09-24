@@ -148,6 +148,35 @@ def test_runtime_sessions_are_independent_and_clearable() -> None:
     assert runtime._sessions["right"] is right
 
 
+def test_terminal_round_cannot_be_predicted_and_next_round_reopens() -> None:
+    class FakePlayerState:
+        def __init__(self, player_id: int) -> None:
+            self.player_id = player_id
+
+        def update(self, _event: str) -> SimpleNamespace:
+            return SimpleNamespace()
+
+    runtime = AnalysisRuntime.__new__(AnalysisRuntime)
+    runtime.player_state_type = FakePlayerState
+    runtime._sessions = {}
+    start = _start_kyoku_event()
+    finished = runtime._prepare_session(
+        [start, {"type": "hora", "actor": 0, "target": 0, "pai": "4s"}],
+        0, "game",
+    )
+    assert finished.terminal
+    with pytest.raises(ValueError, match="terminal round"):
+        runtime.predict(
+            [start, {"type": "hora", "actor": 0, "target": 0, "pai": "4s"}],
+            0, [], session_id="game",
+        )
+    next_round = runtime._prepare_session(
+        [start, {"type": "hora", "actor": 0, "target": 0, "pai": "4s"}, start],
+        0, "game",
+    )
+    assert not next_round.terminal
+
+
 def test_candidate_action_mapping() -> None:
     assert candidate_action_index({"type": "dahai", "pai": "5mr"}) == 34
     assert candidate_action_index({"type": "reach"}) == 37
