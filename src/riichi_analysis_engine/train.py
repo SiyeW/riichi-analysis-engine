@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -310,6 +311,7 @@ def resume_training_cursor(
     batch_size: int,
     *,
     allow_complete: bool = False,
+    allow_batch_size_transition: bool = False,
 ) -> tuple[int, int]:
     """Validate and return the next unread sample and completed update count."""
 
@@ -324,7 +326,10 @@ def resume_training_cursor(
         raise RuntimeError("resume checkpoint has an invalid pass-complete marker")
     if complete and not allow_complete:
         raise RuntimeError("resume checkpoint has already completed its training pass")
-    if int(cursor.get("batchSize", -1)) != batch_size:
+    saved_batch_size = int(cursor.get("batchSize", -1))
+    if saved_batch_size <= 0:
+        raise RuntimeError("resume checkpoint has an invalid training batch size")
+    if saved_batch_size != batch_size and not allow_batch_size_transition:
         raise RuntimeError("resume checkpoint uses a different training batch size")
 
     saved_datasets = checkpoint.get("datasets")
@@ -1011,6 +1016,7 @@ def save_checkpoint(
     validation: dict[str, float] | None,
     learning_rate_schedule: dict[str, object] | None = None,
     resume_allowed: bool = True,
+    batch_size_phases: list[dict[str, int]] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -1026,6 +1032,11 @@ def save_checkpoint(
                 "batchesConsumed": step,
                 "batchSize": batch_size,
                 "complete": pass_complete,
+                **(
+                    {"batchSizePhases": batch_size_phases}
+                    if batch_size_phases is not None
+                    else {}
+                ),
             },
             "model": model.state_dict(),
             "modelArchitecture": architecture.to_dict(),
@@ -1187,6 +1198,11 @@ def main() -> None:
     parser.add_argument("--keep-checkpoints", type=int, default=3)
     parser.add_argument("--resume", type=Path)
     parser.add_argument(
+        "--allow-batch-size-transition",
+        action="store_true",
+        help="explicitly continue a single pass with a new batch size",
+    )
+    parser.add_argument(
         "--validate-only",
         action="store_true",
         help="validate a saved checkpoint without consuming more training samples",
@@ -1202,6 +1218,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_steps < 0:
         raise ValueError("max steps must be non-negative")
+    if args.allow_batch_size_transition and args.resume is None:
+        raise ValueError("batch-size transition requires --resume")
     if args.loader_prefetch <= 0:
         raise ValueError("loader prefetch must be positive")
     if args.max_analysis_samples < 0:
@@ -1334,6 +1352,7 @@ def main() -> None:
         "workers": args.loader_workers,
         "prefetchBatches": args.loader_prefetch if args.loader_workers else 0,
     }
+    batch_size_phases = [{"startSample": 0, "batchSize": args.batch_size}]
     if args.resume is not None:
         resume_path = resolve_resume_path(args.resume)
         print(json.dumps({"resumedFrom": str(resume_path)}))
@@ -1384,7 +1403,41 @@ def main() -> None:
             datasets,
             args.batch_size,
             allow_complete=args.validate_only,
+            allow_batch_size_transition=args.allow_batch_size_transition,
         )
+        saved_cursor = checkpoint["trainingCursor"]
+        saved_batch_size = int(saved_cursor["batchSize"])
+        saved_phases = saved_cursor.get("batchSizePhases")
+        if saved_phases is None:
+            batch_size_phases = [
+                {"startSample": 0, "batchSize": saved_batch_size}
+            ]
+        elif (
+            not isinstance(saved_phases, list)
+            or not saved_phases
+            or any(
+                not isinstance(phase, dict)
+                or not isinstance(phase.get("startSample"), int)
+                or not isinstance(phase.get("batchSize"), int)
+                or phase["batchSize"] <= 0
+                or phase["startSample"] < 0
+                or phase["startSample"] >= samples_seen
+                for phase in saved_phases
+            )
+            or saved_phases[0]["startSample"] != 0
+            or saved_phases[-1]["batchSize"] != saved_batch_size
+            or any(
+                left["startSample"] >= right["startSample"]
+                for left, right in pairwise(saved_phases)
+            )
+        ):
+            raise RuntimeError("resume checkpoint has invalid batch-size phases")
+        else:
+            batch_size_phases = [dict(phase) for phase in saved_phases]
+        if args.batch_size != saved_batch_size:
+            batch_size_phases.append(
+                {"startSample": samples_seen, "batchSize": args.batch_size}
+            )
         analysis_samples_seen = int(
             checkpoint.get(
                 "analysisSamplesSeen",
@@ -1542,6 +1595,7 @@ def main() -> None:
             "sampleLimit": sample_limit,
             "analysisSamplesSeen": analysis_samples_seen,
             "analysisSampleLimit": args.max_analysis_samples or None,
+            "batchSizePhases": batch_size_phases,
         },
         "environment": environment,
         "trainingContract": training_contract,
@@ -1585,6 +1639,7 @@ def main() -> None:
             environment=environment,
             validation=validation,
             learning_rate_schedule=learning_rate_schedule,
+            batch_size_phases=batch_size_phases,
             resume_allowed=(
                 True
                 if args.resume is None

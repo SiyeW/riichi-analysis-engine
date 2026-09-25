@@ -43,6 +43,8 @@ def run_training(
     max_analysis_samples: int = 0,
     tail_decay_samples: int = 0,
     tail_learning_rate_factor: float = 0.1,
+    batch_size: int = 8,
+    allow_batch_size_transition: bool = False,
 ) -> Path:
     arguments = [
         "riichi-analysis-train",
@@ -53,7 +55,7 @@ def run_training(
         "--run",
         str(run),
         "--batch-size",
-        "8",
+        str(batch_size),
         "--max-train-samples",
         str(max_samples),
         "--max-analysis-samples",
@@ -103,6 +105,8 @@ def run_training(
     ]
     if resume is not None:
         arguments.extend(["--resume", str(resume)])
+    if allow_batch_size_transition:
+        arguments.append("--allow-batch-size-transition")
     if validate_only:
         arguments.append("--validate-only")
     monkeypatch.setattr(sys, "argv", arguments)
@@ -217,6 +221,7 @@ def test_training_resumes_forward_and_completes_one_pass(
         "nextSample": 13,
         "batchesConsumed": 2,
         "batchSize": 8,
+        "batchSizePhases": [{"startSample": 0, "batchSize": 8}],
         "complete": False,
     }
 
@@ -226,6 +231,7 @@ def test_training_resumes_forward_and_completes_one_pass(
         "nextSample": 29,
         "batchesConsumed": 4,
         "batchSize": 8,
+        "batchSizePhases": [{"startSample": 0, "batchSize": 8}],
         "complete": False,
     }
 
@@ -235,11 +241,63 @@ def test_training_resumes_forward_and_completes_one_pass(
         "nextSample": 128,
         "batchesConsumed": 17,
         "batchSize": 8,
+        "batchSizePhases": [{"startSample": 0, "batchSize": 8}],
         "complete": True,
     }
 
     with pytest.raises(RuntimeError, match="already completed"):
         run_training(monkeypatch, packs, run, max_samples=0, resume=complete)
+
+
+def test_explicit_batch_size_transition_keeps_exact_single_pass_cursor(
+    scratch: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packs = pack_directory(scratch, training_targets=True)
+    first = run_training(monkeypatch, packs, scratch / "before", max_samples=13)
+
+    with pytest.raises(RuntimeError, match="different training batch size"):
+        run_training(
+            monkeypatch,
+            packs,
+            scratch / "rejected",
+            max_samples=29,
+            resume=first,
+            batch_size=16,
+        )
+
+    second = run_training(
+        monkeypatch,
+        packs,
+        scratch / "after",
+        max_samples=29,
+        resume=first,
+        batch_size=16,
+        allow_batch_size_transition=True,
+    )
+    assert load_cursor(second) == {
+        "type": "single-pass-v1",
+        "nextSample": 29,
+        "batchesConsumed": 3,
+        "batchSize": 16,
+        "batchSizePhases": [
+            {"startSample": 0, "batchSize": 8},
+            {"startSample": 13, "batchSize": 16},
+        ],
+        "complete": False,
+    }
+
+    complete = run_training(
+        monkeypatch,
+        packs,
+        scratch / "finish",
+        max_samples=0,
+        resume=second,
+        batch_size=16,
+    )
+    assert load_cursor(complete)["nextSample"] == 128
+    assert load_cursor(complete)["batchSizePhases"] == load_cursor(second)[
+        "batchSizePhases"
+    ]
 
 
 def test_training_checkpoint_is_durable_before_validation(
@@ -347,6 +405,7 @@ def test_interrupt_saves_the_next_unread_sample_and_can_resume(
         "nextSample": 8,
         "batchesConsumed": 1,
         "batchSize": 8,
+        "batchSizePhases": [{"startSample": 0, "batchSize": 8}],
         "complete": False,
     }
 

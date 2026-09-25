@@ -126,6 +126,19 @@ def test_resume_cursor_requires_the_same_manifests_and_exact_counters() -> None:
 
     assert resume_training_cursor(checkpoint, datasets, 8) == (13, 2)
 
+    with pytest.raises(RuntimeError, match="different training batch size"):
+        resume_training_cursor(checkpoint, datasets, 16)
+    assert resume_training_cursor(
+        checkpoint, datasets, 16, allow_batch_size_transition=True
+    ) == (13, 2)
+
+    checkpoint["trainingCursor"]["batchSize"] = -1
+    with pytest.raises(RuntimeError, match="invalid training batch size"):
+        resume_training_cursor(
+            checkpoint, datasets, 16, allow_batch_size_transition=True
+        )
+    checkpoint["trainingCursor"]["batchSize"] = 8
+
     changed = {**datasets, "train": {"manifestSha256": "train-b"}}
     with pytest.raises(RuntimeError, match="different train manifest"):
         resume_training_cursor(checkpoint, changed, 8)
