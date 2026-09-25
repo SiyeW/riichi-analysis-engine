@@ -829,6 +829,76 @@ def tail_learning_rate_factor(
     return 1.0 + (final_factor - 1.0) * progress
 
 
+def resolve_learning_rate_schedule(
+    requested: dict[str, object],
+    saved: dict[str, object] | None,
+    *,
+    next_sample: int,
+    allow_transition: bool,
+    validate_only: bool,
+) -> dict[str, object]:
+    """Keep a single-pass rate change explicit and tied to its exact cursor."""
+
+    if saved is None:
+        if allow_transition:
+            raise RuntimeError("learning-rate transition requires a saved schedule")
+        return requested
+    if validate_only:
+        return saved
+    if not allow_transition:
+        if saved != requested:
+            # A phased checkpoint can be resumed without spelling out its
+            # history again, provided the active rates and tail still match.
+            phases = saved.get("learningRatePhases")
+            if not isinstance(phases, list) or not phases:
+                raise RuntimeError("resume checkpoint uses a different learning-rate schedule")
+            comparison = dict(saved)
+            comparison.pop("learningRatePhases")
+            if comparison != requested:
+                raise RuntimeError("resume checkpoint uses a different learning-rate schedule")
+        return saved
+    if next_sample <= 0:
+        raise RuntimeError("learning-rate transition requires a positive exact cursor")
+    if requested["warmupSteps"] or requested["cooldownSteps"]:
+        raise RuntimeError("learning-rate transition requires a plateau schedule")
+    old = dict(saved)
+    phases = old.pop("learningRatePhases", None)
+    if phases is None:
+        phases = [{"startSample": 0, "learningRate": old["learningRate"]}]
+    if (
+        not isinstance(phases, list)
+        or not phases
+        or any(
+            not isinstance(phase, dict)
+            or not isinstance(phase.get("startSample"), int)
+            or not isinstance(phase.get("learningRate"), (float, int))
+            or phase["learningRate"] <= 0
+            or phase["startSample"] >= next_sample
+            for phase in phases
+        )
+        or phases[0]["startSample"] != 0
+        or phases[-1]["learningRate"] != old["learningRate"]
+        or any(
+            left["startSample"] >= right["startSample"]
+            for left, right in pairwise(phases)
+        )
+    ):
+        raise RuntimeError("resume checkpoint has invalid learning-rate phases")
+    old["learningRate"] = requested["learningRate"]
+    old["peakLearningRate"] = requested["peakLearningRate"]
+    if old != requested:
+        raise RuntimeError("learning-rate transition changed another schedule field")
+    if requested["learningRate"] == saved["learningRate"]:
+        raise RuntimeError("learning-rate transition did not change the rate")
+    return {
+        **requested,
+        "learningRatePhases": [
+            *phases,
+            {"startSample": next_sample, "learningRate": requested["learningRate"]},
+        ],
+    }
+
+
 def _label_entropy(counts: np.ndarray) -> float:
     """Entropy in nats of a label distribution, the score of a null predictor."""
 
@@ -1203,6 +1273,11 @@ def main() -> None:
         help="explicitly continue a single pass with a new batch size",
     )
     parser.add_argument(
+        "--allow-learning-rate-transition",
+        action="store_true",
+        help="explicitly change the model learning rate at the exact resume cursor",
+    )
+    parser.add_argument(
         "--validate-only",
         action="store_true",
         help="validate a saved checkpoint without consuming more training samples",
@@ -1220,6 +1295,8 @@ def main() -> None:
         raise ValueError("max steps must be non-negative")
     if args.allow_batch_size_transition and args.resume is None:
         raise ValueError("batch-size transition requires --resume")
+    if args.allow_learning_rate_transition and args.resume is None:
+        raise ValueError("learning-rate transition requires --resume")
     if args.loader_prefetch <= 0:
         raise ValueError("loader prefetch must be positive")
     if args.max_analysis_samples < 0:
@@ -1496,12 +1573,13 @@ def main() -> None:
         learning_rate_schedule["sampleLimit"] = sample_limit
     if args.resume is not None:
         saved_schedule = checkpoint.get("learningRateSchedule")
-        if args.validate_only and isinstance(saved_schedule, dict):
-            learning_rate_schedule = saved_schedule
-        elif saved_schedule is not None and saved_schedule != learning_rate_schedule:
-            raise RuntimeError(
-                "resume checkpoint uses a different learning-rate schedule"
-            )
+        learning_rate_schedule = resolve_learning_rate_schedule(
+            learning_rate_schedule,
+            saved_schedule,
+            next_sample=samples_seen,
+            allow_transition=args.allow_learning_rate_transition,
+            validate_only=args.validate_only,
+        )
         if (
             not args.validate_only
             and saved_schedule is None
