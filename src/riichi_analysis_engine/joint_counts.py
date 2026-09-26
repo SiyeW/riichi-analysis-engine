@@ -120,29 +120,27 @@ def project_joint_counts(
     ).masked_fill(baseline == 0, -torch.inf)
     total, red = _values(logits)
     column_target, red_target = family_inventory(inventory.float())
+    source_target = capacities.float()
     row_bias = logits.new_zeros((len(logits), 4, 1, 1))
     column_bias = logits.new_zeros((len(logits), 1, 34, 1))
     red_bias = torch.zeros_like(column_bias)
 
-    def moments() -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        p = (logits + total * (row_bias + column_bias) + red * red_bias).softmax(-1)
-        mt = (p * total).sum(-1)
-        mr = (p * red).sum(-1)
-        dt, dr = total - mt.unsqueeze(-1), red - mr.unsqueeze(-1)
-        return (
-            p,
-            mt,
-            mr,
-            (p * dt.square()).sum(-1),
-            (p * dr.square()).sum(-1),
-            (p * dt * dr).sum(-1),
-        )
+    def probability() -> Tensor:
+        return (logits + total * (row_bias + column_bias) + red * red_bias).softmax(-1)
 
     for _ in range(iterations):
-        _, mt, _, vt, _, _ = moments()
-        delta = (capacities.float() - mt.sum(-1)) / vt.sum(-1).clamp_min(1e-4)
+        # The source update only needs total-count moments. Computing red
+        # variance/covariance here creates unused GPU work on every iteration.
+        p = probability()
+        mt = (p * total).sum(-1)
+        vt = (p * (total - mt.unsqueeze(-1)).square()).sum(-1)
+        delta = (source_target - mt.sum(-1)) / vt.sum(-1).clamp_min(1e-4)
         row_bias = row_bias + delta.clamp(-1, 1)[:, :, None, None]
-        _, mt, mr, vt, vr, cov = moments()
+        p = probability()
+        mt, mr = (p * total).sum(-1), (p * red).sum(-1)
+        dt, dr = total - mt.unsqueeze(-1), red - mr.unsqueeze(-1)
+        vt, vr = (p * dt.square()).sum(-1), (p * dr.square()).sum(-1)
+        cov = (p * dt * dr).sum(-1)
         # Joint 2x2 Newton update retains total/red covariance. A small ridge
         # handles deterministic or absent-red columns without a singular solve.
         a, d, b = vt.sum(1) + 1e-4, vr.sum(1) + 1e-4, cov.sum(1)
@@ -151,4 +149,4 @@ def project_joint_counts(
         dt, dr = (d * et - b * er) / determinant, (a * er - b * et) / determinant
         column_bias = column_bias + dt.clamp(-1, 1)[:, None, :, None]
         red_bias = red_bias + dr.clamp(-1, 1)[:, None, :, None]
-    return JointCountPrediction(moments()[0], baseline)
+    return JointCountPrediction(probability(), baseline)

@@ -90,11 +90,25 @@ def gradient_total_norm(parameters: list[torch.nn.Parameter]) -> float:
 def gradients_are_finite(parameters: list[torch.nn.Parameter]) -> bool:
     """Return whether every materialized gradient can be applied safely."""
 
-    return all(
-        bool(torch.isfinite(parameter.grad).all())
+    finite = [
+        torch.isfinite(parameter.grad).all()
         for parameter in parameters
         if parameter.grad is not None
-    )
+    ]
+    # Keep reductions on the training device: a Python bool per parameter would
+    # synchronize the CUDA stream hundreds of times on every optimizer step.
+    return not finite or bool(torch.stack(finite).all())
+
+
+def gradient_max_abs(parameters: list[torch.nn.Parameter]) -> float:
+    """Measure the largest unscaled gradient with one device-to-host read."""
+
+    maxima = [
+        parameter.grad.detach().abs().max()
+        for parameter in parameters
+        if parameter.grad is not None and parameter.grad.numel()
+    ]
+    return float(torch.stack(maxima).max()) if maxima else 0.0
 
 
 def shared_gradient_geometry(
@@ -1818,12 +1832,12 @@ def main() -> None:
                 raise
             scaler.unscale_(optimizer)
             if gradients_are_finite(trainable_parameters):
-                gradient_norm = gradient_total_norm(trainable_parameters)
-                gradient_max = max(
-                    float(parameter.grad.abs().max())
-                    for parameter in trainable_parameters
-                    if parameter.grad is not None
-                )
+                # Finiteness is a safety check on EVERY step. Norm/max are
+                # telemetry only; compute them precisely when they are logged,
+                # before the optimizer, without changing or clipping gradients.
+                if step == 0 or (step + 1) % 100 == 0 or gradient_geometry:
+                    gradient_norm = gradient_total_norm(trainable_parameters)
+                    gradient_max = gradient_max_abs(trainable_parameters)
                 scaler.step(optimizer)
                 scaler.update()
                 break
