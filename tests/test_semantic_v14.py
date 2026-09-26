@@ -19,7 +19,18 @@ from riichi_analysis_engine.losses import (
 )
 from riichi_analysis_engine.model import RiichiAnalysisModel
 from riichi_analysis_engine.model_input import SHARED_MODEL_INPUT_CHANNELS
-from riichi_analysis_engine.semantic_input import EVENT_FIELDS
+from riichi_analysis_engine.semantic_input import (
+    EVENT_ACTOR,
+    EVENT_CONSUMED_START,
+    EVENT_FIELDS,
+    EVENT_FLAGS,
+    EVENT_TARGET,
+    EVENT_TILE,
+    EVENT_TYPE,
+    MAX_EVENT_CONSUMED,
+    encode_public_event,
+)
+from riichi_analysis_engine.semantic_model import SemanticInputStem
 from riichi_analysis_engine.semantic_v14 import HIDDEN_SOURCE_ROLES, V14Decoder
 from riichi_analysis_engine.train import forward_batch, validate
 from riichi_analysis_engine.training_schema import validate_semantic_training_batch
@@ -53,6 +64,103 @@ def inputs():
     events = torch.zeros(2, 4, EVENT_FIELDS, dtype=torch.uint8)
     mask = torch.tensor([[True, True, True, True], [True, True, False, False]])
     return observation, events, mask
+
+
+@pytest.mark.parametrize(
+    ("kind", "main_a", "hand_a", "main_b", "hand_b"),
+    [
+        ("chi", "3m", ["1m", "2m"], "1m", ["2m", "3m"]),
+        ("pon", "5mr", ["5m", "5m"], "5m", ["5mr", "5m"]),
+    ],
+)
+def test_event_tile_roles_do_not_collapse(kind, main_a, hand_a, main_b, hand_b):
+    torch.manual_seed(9)
+    stem = RiichiAnalysisModel(
+        format_version=14, architecture=architecture()
+    ).semantic_model.input
+    tokens = torch.tensor(
+        [
+            encode_public_event(
+                {
+                    "type": kind,
+                    "actor": 1,
+                    "target": 0,
+                    "pai": main_a,
+                    "consumed": hand_a,
+                }
+            ).tolist(),
+            encode_public_event(
+                {
+                    "type": kind,
+                    "actor": 1,
+                    "target": 0,
+                    "pai": main_b,
+                    "consumed": hand_b,
+                }
+            ).tolist(),
+        ]
+    )
+    encoded = stem.encode_events(tokens)
+    assert not torch.allclose(encoded[0], encoded[1], atol=1e-5, rtol=1e-5)
+    encoded.square().mean().backward()
+    assert stem.event_tile_fusion.weight.grad.abs().sum() > 0
+
+
+def test_consumed_tiles_are_a_multiset_not_an_ordered_or_padded_sequence():
+    torch.manual_seed(41)
+    stem = RiichiAnalysisModel(
+        format_version=14, architecture=architecture()
+    ).semantic_model.input
+    tokens = torch.tensor(
+        encode_public_event(
+            {
+                "type": "pon",
+                "actor": 1,
+                "target": 0,
+                "pai": "5m",
+                "consumed": ["5mr", "5m"],
+            }
+        ).tolist()
+    )[None]
+    reordered = tokens.clone()
+    reordered[:, 4:8] = tokens[:, [7, 5, 6, 4]]
+    torch.testing.assert_close(
+        stem.encode_events(tokens), stem.encode_events(reordered)
+    )
+    removed = tokens.clone()
+    removed[:, 5] = 0
+    assert not torch.allclose(stem.encode_events(tokens), stem.encode_events(removed))
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_legacy_event_encoding_remains_exact(shared):
+    torch.manual_seed(37)
+    stem = SemanticInputStem(architecture(), shared_rule_context=shared)
+    tokens = torch.tensor(
+        encode_public_event(
+            {
+                "type": "chi",
+                "actor": 1,
+                "target": 0,
+                "pai": "3m",
+                "consumed": ["1m", "2m"],
+            }
+        ).tolist()
+    )[None]
+    expected = (
+        stem.event_type(tokens[..., EVENT_TYPE])
+        + stem.event_actor(tokens[..., EVENT_ACTOR])
+        + stem.event_target(tokens[..., EVENT_TARGET])
+        + stem.event_tile(tokens[..., EVENT_TILE])
+        + stem.event_flags(tokens[..., EVENT_FLAGS])
+    )
+    for offset in range(MAX_EVENT_CONSUMED):
+        expected = expected + stem.event_tile(
+            tokens[..., EVENT_CONSUMED_START + offset]
+        )
+    expected = stem.event_output(expected)
+    assert torch.equal(stem.encode_events(tokens), expected)
+    assert not any("event_tile_fusion" in name for name in stem.state_dict())
 
 
 def test_joint_baseline_matches_total_five_hypergeometric_exactly():
@@ -107,20 +215,21 @@ def test_empty_inventory_is_deterministic_zero():
     assert (p.probability[..., 0] == 1).all()
 
 
-@pytest.mark.parametrize("backbone", ["cnn", "transformer"])
-def test_v14_reads_history_into_tiles_and_refines_task_queries(backbone):
+def test_v14_encodes_modalities_once_and_fuses_at_common_readout():
     torch.manual_seed(23)
-    model = RiichiAnalysisModel(
-        format_version=14, architecture=architecture(backbone)
-    ).eval()
+    model = RiichiAnalysisModel(format_version=14, architecture=architecture()).eval()
     observation, events, mask = inputs()
     semantic = model.semantic_model
     state = semantic.encode(observation, events, mask)
     changed = events.clone()
     changed[:, 1, 0] = 2
     state2 = semantic.encode(observation, changed, mask)
-    assert not torch.allclose(state.tiles, state2.tiles)
-    assert not torch.allclose(state.players, state2.players)
+    torch.testing.assert_close(state.tiles, state2.tiles)
+    torch.testing.assert_close(state.players, state2.players)
+    assert not torch.allclose(state.events, state2.events)
+    assert not torch.allclose(
+        semantic.decode(state)["shanten"], semantic.decode(state2)["shanten"]
+    )
     outputs = semantic.decode(state)
     assert outputs["hidden_joint_residual"].shape == (2, 4, 34, 10)
     assert torch.count_nonzero(outputs["hidden_joint_residual"]) == 0
@@ -138,6 +247,17 @@ def test_v14_reads_history_into_tiles_and_refines_task_queries(backbone):
         torch.testing.assert_close(alone[key][0], outputs[key][1], atol=2e-6, rtol=2e-5)
     with pytest.raises(ValueError, match="exact re-encoding"):
         semantic.decode_policy(state, observation)
+
+
+def test_v14_does_not_silently_reintroduce_a_transformer_backbone():
+    with pytest.raises(ValueError, match="only the reviewed CNN"):
+        RiichiAnalysisModel(format_version=14, architecture=architecture("transformer"))
+    model = RiichiAnalysisModel(format_version=14, architecture=architecture())
+    assert not any(
+        isinstance(m, torch.nn.MultiheadAttention)
+        for m in model.semantic_model.backbone.modules()
+    )
+    assert sum(isinstance(m, torch.nn.MultiheadAttention) for m in model.modules()) == 1
 
 
 def test_hidden_sources_reuse_correct_opponents_and_separate_wall():
@@ -168,7 +288,11 @@ def test_every_output_directly_reads_event_memory_without_backbone_help(name):
         torch.nn.init.normal_(decoder.outputs[name].weight, std=0.01)
     with torch.no_grad():
         state = model.semantic_model.encode(*inputs())
-    state = replace(state, events=state.events.detach().requires_grad_())
+    state = replace(
+        state,
+        tiles=state.tiles.detach().requires_grad_(),
+        events=state.events.detach().requires_grad_(),
+    )
     calls = []
     handle = decoder.task_attention.register_forward_pre_hook(
         lambda _module, args: calls.append(args[0].shape)
@@ -178,6 +302,8 @@ def test_every_output_directly_reads_event_memory_without_backbone_help(name):
     handle.remove()
     assert calls == [torch.Size([2, 300, architecture().width])]
     assert torch.isfinite(state.events.grad).all()
+    assert torch.isfinite(state.tiles.grad).all()
+    assert state.tiles.grad.abs().sum() > 0
     assert state.events.grad[:, :2].abs().sum() > 0
     assert state.events.grad[1, 2:].abs().sum() == 0
     changed = replace(state, events=state.events.detach().clone())

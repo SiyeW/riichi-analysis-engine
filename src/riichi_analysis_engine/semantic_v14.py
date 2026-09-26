@@ -1,4 +1,4 @@
-"""Explicit entity routing and repeated cross-modal fusion, model format v14.
+"""Convolutional input encoders and one shared task readout, model format v14.
 
 Input/target schemas remain v13. This is a new weight topology, never an implicit
 reinterpretation of a historical checkpoint.
@@ -10,12 +10,16 @@ from typing import ClassVar
 import torch
 from torch import Tensor, nn
 
+from .analysis_observation import PLANE_CHANNELS
 from .architecture import SemanticModelArchitecture
 from .constants import ACTION_SPACE
 from .kyoku_outcome import OUTCOME_COUNT
+from .physical_tile_features import (
+    PHYSICAL_STOCK_FEATURE_NAMES,
+    physical_stock_features,
+)
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 from .semantic_model import (
-    DualStreamTransformerBlock,
     MaskedCausalEventBlock,
     SemanticInputStem,
     SemanticState,
@@ -25,6 +29,23 @@ from .semantic_model import (
 
 ENTITY_ROLES = ("self", "downstream", "opposite", "upstream", "wall", "global")
 HIDDEN_SOURCE_ROLES = ENTITY_ROLES[1:5]
+
+
+class V14InputStem(SemanticInputStem):
+    """Preserve legacy stems while exposing exact v14 physical stock facts."""
+
+    def __init__(self, architecture: SemanticModelArchitecture) -> None:
+        super().__init__(architecture, shared_rule_context=True, role_aware_events=True)
+        self.stock_attributes = nn.Linear(
+            len(PHYSICAL_STOCK_FEATURE_NAMES), architecture.width, bias=False
+        )
+
+    def forward(self, observation: Tensor, event_tokens: Tensor, event_mask: Tensor):
+        tiles, events, context = super().forward(observation, event_tokens, event_mask)
+        tiles = tiles + self.stock_attributes(
+            physical_stock_features(observation[:, :PLANE_CHANNELS])
+        )
+        return tiles, events, context
 
 
 @dataclass(frozen=True)
@@ -42,6 +63,8 @@ class V14Backbone(nn.Module):
     def __init__(self, architecture: SemanticModelArchitecture) -> None:
         super().__init__()
         width = architecture.width
+        if architecture.backbone != "cnn":
+            raise ValueError("v14 currently supports only the reviewed CNN backbone")
         self.entities = nn.Parameter(torch.empty(len(ENTITY_ROLES), width))
         nn.init.normal_(self.entities, std=width**-0.5)
         self.tile_blocks = nn.ModuleList(
@@ -57,36 +80,12 @@ class V14Backbone(nn.Module):
             )
             for i in range(architecture.event_blocks)
         )
-        # CNN: fuse halfway and at the end, with local processing in between.
-        # Transformer: local prior + global/event fusion at every block.
-        self.fusion_indices = (
-            tuple(range(architecture.backbone_blocks))
-            if architecture.backbone == "transformer"
-            else tuple(
-                sorted(
-                    {
-                        (architecture.backbone_blocks - 1) // 2,
-                        architecture.backbone_blocks - 1,
-                    }
-                )
-            )
-        )
-        self.fusions = nn.ModuleList(
-            DualStreamTransformerBlock(
-                width,
-                architecture.attention_heads,
-                architecture.transformer_ff_multiplier
-                if architecture.backbone == "transformer"
-                else 2,
-            )
-            for _ in self.fusion_indices
-        )
         if (
             architecture.transformer_tile_prior_blocks
             or architecture.transformer_event_prior_blocks
         ):
             raise ValueError(
-                "v14 already includes local priors in each stage; extra v12 priors are unsupported"
+                "v14 uses convolutional input encoders; extra transformer priors are unsupported"
             )
 
     def forward(
@@ -103,15 +102,10 @@ class V14Backbone(nn.Module):
         events = events.transpose(1, 2)
         entities = self.entities.unsqueeze(0).expand(len(tiles), -1, -1)
         entities = entities + context.unsqueeze(1)
-        fusion_index = 0
-        for index, block in enumerate(self.tile_blocks):
+        for block in self.tile_blocks:
             tiles = block(tiles)
-            if index in self.fusion_indices:
-                state = self.fusions[fusion_index](
-                    torch.cat((tiles, entities), dim=1), events, mask
-                )
-                tiles, entities = state[:, :37], state[:, 37:]
-                fusion_index += 1
+        # No repeatedly injected history and no Transformer state blocks. Both
+        # encoded modalities remain unpooled for the single common task reader.
         return torch.cat((tiles, entities), dim=1), events
 
 
@@ -266,7 +260,7 @@ class SemanticV14Model(nn.Module):
     def __init__(self, architecture: SemanticModelArchitecture) -> None:
         super().__init__()
         self.architecture = architecture
-        self.input = SemanticInputStem(architecture, shared_rule_context=True)
+        self.input = V14InputStem(architecture)
         self.backbone = V14Backbone(architecture)
         self.decoder = V14Decoder(architecture)
 

@@ -27,6 +27,7 @@ RED_ENTITY_FEATURE_NAMES = (
     "river_p3",
     "current_tile",
 )
+PHYSICAL_STOCK_FEATURE_NAMES = ("self_hand", "public_seen", "unseen")
 
 
 def dora_tile_index(marker: int) -> int:
@@ -89,13 +90,14 @@ def physical_dora_features(analysis_observation: Tensor) -> PhysicalDoraFeatures
         )
 
     count_channels = [
-        PLANE_CHANNEL_INDEX[f"dora_indicator_count_{count}"]
-        for count in range(1, 5)
+        PLANE_CHANNEL_INDEX[f"dora_indicator_count_{count}"] for count in range(1, 5)
     ]
     indicator_count34 = analysis_observation[:, count_channels].sum(dim=1)
     red_indicator_count = torch.stack(
         tuple(
-            analysis_observation[:, PLANE_CHANNEL_INDEX[f"dora_indicator_red_{suit}"], 0]
+            analysis_observation[
+                :, PLANE_CHANNEL_INDEX[f"dora_indicator_red_{suit}"], 0
+            ]
             for suit in "mps"
         ),
         dim=1,
@@ -103,9 +105,7 @@ def physical_dora_features(analysis_observation: Tensor) -> PhysicalDoraFeatures
 
     normal_indicator_count = indicator_count34.clone()
     normal_indicator_count[:, RED_BASE_TILE_INDICES] -= red_indicator_count
-    indicator_count37 = torch.cat(
-        (normal_indicator_count, red_indicator_count), dim=1
-    )
+    indicator_count37 = torch.cat((normal_indicator_count, red_indicator_count), dim=1)
 
     target = torch.tensor(
         DORA_TARGET_BY_MARKER,
@@ -163,6 +163,49 @@ def physical_red_features(analysis_observation: Tensor) -> Tensor:
         ]
         result[:, TILE_TYPES + suit_index] = analysis_observation[:, channels, 0]
     return result
+
+
+def physical_stock_features(analysis_observation: Tensor) -> Tensor:
+    """Exact physical counts from public facts, never hidden training labels.
+
+    Return [batch, 37, 3], scaled by four. The 34-family hand/public totals
+    already exist in the stored planes. A red tile is publicly visible if it
+    occurs in any indicator, river, open meld or closed quad. Use a union, not
+    a sum: a called discard remains in both the river and the meld planes.
+    This shares the existing four-player, one-red-per-suit inventory contract.
+    No values are clamped to hide inconsistent inputs.
+    """
+    # Reuse the shape validation and the existing suit-local red facts.
+    red_facts = physical_red_features(analysis_observation)
+    hand34 = analysis_observation[
+        :, [PLANE_CHANNEL_INDEX[f"hand_count_{n}"] for n in range(1, 5)]
+    ].sum(1)
+    seen34 = analysis_observation[:, PLANE_CHANNEL_INDEX["tiles_seen"]] * 4
+    red_hand = red_facts[:, TILE_TYPES:, 0]
+    red_seen = red_facts[:, TILE_TYPES:, 1:6].amax(-1)
+    closed = analysis_observation[
+        :, [PLANE_CHANNEL_INDEX[f"ankan_p{p}"] for p in range(4)]
+    ][:, :, RED_BASE_TILE_INDICES].amax(1)
+    prefixes = [f"fuuro_p{p}_slot_{s}" for p in range(4) for s in range(4)]
+    present = analysis_observation[
+        :, [PLANE_CHANNEL_INDEX[f"{prefix}_count_1"] for prefix in prefixes]
+    ][:, :, RED_BASE_TILE_INDICES]
+    red = analysis_observation[
+        :, [PLANE_CHANNEL_INDEX[f"{prefix}_red"] for prefix in prefixes], :1
+    ]
+    red_seen = torch.maximum(red_seen, torch.maximum(closed, (present * red).amax(1)))
+
+    def split(family: Tensor, red: Tensor) -> Tensor:
+        normal = family.clone()
+        normal[:, RED_BASE_TILE_INDICES] -= red
+        return torch.cat((normal, red), dim=1)
+
+    hand = split(hand34, red_hand)
+    seen = split(seen34, red_seen)
+    stock = hand.new_full((PHYSICAL_TILE_TYPES,), 4)
+    stock[list(RED_BASE_TILE_INDICES)] = 3
+    stock[TILE_TYPES:] = 1
+    return torch.stack((hand, seen, stock - hand - seen), dim=-1) / 4
 
 
 assert PHYSICAL_TILE_TYPES == TILE_TYPES + len(RED_TILES)

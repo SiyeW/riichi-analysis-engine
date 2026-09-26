@@ -13,6 +13,7 @@ from riichi_analysis_engine.physical_tile_features import (
     dora_tile_index,
     physical_dora_features,
     physical_red_features,
+    physical_stock_features,
 )
 
 
@@ -29,9 +30,7 @@ def _set_indicator(
             batch, PLANE_CHANNEL_INDEX[f"dora_indicator_count_{copy}"], tile
         ] = 1
     if red_suit is not None:
-        observation[
-            batch, PLANE_CHANNEL_INDEX[f"dora_indicator_red_{red_suit}"], :
-        ] = 1
+        observation[batch, PLANE_CHANNEL_INDEX[f"dora_indicator_red_{red_suit}"], :] = 1
 
 
 def test_dora_indicator_cycles_match_riichi_rules() -> None:
@@ -97,3 +96,70 @@ def test_red_five_public_facts_are_localized_to_red_entities() -> None:
     assert features[0, 35, 4] == 1
     assert features[0, 36, 6] == 1
     assert torch.count_nonzero(features) == 3
+
+
+@pytest.mark.parametrize("suit_index,base", [(0, 4), (1, 13), (2, 22)])
+@pytest.mark.parametrize("source", ["hand", "indicator", "called", "open", "closed"])
+def test_physical_stock_is_exact_and_does_not_double_count_called_reds(
+    suit_index, base, source
+):
+    observation = torch.zeros(1, PLANE_CHANNELS, TILE_TYPES)
+    suit = "mps"[suit_index]
+
+    def set_channel(name, value, tile=None):
+        observation[
+            :, PLANE_CHANNEL_INDEX[name], slice(None) if tile is None else tile
+        ] = value
+
+    hand_count, public_count = 0, 0
+    if source == "hand":
+        hand_count = 2
+        set_channel("hand_count_1", 1, base)
+        set_channel("hand_count_2", 1, base)
+        set_channel(f"hand_red_{suit}", 1)
+    elif source == "indicator":
+        public_count = 1
+        set_channel("dora_indicator_count_1", 1, base)
+        set_channel(f"dora_indicator_red_{suit}", 1)
+    elif source in ("called", "open"):
+        public_count = 3
+        for count in range(1, 4):
+            set_channel(f"fuuro_p2_slot_0_count_{count}", 1, base)
+        set_channel("fuuro_p2_slot_0_red", 1)
+        if source == "called":
+            set_channel("river_p1_count_1", 1, base)
+            set_channel(f"river_p1_red_{suit}", 1)
+    else:
+        public_count = 4
+        set_channel("ankan_p3", 1, base)
+    set_channel("tiles_seen", public_count / 4, base)
+    features = physical_stock_features(observation) * 4
+    red_hand = int(source == "hand")
+    red_public = 1 - red_hand
+    torch.testing.assert_close(
+        features[0, 34 + suit_index], torch.tensor([red_hand, red_public, 0.0])
+    )
+    torch.testing.assert_close(
+        features[0, base],
+        torch.tensor(
+            [
+                hand_count - red_hand,
+                public_count - red_public,
+                4 - hand_count - public_count,
+            ],
+            dtype=torch.float32,
+        ),
+    )
+    assert features.min() >= 0
+    # A single red meld belongs only to its suit, never the other fives.
+    for other in set(range(3)) - {suit_index}:
+        torch.testing.assert_close(
+            features[0, 34 + other], torch.tensor([0.0, 0.0, 1.0])
+        )
+
+
+def test_physical_stock_does_not_hide_inconsistent_observations():
+    observation = torch.zeros(1, PLANE_CHANNELS, TILE_TYPES)
+    observation[:, PLANE_CHANNEL_INDEX["tiles_seen"], 0] = 1
+    observation[:, PLANE_CHANNEL_INDEX["hand_count_1"], 0] = 1
+    assert physical_stock_features(observation)[0, 0, 2] == -0.25
