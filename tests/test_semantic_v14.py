@@ -20,7 +20,7 @@ from riichi_analysis_engine.losses import (
 from riichi_analysis_engine.model import RiichiAnalysisModel
 from riichi_analysis_engine.model_input import SHARED_MODEL_INPUT_CHANNELS
 from riichi_analysis_engine.semantic_input import EVENT_FIELDS
-from riichi_analysis_engine.semantic_v14 import HIDDEN_SOURCE_ROLES
+from riichi_analysis_engine.semantic_v14 import HIDDEN_SOURCE_ROLES, V14Decoder
 from riichi_analysis_engine.train import forward_batch, validate
 from riichi_analysis_engine.training_schema import validate_semantic_training_batch
 
@@ -146,13 +146,68 @@ def test_hidden_sources_reuse_correct_opponents_and_separate_wall():
     assert HIDDEN_SOURCE_ROLES == ("downstream", "opposite", "upstream", "wall")
     torch.testing.assert_close(state.hidden_sources[:, :3], state.players[:, 1:])
     torch.testing.assert_close(state.hidden_sources[:, 3], state.wall)
-    called = []
-    handle = model.semantic_model.decoder.hidden_joint.register_forward_pre_hook(
-        lambda _module, args: called.append(args[0].detach().clone())
+    decoder = model.semantic_model.decoder
+    seeds = decoder.question_seeds(state)
+    # Source differences must be identical for every tile, with wall separate.
+    expected = decoder.source_projection(state.hidden_sources)
+    actual = seeds["hidden_joint_residual"]
+    torch.testing.assert_close(
+        actual[:, 1:] - actual[:, :1],
+        (expected[:, 1:] - expected[:, :1])[:, :, None].expand(-1, -1, 34, -1),
     )
-    model.semantic_model.decode(state)
+
+
+@pytest.mark.parametrize("name", [*V14Decoder.OUTPUT_WIDTHS, "dora_tail"])
+def test_every_output_directly_reads_event_memory_without_backbone_help(name):
+    torch.manual_seed(83)
+    model = RiichiAnalysisModel(format_version=14, architecture=architecture()).eval()
+    decoder = model.semantic_model.decoder
+    # The zero residual initialization is deliberate. Check the learned route
+    # after making its final map nonzero, not a nonexistent initialization gradient.
+    if name == "hidden_joint_residual":
+        torch.nn.init.normal_(decoder.outputs[name].weight, std=0.01)
+    with torch.no_grad():
+        state = model.semantic_model.encode(*inputs())
+    state = replace(state, events=state.events.detach().requires_grad_())
+    calls = []
+    handle = decoder.task_attention.register_forward_pre_hook(
+        lambda _module, args: calls.append(args[0].shape)
+    )
+    outputs = decoder(state)
+    outputs[name].square().sum().backward()
     handle.remove()
-    torch.testing.assert_close(called[0], state.hidden_sources)
+    assert calls == [torch.Size([2, 300, architecture().width])]
+    assert torch.isfinite(state.events.grad).all()
+    assert state.events.grad[:, :2].abs().sum() > 0
+    assert state.events.grad[1, 2:].abs().sum() == 0
+    changed = replace(state, events=state.events.detach().clone())
+    changed.events[:, 0, 0] += 2
+    assert not torch.allclose(outputs[name], decoder(changed)[name])
+
+
+def test_query_entities_permute_with_their_outputs():
+    torch.manual_seed(47)
+    model = RiichiAnalysisModel(format_version=14, architecture=architecture()).eval()
+    decoder = model.semantic_model.decoder
+    torch.nn.init.normal_(decoder.outputs["hidden_joint_residual"].weight, std=0.01)
+    state = model.semantic_model.encode(*inputs())
+    permuted = replace(state, players=state.players[:, [0, 3, 1, 2]])
+    original, changed = decoder(state), decoder(permuted)
+    for name in (
+        "shanten",
+        "furiten_no_yaku",
+        "dora_distribution",
+        "dora_tail",
+        "score_distribution",
+        "deal_in_tile",
+    ):
+        torch.testing.assert_close(changed[name], original[name][:, [2, 0, 1]])
+    torch.testing.assert_close(
+        changed["hidden_joint_residual"],
+        original["hidden_joint_residual"][:, [2, 0, 1, 3]],
+    )
+    for name in ("outcome", "kyoku_accounts", "placement", "match_score", "policy"):
+        torch.testing.assert_close(changed[name], original[name])
 
 
 def test_v14_consumes_existing_v13_packs_and_all_losses(tmp_path):

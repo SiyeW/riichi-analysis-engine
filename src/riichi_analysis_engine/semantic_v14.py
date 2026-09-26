@@ -5,18 +5,20 @@ reinterpretation of a historical checkpoint.
 """
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 from torch import Tensor, nn
 
 from .architecture import SemanticModelArchitecture
+from .constants import ACTION_SPACE
+from .kyoku_outcome import OUTCOME_COUNT
+from .prediction_values import DORA_VALUES, SCORE_VALUES
 from .semantic_model import (
     DualStreamTransformerBlock,
     MaskedCausalEventBlock,
-    PairwiseCategoricalLogits,
     SemanticInputStem,
     SemanticState,
-    StructuredSemanticDecoder,
     TileGraphBlock,
     _sinusoidal_positions,
 )
@@ -113,17 +115,41 @@ class V14Backbone(nn.Module):
         return torch.cat((tiles, entities), dim=1), events
 
 
-class V14Decoder(StructuredSemanticDecoder):
+class V14Decoder(nn.Module):
+    """One batched reader for all semantic questions, then small output maps.
+
+    Queries retain their entity/tile anchors through a residual connection. All
+    queries read the same unpooled memory; none communicate through another
+    task's prediction or get a private attention/FFN stack.
+    """
+
+    OUTPUT_WIDTHS: ClassVar[dict[str, int]] = {
+        "shanten": 7,
+        "furiten_no_yaku": 1,
+        "dora_distribution": len(DORA_VALUES),
+        "score_distribution": len(SCORE_VALUES),
+        "deal_in_tile": 1,
+        "hidden_joint_residual": 10,
+        "outcome": OUTCOME_COUNT,
+        "kyoku_accounts": 5,
+        "placement": 24,
+        "match_score": 4,
+        "policy": 1,
+    }
+
     def __init__(self, architecture: SemanticModelArchitecture) -> None:
-        super().__init__(architecture, shared_rule_context=True)
-        del self.hidden_count
-        self.hidden_joint = PairwiseCategoricalLogits(
-            architecture.width, architecture.decoder_width, 10
-        )
-        self.five_fusion = nn.Linear(architecture.width * 2, architecture.width)
+        super().__init__()
         width = architecture.width
-        self.task_queries = nn.Parameter(torch.empty(3, width))
-        nn.init.normal_(self.task_queries, std=width**-0.5)
+        self.source_projection = nn.Linear(width, width)
+        self.tile_projection = nn.Linear(width, width)
+        self.five_fusion = nn.Linear(width * 2, width)
+        self.action_keys = nn.Embedding(ACTION_SPACE, width)
+        self.task_queries = nn.ParameterDict(
+            {name: nn.Parameter(torch.empty(width)) for name in self.OUTPUT_WIDTHS}
+        )
+        for query in self.task_queries.values():
+            nn.init.normal_(query, std=width**-0.5)
+        nn.init.normal_(self.action_keys.weight, std=width**-0.5)
         self.query_norm = nn.LayerNorm(width)
         self.memory_norm = nn.LayerNorm(width)
         self.task_attention = nn.MultiheadAttention(
@@ -131,15 +157,61 @@ class V14Decoder(StructuredSemanticDecoder):
         )
         self.task_ff = nn.Sequential(
             nn.LayerNorm(width),
-            nn.Linear(width, width * 2),
+            nn.Linear(width, architecture.decoder_width),
             nn.GELU(),
-            nn.Linear(width * 2, width),
+            nn.Linear(architecture.decoder_width, width),
         )
+        self.outputs = nn.ModuleDict(
+            {name: nn.Linear(width, size) for name, size in self.OUTPUT_WIDTHS.items()}
+        )
+        # The open-ended dora bucket needs a tail estimate, not a second query.
+        self.dora_tail = nn.Linear(width, 1)
+        nn.init.zeros_(self.outputs["hidden_joint_residual"].weight)
+        nn.init.zeros_(self.outputs["hidden_joint_residual"].bias)
 
-    def task_states(self, state: V14State) -> Tensor:
-        """Nine parallel reads: each opponent's shanten, furiten and value query."""
-        query = state.players[:, 1:, None, :] + self.task_queries[None, None, :, :]
-        query = query.flatten(1, 2)
+    def question_seeds(self, state: V14State) -> dict[str, Tensor]:
+        """Semantic axes, not arbitrary learned slots: 300 questions in total."""
+        opponents = self.source_projection(state.players[:, 1:])
+        global_state = self.source_projection(state.global_state)
+        tiles = self.tile_projection(state.tiles)
+        count_tiles = state.tiles[:, :34].clone()
+        count_tiles[:, (4, 13, 22)] = self.five_fusion(
+            torch.cat((state.tiles[:, (4, 13, 22)], state.tiles[:, 34:]), dim=-1)
+        ).to(count_tiles.dtype)
+        # 0..36 are discard identities; 37..45 are non-discard actions.
+        action_tiles = torch.cat(
+            (tiles, tiles.new_zeros(len(tiles), ACTION_SPACE - 37, tiles.shape[-1])),
+            dim=1,
+        )
+        seeds = {
+            name: opponents
+            for name in (
+                "shanten",
+                "furiten_no_yaku",
+                "dora_distribution",
+                "score_distribution",
+            )
+        }
+        seeds["deal_in_tile"] = opponents[:, :, None] + tiles[:, None, :34]
+        seeds["hidden_joint_residual"] = (
+            self.source_projection(state.hidden_sources)[:, :, None]
+            + self.tile_projection(count_tiles)[:, None]
+        )
+        for name in ("outcome", "kyoku_accounts", "placement", "match_score"):
+            seeds[name] = global_state[:, None]
+        seeds["policy"] = (
+            self.source_projection(state.players[:, 0])[:, None]
+            + self.action_keys.weight[None]
+            + action_tiles
+        )
+        return {name: seed + self.task_queries[name] for name, seed in seeds.items()}
+
+    def task_states(self, state: V14State) -> dict[str, Tensor]:
+        seeds = self.question_seeds(state)
+        flattened = [
+            seed.reshape(len(seed), -1, seed.shape[-1]) for seed in seeds.values()
+        ]
+        query = torch.cat(flattened, dim=1)
         memory = torch.cat(
             (
                 state.tiles,
@@ -168,34 +240,25 @@ class V14Decoder(StructuredSemanticDecoder):
                 need_weights=False,
             )[0]
         )
-        return (query + self.task_ff(query)).reshape(len(query), 3, 3, -1)
+        parts = (query + self.task_ff(query)).split(
+            [part.shape[1] for part in flattened], dim=1
+        )
+        return {
+            name: part.reshape(seed.shape)
+            for (name, seed), part in zip(seeds.items(), parts, strict=True)
+        }
 
     def forward(self, state: V14State) -> dict[str, Tensor]:
-        # Reuse the unchanged conditional wait / shanten / value semantics.
-        opponents = state.players[:, 1:]
         tasks = self.task_states(state)
-        shanten_state, furiten_state, value_state = tasks.unbind(dim=2)
-        tiles = state.tiles[:, :34]
-        outputs = {
-            "shanten": self.shanten(shanten_state),
-            "furiten_no_yaku": self.furiten(furiten_state).squeeze(-1),
-            "deal_in_tile": self.wait(opponents, tiles),
-            "dora_distribution": self.dora(value_state),
-            "dora_tail": self.dora_tail(value_state).squeeze(-1),
-            "score_distribution": self.score(value_state),
-            "outcome": self.outcome(state.global_state),
-            "kyoku_accounts": self.kyoku_accounts(state.global_state),
-            "placement": self.placement(state.global_state),
-            "match_score": self.match_score(state.global_state),
-            "policy": self.policy(state.global_state, state.decision_context),
-        }
-        count_tiles = tiles.clone()
-        count_tiles[:, (4, 13, 22)] = self.five_fusion(
-            torch.cat((tiles[:, (4, 13, 22)], state.tiles[:, 34:]), dim=-1)
-        ).to(count_tiles.dtype)
-        outputs["hidden_joint_residual"] = self.hidden_joint(
-            state.hidden_sources, count_tiles
-        )
+        outputs = {}
+        for name, head in self.outputs.items():
+            output = head(tasks[name])
+            if name in ("outcome", "kyoku_accounts", "placement", "match_score"):
+                output = output.squeeze(1)
+            if self.OUTPUT_WIDTHS[name] == 1:
+                output = output.squeeze(-1)
+            outputs[name] = output
+        outputs["dora_tail"] = self.dora_tail(tasks["dora_distribution"]).squeeze(-1)
         return outputs
 
 
