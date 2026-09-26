@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 
 from .constants import OBS_CHANNELS
-from .model_input import SHARED_MODEL_INPUT_SCHEMA_ID
+from .model_input import SHARED_MODEL_INPUT_SCHEMA_ID, V15_MODEL_INPUT_SCHEMA_ID
 from .semantic_input import EVENT_MEMORY_SCHEMA_ID
 from .storage import (
     PACK_CATALOG_FIELDS,
@@ -100,7 +100,9 @@ def plan_corpus(
     path_indices: list[int] = []
     for path_index, path in enumerate(game_paths):
         source_game = staged_game_number(path) + game_offset
-        chunk_lengths = [int(value) for value in read_chunk_archive_meta(path)["chunkLengths"]]
+        chunk_lengths = [
+            int(value) for value in read_chunk_archive_meta(path)["chunkLengths"]
+        ]
         games.extend([source_game] * len(chunk_lengths))
         path_indices.extend([path_index] * len(chunk_lengths))
         members.extend(range(len(chunk_lengths)))
@@ -211,10 +213,16 @@ def nonadjacent_order(
         # from the same game. Re-running with another shuffle is cheaper than
         # steering the tail of the schedule, and it almost never happens: the
         # chance is one game's share of the pack.
-        if reserved is None or not order or int(source_game[order[-1]]) != int(last_game):
+        if (
+            reserved is None
+            or not order
+            or int(source_game[order[-1]]) != int(last_game)
+        ):
             break
     else:
-        raise RuntimeError(f"cannot keep the pack's last sample away from game {last_game}")
+        raise RuntimeError(
+            f"cannot keep the pack's last sample away from game {last_game}"
+        )
 
     if reserved is not None:
         order.append(reserved)
@@ -233,19 +241,24 @@ def _spread_order(
     total = sum(len(indices) for indices in groups.values())
     largest = max(len(indices) for indices in groups.values())
     if largest > (total + 1) // 2:
-        raise RuntimeError(f"cannot avoid adjacent source games: largest group {largest}/{total}")
+        raise RuntimeError(
+            f"cannot avoid adjacent source games: largest group {largest}/{total}"
+        )
 
     # Each game's first sample is staggered inside its own spacing, so a pack
     # does not always open with the same games in the same order.
     spacing = {game: total / len(indices) for game, indices in groups.items()}
     due_heap: list[tuple[float, float, int]] = [
-        (float(rng.random()) * spacing[game], float(rng.random()), game) for game in groups
+        (float(rng.random()) * spacing[game], float(rng.random()), game)
+        for game in groups
     ]
     heapq.heapify(due_heap)
     # A second heap tracks which game has the most samples left. Serving a game
     # makes its entry there stale, so the loop below re-pushes the current count
     # whenever it finds one.
-    count_heap: list[tuple[int, int]] = [(-len(indices), game) for game, indices in groups.items()]
+    count_heap: list[tuple[int, int]] = [
+        (-len(indices), game) for game, indices in groups.items()
+    ]
     heapq.heapify(count_heap)
 
     remaining = {game: len(indices) for game, indices in groups.items()}
@@ -340,9 +353,7 @@ def load_slot(
         assert payload is not None
         with np.load(io.BytesIO(payload), allow_pickle=False) as data:
             parts.append(
-                normalize_packed_metadata(
-                    {name: data[name] for name in data.files}
-                )
+                normalize_packed_metadata({name: data[name] for name in data.files})
             )
         source_game.extend([int(games[position])] * int(lengths[position]))
     combined = concatenate_packed(parts)
@@ -406,7 +417,9 @@ def _attach_event_catalogs(
         offset = int(plan.get("game_offset", np.asarray(0)))
         path_indices = source_games - offset
     path_by_game: dict[int, int] = {}
-    for game, path_index in zip(source_games.tolist(), path_indices.tolist(), strict=True):
+    for game, path_index in zip(
+        source_games.tolist(), path_indices.tolist(), strict=True
+    ):
         previous = path_by_game.setdefault(int(game), int(path_index))
         if previous != int(path_index):
             raise ValueError(f"source game {game} resolves to multiple staged archives")
@@ -453,7 +466,9 @@ def _attach_event_catalogs(
 
 def write_manifest(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def audit_packs(
@@ -505,10 +520,19 @@ def audit_packs(
                 else None
             )
             if pack_target_schema is not None and (
-                pack_schema != SHARED_MODEL_INPUT_SCHEMA_ID
+                pack_schema
+                not in {SHARED_MODEL_INPUT_SCHEMA_ID, V15_MODEL_INPUT_SCHEMA_ID}
                 or pack_target_schema != TRAINING_TARGET_SCHEMA_ID
             ):
                 raise ValueError(f"{name} has an unsupported training-target schema")
+            if pack_schema == V15_MODEL_INPUT_SCHEMA_ID:
+                from .v15_facts import V15_FACTS_WIDTH
+
+                if "v15_facts" not in source.files or source["v15_facts"].shape != (
+                    len(games),
+                    V15_FACTS_WIDTH,
+                ):
+                    raise ValueError(f"{name} lacks complete v15 public facts")
             catalog_fields = PACK_CATALOG_FIELDS.intersection(source.files)
             if catalog_fields:
                 if catalog_fields != PACK_CATALOG_FIELDS:
@@ -528,8 +552,12 @@ def audit_packs(
                 validate_event_references(catalog, starts, lengths)
                 if len(catalog_offsets) != len(catalog_games) + 1:
                     raise ValueError(f"{name} has invalid event-catalog offsets")
-                if int(catalog_offsets[0]) != 0 or int(catalog_offsets[-1]) != len(catalog):
-                    raise ValueError(f"{name} event-catalog offsets do not cover the catalog")
+                if int(catalog_offsets[0]) != 0 or int(catalog_offsets[-1]) != len(
+                    catalog
+                ):
+                    raise ValueError(
+                        f"{name} event-catalog offsets do not cover the catalog"
+                    )
                 if len(np.unique(catalog_games)) != len(catalog_games):
                     raise ValueError(f"{name} repeats a game in its event catalog")
                 game_bounds = {
@@ -538,7 +566,9 @@ def audit_packs(
                 }
                 for game in np.unique(games).tolist():
                     if int(game) not in game_bounds:
-                        raise ValueError(f"{name} omits source game {game} from its event catalog")
+                        raise ValueError(
+                            f"{name} omits source game {game} from its event catalog"
+                        )
                     lower, upper = game_bounds[int(game)]
                     selected = games == game
                     if (starts[selected] < lower).any() or (
@@ -555,9 +585,7 @@ def audit_packs(
         elif (pack_schema, pack_channels) != (input_schema, observation_channels):
             raise ValueError("packs do not share one model-input contract")
         pack_event_schema = (
-            str(entry["eventMemorySchema"])
-            if "eventMemorySchema" in entry
-            else None
+            str(entry["eventMemorySchema"]) if "eventMemorySchema" in entry else None
         )
         if not event_schema_initialized:
             event_memory_schema = pack_event_schema
@@ -579,7 +607,9 @@ def audit_packs(
         elif pack_target_schema != training_target_schema:
             raise ValueError("packs do not share one training-target contract")
         if len(games) != int(entry["samples"]):
-            raise ValueError(f"{name} holds {len(games)} samples, manifest says {entry['samples']}")
+            raise ValueError(
+                f"{name} holds {len(games)} samples, manifest says {entry['samples']}"
+            )
         if len(games) == 0:
             raise ValueError(f"{name} is empty")
         seen_samples += np.bincount(games, minlength=game_count)
@@ -591,7 +621,9 @@ def audit_packs(
         previous_game = int(games[-1])
 
     if total != expected_samples:
-        raise ValueError(f"packs hold {total} samples, the plan holds {expected_samples}")
+        raise ValueError(
+            f"packs hold {total} samples, the plan holds {expected_samples}"
+        )
     if not np.array_equal(seen_samples, plan_samples):
         raise ValueError("packs do not reproduce the planned source-game sample counts")
     if adjacent_pairs:

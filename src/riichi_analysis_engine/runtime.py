@@ -20,6 +20,7 @@ from .architecture import (
     ModelArchitecture,
     SemanticModelArchitecture,
     StructuredModelArchitecture,
+    V15Architecture,
 )
 from .constants import (
     MORTAL_OBS_CHANNELS,
@@ -42,12 +43,14 @@ from .kyoku_outcome import OUTCOME_CLASSES, outcome_marginals
 from .model import RiichiAnalysisModel
 from .model_input import (
     MODEL_INPUT_CHANNELS,
+    RULE_CONTEXT_START,
     SHARED_MODEL_INPUT_CHANNELS,
     compose_model_input,
     compose_shared_model_input,
     extract_policy_context,
     model_input_metadata,
     shared_model_input_metadata,
+    v15_model_input_metadata,
 )
 from .observations import add_all_player_ranks
 from .prediction_values import DORA_VALUES, SCORE_VALUES, score_class_mask
@@ -69,6 +72,7 @@ from .structured_outputs import (
     fixed_total_values,
     zero_sum_accounts,
 )
+from .v15_facts import V15_FACTS_WIDTH, encode_v15_facts
 
 PERMUTATIONS = tuple(itertools.permutations(range(4)))
 
@@ -301,19 +305,22 @@ class AnalysisRuntime:
             "riichi-analysis-model-v12": 12,
             "riichi-analysis-model-v13": 13,
             "riichi-analysis-model-v14": 14,
+            "riichi-analysis-model-v15": 15,
         }
         if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
         self.format_version = formats[model_format]
-        if self.format_version in {9, 10, 11, 12, 13, 14}:
+        if self.format_version in {9, 10, 11, 12, 13, 14, 15}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict) or architecture.get("modelInput") != (
-                shared_model_input_metadata()
+                v15_model_input_metadata()
+                if self.format_version == 15
+                else shared_model_input_metadata()
                 if self.format_version in {13, 14}
                 else model_input_metadata()
             ):
                 raise RuntimeError("weight file uses a different model-input contract")
-        if self.format_version in {12, 13, 14}:
+        if self.format_version in {12, 13, 14, 15}:
             architecture = payload.get("architecture")
             if (
                 not isinstance(architecture, dict)
@@ -333,13 +340,15 @@ class AnalysisRuntime:
                 or architecture.get("predictionValues") != expected_values
             ):
                 raise RuntimeError("weight file uses different prediction values")
-        if self.format_version in {6, 7, 8, 9, 10, 11, 12, 13, 14}:
+        if self.format_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict):
                 raise RuntimeError("weight file has no architecture metadata")
             try:
                 architecture_type = (
-                    SemanticModelArchitecture
+                    V15Architecture
+                    if self.format_version == 15
+                    else SemanticModelArchitecture
                     if self.format_version in {12, 13, 14}
                     else StructuredModelArchitecture
                     if self.format_version in {8, 9, 10, 11}
@@ -363,16 +372,27 @@ class AnalysisRuntime:
         self._sessions: dict[str, RuntimeSession] = {}
         observation_channels = (
             SHARED_MODEL_INPUT_CHANNELS
-            if self.format_version in {13, 14}
+            if self.format_version in {13, 14, 15}
             else MODEL_INPUT_CHANNELS
-            if self.format_version in {9, 10, 11, 12, 13, 14}
+            if self.format_version in {9, 10, 11, 12, 13, 14, 15}
             else OBS_CHANNELS
             if self.format_version in {6, 7, 8}
             else MORTAL_OBS_CHANNELS
         )
         with torch.inference_mode():
             observation = torch.zeros(1, observation_channels, 34, device=self.device)
-            if self.format_version in {12, 13, 14}:
+            if self.format_version == 15:
+                facts = torch.zeros(1, V15_FACTS_WIDTH, device=self.device)
+                facts[:, 24] = 1
+                self.model(
+                    observation,
+                    torch.zeros(
+                        1, 1, EVENT_FIELDS, dtype=torch.uint8, device=self.device
+                    ),
+                    torch.ones(1, 1, dtype=torch.bool, device=self.device),
+                    facts,
+                )
+            elif self.format_version in {12, 13, 14}:
                 self.model(
                     observation,
                     torch.zeros(
@@ -444,7 +464,7 @@ class AnalysisRuntime:
         rule_state: PublicRuleState | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         observation, mask = state.encode_obs(4, at_kan_select)
-        if self.format_version in {9, 10, 11, 12, 13, 14}:
+        if self.format_version in {9, 10, 11, 12, 13, 14, 15}:
             if analysis_observation is None:
                 raise ValueError(
                     "semantic model formats require the public-history observation"
@@ -463,7 +483,7 @@ class AnalysisRuntime:
                         rule_state=rule_state,
                     ),
                 )
-                if self.format_version in {13, 14}
+                if self.format_version in {13, 14, 15}
                 else compose_model_input(
                     analysis_observation, extract_policy_context(observation)
                 )
@@ -501,7 +521,7 @@ class AnalysisRuntime:
             rule_state.process(event)
         analysis_observation = (
             self._analysis_observation(events, controlled_seat)
-            if self.format_version in {9, 10, 11, 12, 13, 14}
+            if self.format_version in {9, 10, 11, 12, 13, 14, 15}
             else None
         )
         observation, _mask = self._encode_observation(
@@ -558,7 +578,7 @@ class AnalysisRuntime:
         score_state = session.score_state
         analysis_observation = (
             session.analysis_observation()
-            if self.format_version in {9, 10, 11, 12, 13, 14}
+            if self.format_version in {9, 10, 11, 12, 13, 14, 15}
             else None
         )
         observation, _primary_mask = self._encode_observation(
@@ -570,7 +590,7 @@ class AnalysisRuntime:
         )
         tensor = torch.from_numpy(observation).unsqueeze(0).to(self.device)
         semantic_memory: tuple[torch.Tensor, torch.Tensor] | None = None
-        if self.format_version in {12, 13, 14}:
+        if self.format_version in {12, 13, 14, 15}:
             event_tokens, event_mask = session.semantic_event_memory()
             semantic_memory = (
                 event_tokens.to(self.device),
@@ -579,8 +599,23 @@ class AnalysisRuntime:
         with torch.inference_mode():
             semantic_state = None
             if semantic_memory is not None:
+                facts = (
+                    torch.from_numpy(
+                        encode_v15_facts(
+                            session.public_state,
+                            controlled_seat,
+                            observation[RULE_CONTEXT_START:],
+                        )
+                    )
+                    .unsqueeze(0)
+                    .to(self.device)
+                    if self.format_version == 15
+                    else None
+                )
                 semantic_state = self.model.semantic_model.encode(
-                    tensor, *semantic_memory
+                    tensor,
+                    *semantic_memory,
+                    *((facts,) if facts is not None else ()),
                 )
                 raw = self.model.semantic_model.decode(semantic_state)
             else:
@@ -639,7 +674,8 @@ class AnalysisRuntime:
             if "hidden_joint_residual" in outputs:
                 prediction = project_joint_counts(
                     outputs["hidden_joint_residual"].unsqueeze(0),
-                    inventory_tensor, capacity_tensor,
+                    inventory_tensor,
+                    capacity_tensor,
                 )
                 hidden_counts, hidden_red, _ = prediction.marginals()
             elif "hidden_count_residual" in outputs:
@@ -1006,11 +1042,34 @@ class AnalysisRuntime:
                     torch.from_numpy(selection_observation).unsqueeze(0).to(self.device)
                 )
                 with torch.inference_mode():
-                    if semantic_state is not None and self.format_version in {13, 14}:
+                    if semantic_state is not None and self.format_version in {
+                        13,
+                        14,
+                        15,
+                    }:
                         # Rule facts enter the v13 readout queries. Replacing a
                         # context vector after encoding is not equivalent.
+                        selection_facts = (
+                            torch.from_numpy(
+                                encode_v15_facts(
+                                    session.public_state,
+                                    controlled_seat,
+                                    selection_observation[RULE_CONTEXT_START:],
+                                )
+                            )
+                            .unsqueeze(0)
+                            .to(self.device)
+                            if self.format_version == 15
+                            else None
+                        )
                         selection_policy = self.model.semantic_model(
-                            selection_tensor, *semantic_memory
+                            selection_tensor,
+                            *semantic_memory,
+                            *(
+                                (selection_facts,)
+                                if selection_facts is not None
+                                else ()
+                            ),
                         )["policy"]
                     elif semantic_state is not None:
                         selection_policy = self.model.semantic_model.decode_policy(

@@ -25,6 +25,7 @@ from .architecture import (
     ModelArchitecture,
     SemanticModelArchitecture,
     StructuredModelArchitecture,
+    V15Architecture,
 )
 from .constants import OBS_CHANNELS
 from .count_acceleration import CudaGraphJointCounts
@@ -54,8 +55,10 @@ from .model_input import (
     MODEL_INPUT_SCHEMA_ID,
     SHARED_MODEL_INPUT_CHANNELS,
     SHARED_MODEL_INPUT_SCHEMA_ID,
+    V15_MODEL_INPUT_SCHEMA_ID,
     model_input_metadata,
     shared_model_input_metadata,
+    v15_model_input_metadata,
 )
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
 from .semantic_input import EVENT_MEMORY_SCHEMA_ID, semantic_input_metadata
@@ -69,6 +72,7 @@ from .training_schema import (
     validate_semantic_training_batch,
     validate_v8_training_batch,
 )
+from .v15_facts import V15_FACTS_WIDTH
 
 
 class TrainingInterrupted(Exception):
@@ -243,7 +247,9 @@ def validate_dataset_input_contract(
     """Fail before training when packs cannot supply the selected model input."""
 
     expected_schema = (
-        SHARED_MODEL_INPUT_SCHEMA_ID
+        V15_MODEL_INPUT_SCHEMA_ID
+        if model_format == 15
+        else SHARED_MODEL_INPUT_SCHEMA_ID
         if model_format in {13, 14}
         else MODEL_INPUT_SCHEMA_ID
         if model_format in {9, 10, 11, 12}
@@ -251,7 +257,7 @@ def validate_dataset_input_contract(
     )
     expected_channels = (
         SHARED_MODEL_INPUT_CHANNELS
-        if model_format in {13, 14}
+        if model_format in {13, 14, 15}
         else MODEL_INPUT_CHANNELS
         if model_format in {9, 10, 11, 12}
         else OBS_CHANNELS
@@ -264,16 +270,16 @@ def validate_dataset_input_contract(
         if (
             schema is None
             and channels is None
-            and model_format not in {9, 10, 11, 12, 13, 14}
+            and model_format not in {9, 10, 11, 12, 13, 14, 15}
         ):
             continue
         if schema != expected_schema or channels != expected_channels:
             raise RuntimeError(f"{split} dataset uses a different model-input contract")
         event_schema = metadata.get("eventMemorySchema")
-        if model_format in {12, 13, 14} and event_schema != EVENT_MEMORY_SCHEMA_ID:
+        if model_format in {12, 13, 14, 15} and event_schema != EVENT_MEMORY_SCHEMA_ID:
             raise RuntimeError(f"{split} dataset has no compatible event memory")
         target_schema = metadata.get("trainingTargetSchema")
-        if model_format in {13, 14} and target_schema != TRAINING_TARGET_SCHEMA_ID:
+        if model_format in {13, 14, 15} and target_schema != TRAINING_TARGET_SCHEMA_ID:
             raise RuntimeError(f"{split} dataset has no compatible training targets")
 
 
@@ -281,6 +287,13 @@ def forward_batch(
     model: RiichiAnalysisModel, batch: Mapping[str, torch.Tensor]
 ) -> dict[str, torch.Tensor]:
     observation = batch["obs"].float()
+    if model.format_version == 15:
+        return model(
+            observation,
+            batch["event_tokens"],
+            batch["event_mask"],
+            batch["v15_facts"].float(),
+        )
     if model.format_version in {12, 13, 14}:
         return model(observation, batch["event_tokens"], batch["event_mask"])
     return model(observation)
@@ -545,20 +558,20 @@ def validate(
         honor_cells = torch.zeros_like(eligible_cells)
         honor_cells[..., 27:] = True
         add_metric(
-            "dealInHonorPositiveMean", deal_in_probability,
+            "dealInHonorPositiveMean",
+            deal_in_probability,
             positive_cells & honor_cells,
         )
         add_metric(
-            "dealInHonorNegativeMean", deal_in_probability,
+            "dealInHonorNegativeMean",
+            deal_in_probability,
             negative_cells & honor_cells,
         )
         eligible_positive_histogram += (
-            torch.bincount(deal_in_bins[positive_cells], minlength=1_000)
-            .cpu().numpy()
+            torch.bincount(deal_in_bins[positive_cells], minlength=1_000).cpu().numpy()
         )
         eligible_negative_histogram += (
-            torch.bincount(deal_in_bins[negative_cells], minlength=1_000)
-            .cpu().numpy()
+            torch.bincount(deal_in_bins[negative_cells], minlength=1_000).cpu().numpy()
         )
         if structured:
             _physical_counts, inventory, capacities = physical_hidden_counts(
@@ -569,12 +582,21 @@ def validate(
             )
             if "hidden_count_residual" in outputs or "hidden_joint_residual" in outputs:
                 if "hidden_joint_residual" in outputs:
-                    prediction = project_joint_counts(outputs["hidden_joint_residual"], inventory, capacities)
-                    hidden_count, hidden_red, physical_distribution = prediction.marginals()
+                    prediction = project_joint_counts(
+                        outputs["hidden_joint_residual"], inventory, capacities
+                    )
+                    hidden_count, hidden_red, physical_distribution = (
+                        prediction.marginals()
+                    )
                     _, _, baseline = joint_count_marginals(prediction.baseline)
-                    add_metric("hiddenJointLoss", prediction.loss(
-                        _physical_counts, inventory, batch["hidden_baseline_anchor"].bool()
-                    ).expand(len(inventory)))
+                    add_metric(
+                        "hiddenJointLoss",
+                        prediction.loss(
+                            _physical_counts,
+                            inventory,
+                            batch["hidden_baseline_anchor"].bool(),
+                        ).expand(len(inventory)),
+                    )
                 else:
                     physical_distribution, baseline = projected_count_distributions(
                         outputs["hidden_count_residual"], inventory, capacities
@@ -587,15 +609,19 @@ def validate(
                 )
                 expected_physical = (physical_distribution * count_values).sum(-1)
                 anchor = batch["hidden_baseline_anchor"].bool()
-                active_family = (inventory[:, None, :] > 0).expand(
-                    -1, 4, -1
+                active_family = (inventory[:, None, :] > 0).expand(-1, 4, -1)
+                model_nll = (
+                    -physical_distribution.clamp_min(1e-12)
+                    .log()
+                    .gather(-1, _physical_counts.long().unsqueeze(-1))
+                    .squeeze(-1)
                 )
-                model_nll = -physical_distribution.clamp_min(1e-12).log().gather(
-                    -1, _physical_counts.long().unsqueeze(-1)
-                ).squeeze(-1)
-                theory_nll = -baseline.clamp_min(1e-12).log().gather(
-                    -1, _physical_counts.long().unsqueeze(-1)
-                ).squeeze(-1)
+                theory_nll = (
+                    -baseline.clamp_min(1e-12)
+                    .log()
+                    .gather(-1, _physical_counts.long().unsqueeze(-1))
+                    .squeeze(-1)
+                )
                 add_metric("hiddenCountNll", model_nll, active_family)
                 add_metric("hiddenTheoryNll", theory_nll, active_family)
                 evidence_family = active_family & ~anchor[:, None, None]
@@ -876,11 +902,15 @@ def resolve_learning_rate_schedule(
             # history again, provided the active rates and tail still match.
             phases = saved.get("learningRatePhases")
             if not isinstance(phases, list) or not phases:
-                raise RuntimeError("resume checkpoint uses a different learning-rate schedule")
+                raise RuntimeError(
+                    "resume checkpoint uses a different learning-rate schedule"
+                )
             comparison = dict(saved)
             comparison.pop("learningRatePhases")
             if comparison != requested:
-                raise RuntimeError("resume checkpoint uses a different learning-rate schedule")
+                raise RuntimeError(
+                    "resume checkpoint uses a different learning-rate schedule"
+                )
         return saved
     if next_sample <= 0:
         raise RuntimeError("learning-rate transition requires a positive exact cursor")
@@ -1138,17 +1168,19 @@ def save_checkpoint(
             **(
                 {
                     "modelInput": (
-                        shared_model_input_metadata()
+                        v15_model_input_metadata()
+                        if model.format_version == 15
+                        else shared_model_input_metadata()
                         if model.format_version in {13, 14}
                         else model_input_metadata()
                     )
                 }
-                if model.format_version in {9, 10, 11, 12, 13, 14}
+                if model.format_version in {9, 10, 11, 12, 13, 14, 15}
                 else {}
             ),
             **(
                 {"semanticInput": semantic_input_metadata()}
-                if model.format_version in {12, 13, 14}
+                if model.format_version in {12, 13, 14, 15}
                 else {}
             ),
             "optimizer": optimizer.state_dict(),
@@ -1197,7 +1229,10 @@ def main() -> None:
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(
-        "--model-format", type=int, choices=(7, 8, 9, 10, 11, 12, 13, 14), default=13
+        "--model-format",
+        type=int,
+        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15),
+        default=13,
     )
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
@@ -1226,6 +1261,8 @@ def main() -> None:
     parser.add_argument("--semantic-event-blocks", type=int, default=4)
     parser.add_argument("--semantic-decoder-width", type=int, default=512)
     parser.add_argument("--semantic-attention-heads", type=int, default=8)
+    parser.add_argument("--v15-blocks", type=int, default=4)
+    parser.add_argument("--v15-feed-forward-width", type=int, default=512)
     parser.add_argument("--semantic-transformer-ff-multiplier", type=int, default=4)
     parser.add_argument("--semantic-transformer-tile-prior-blocks", type=int, default=0)
     parser.add_argument(
@@ -1233,7 +1270,9 @@ def main() -> None:
     )
     parser.add_argument("--semantic-prior-version", type=int, choices=(1, 2), default=2)
     parser.add_argument(
-        "--semantic-design-version", type=int, choices=(1, 2),
+        "--semantic-design-version",
+        type=int,
+        choices=(1, 2),
         help="semantic head revision; defaults to 2 for v13/v14 (v14 requires 2)",
     )
     parser.add_argument(
@@ -1310,7 +1349,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=314159)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
-        "--count-projection-execution", choices=("eager", "cuda-graph"), default="eager",
+        "--count-projection-execution",
+        choices=("eager", "cuda-graph"),
+        default="eager",
         help="optional v14 training-only count replay; eager remains the portable default",
     )
     parser.add_argument(
@@ -1358,13 +1399,27 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
     amp_dtype = torch.float16 if device.type == "cuda" else None
     if args.count_projection_execution == "cuda-graph" and (
-        args.model_format != 14 or device.type != "cuda"
+        args.model_format not in {14, 15}
+        or device.type != "cuda"
         or (args.loss_term and "hidden_allocation" not in args.loss_term)
     ):
-        raise ValueError("CUDA count replay requires model format 14, CUDA, and the hidden_allocation loss")
+        raise ValueError(
+            "CUDA count replay requires model format 14/15, CUDA, and the hidden_allocation loss"
+        )
 
-    if args.model_format in {12, 13, 14}:
-        design_version = args.semantic_design_version or (2 if args.model_format in {13, 14} else 1)
+    if args.model_format == 15:
+        architecture = V15Architecture(
+            width=args.semantic_width,
+            blocks=args.v15_blocks,
+            attention_heads=args.semantic_attention_heads,
+            feed_forward_width=args.v15_feed_forward_width,
+            decoder_width=args.semantic_decoder_width,
+        )
+        available_loss_terms = LOSS_TERMS_V8
+    elif args.model_format in {12, 13, 14}:
+        design_version = args.semantic_design_version or (
+            2 if args.model_format in {13, 14} else 1
+        )
         architecture = SemanticModelArchitecture(
             backbone=args.semantic_backbone,
             width=args.semantic_width,
@@ -1473,16 +1528,22 @@ def main() -> None:
         if checkpoint.get("format") != f"riichi-analysis-model-v{args.model_format}":
             raise RuntimeError("resume checkpoint has an unsupported format")
         checkpoint_architecture = checkpoint.get("modelArchitecture")
-        if args.model_format in {12, 13, 14}:
+        if args.model_format == 15:
+            checkpoint_architecture = V15Architecture.from_dict(
+                checkpoint_architecture
+            ).to_dict()
+        elif args.model_format in {12, 13, 14}:
             checkpoint_architecture = SemanticModelArchitecture.from_dict(
                 checkpoint_architecture
             ).to_dict()
         if checkpoint_architecture != architecture.to_dict():
             raise RuntimeError("resume checkpoint uses a different model architecture")
-        if args.model_format in {9, 10, 11, 12, 13, 14} and checkpoint.get(
+        if args.model_format in {9, 10, 11, 12, 13, 14, 15} and checkpoint.get(
             "modelInput"
         ) != (
-            shared_model_input_metadata()
+            v15_model_input_metadata()
+            if args.model_format == 15
+            else shared_model_input_metadata()
             if args.model_format in {13, 14}
             else model_input_metadata()
         ):
@@ -1490,7 +1551,7 @@ def main() -> None:
                 "resume checkpoint uses a different model-input contract"
             )
         if (
-            args.model_format in {12, 13, 14}
+            args.model_format in {12, 13, 14, 15}
             and checkpoint.get("semanticInput") != semantic_input_metadata()
         ):
             raise RuntimeError(
@@ -1520,9 +1581,7 @@ def main() -> None:
         saved_batch_size = int(saved_cursor["batchSize"])
         saved_phases = saved_cursor.get("batchSizePhases")
         if saved_phases is None:
-            batch_size_phases = [
-                {"startSample": 0, "batchSize": saved_batch_size}
-            ]
+            batch_size_phases = [{"startSample": 0, "batchSize": saved_batch_size}]
         elif (
             not isinstance(saved_phases, list)
             or not saved_phases
@@ -1646,14 +1705,25 @@ def main() -> None:
         fixture = next(iter(validation_loader))
     except StopIteration:
         fixture = None
-    if args.model_format in {8, 9, 10, 11, 12, 13, 14}:
+    if args.model_format in {8, 9, 10, 11, 12, 13, 14, 15}:
+
         def validate_fixture(value: Mapping[str, torch.Tensor]) -> dict[str, int]:
-            if args.model_format in {12, 13, 14}:
-                return validate_semantic_training_batch(
+            if args.model_format in {12, 13, 14, 15}:
+                result = validate_semantic_training_batch(
                     value,
                     require_analysis_active=args.model_format >= 10,
-                    require_hidden_baseline_anchor=args.model_format in {13, 14},
+                    require_hidden_baseline_anchor=args.model_format in {13, 14, 15},
                 )
+                if args.model_format == 15:
+                    facts = value.get("v15_facts")
+                    if facts is None or facts.shape != (
+                        len(value["obs"]),
+                        V15_FACTS_WIDTH,
+                    ):
+                        raise ValueError("v15 batch lacks exact public facts")
+                    if not torch.isfinite(facts).all():
+                        raise ValueError("v15 public facts contain a non-finite value")
+                return result
             return validate_v8_training_batch(
                 value, require_analysis_active=args.model_format >= 10
             )
@@ -1666,9 +1736,7 @@ def main() -> None:
                 else {
                     "train": None,
                     "validation": (
-                        validate_fixture(fixture)
-                        if fixture is not None
-                        else None
+                        validate_fixture(fixture) if fixture is not None else None
                     ),
                 }
             )
@@ -1680,9 +1748,7 @@ def main() -> None:
             training_contract = {
                 "train": validate_fixture(train_fixture),
                 "validation": (
-                    validate_fixture(fixture)
-                    if fixture is not None
-                    else None
+                    validate_fixture(fixture) if fixture is not None else None
                 ),
             }
     else:
@@ -1828,7 +1894,10 @@ def main() -> None:
                     else:
                         outputs = forward_batch(model, batch)
                     total, losses, active, weights = multitask_loss(
-                        outputs, batch, balancer, joint_count_projector=joint_count_projector
+                        outputs,
+                        batch,
+                        balancer,
+                        joint_count_projector=joint_count_projector,
                     )
                 if diagnose_gradients:
                     gradient_geometry = shared_gradient_geometry(losses, active, shared)

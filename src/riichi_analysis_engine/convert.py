@@ -21,6 +21,7 @@ from .frame_sampling import SAMPLING_STRATA, FrameSamplingPlan
 from .model_input import (
     MODEL_INPUT_SCHEMA_ID,
     SHARED_MODEL_INPUT_SCHEMA_ID,
+    V15_MODEL_INPUT_SCHEMA_ID,
     compose_model_input,
     compose_shared_model_input,
     extract_policy_context,
@@ -46,6 +47,7 @@ from .storage import (
     read_chunk_archive_meta,
     save_chunk_archive,
 )
+from .v15_facts import encode_v15_facts
 
 
 @dataclass(frozen=True)
@@ -305,19 +307,24 @@ def convert_game(
         at_kan_select: bool = False,
     ) -> None:
         analysis = analysis_encoder.encode(event, perspective)
+        rule_context = (
+            encode_rule_context(
+                state,
+                candidates,
+                action_mask,
+                at_kan_select=at_kan_select,
+                seat=perspective,
+                rule_state=rule_state,
+            )
+            if model_format in {13, 15}
+            else None
+        )
         observation = (
             compose_shared_model_input(
                 analysis,
-                encode_rule_context(
-                    state,
-                    candidates,
-                    action_mask,
-                    at_kan_select=at_kan_select,
-                    seat=perspective,
-                    rule_state=rule_state,
-                ),
+                rule_context,
             )
-            if model_format == 13
+            if model_format in {13, 15}
             else compose_model_input(
                 analysis, extract_policy_context(mortal_observation)
             )
@@ -344,8 +351,12 @@ def convert_game(
             "history_length": np.uint16(history_length),
             **targets,
         }
-        if model_format == 13:
+        if model_format in {13, 15}:
             values["hidden_baseline_anchor"] = np.bool_(hidden_baseline_anchor)
+        if model_format == 15:
+            values["v15_facts"] = encode_v15_facts(
+                public_state, perspective, rule_context
+            )
         for name, value in values.items():
             samples.setdefault(name, []).append(value)
 
@@ -509,13 +520,15 @@ def convert_record_to_archive(
                 meta.get("format") == STAGED_GAME_FORMAT
                 and meta.get("modelInputSchema")
                 == (
-                    SHARED_MODEL_INPUT_SCHEMA_ID
+                    V15_MODEL_INPUT_SCHEMA_ID
+                    if model_format == 15
+                    else SHARED_MODEL_INPUT_SCHEMA_ID
                     if model_format == 13
                     else MODEL_INPUT_SCHEMA_ID
                 )
                 and meta.get("eventMemorySchema") == EVENT_MEMORY_SCHEMA_ID
                 and (
-                    model_format != 13
+                    model_format not in {13, 15}
                     or meta.get("trainingTargetSchema") == TRAINING_TARGET_SCHEMA_ID
                 )
                 and meta.get("frameSampling")
@@ -560,7 +573,7 @@ def convert_record_to_archive(
                 "frameCounts": converted.frame_counts,
             },
             training_target_schema=(
-                TRAINING_TARGET_SCHEMA_ID if model_format == 13 else None
+                TRAINING_TARGET_SCHEMA_ID if model_format in {13, 15} else None
             ),
         )
         return (
@@ -596,7 +609,7 @@ def main() -> None:
     parser.add_argument("--summary-name", default="summary.json")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--model-format", type=int, choices=(12, 13), default=13)
+    parser.add_argument("--model-format", type=int, choices=(12, 13, 15), default=13)
     parser.add_argument("--frame-sampling-seed", type=int)
     parser.add_argument("--rare-action-frame-rate", type=float, default=1.0)
     parser.add_argument("--state-change-frame-rate", type=float, default=0.5)

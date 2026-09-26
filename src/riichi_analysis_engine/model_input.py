@@ -32,6 +32,7 @@ POLICY_CONTEXT_CHANNELS = sum(
 MODEL_INPUT_CHANNELS = ANALYSIS_CHANNELS + POLICY_CONTEXT_CHANNELS
 POLICY_CONTEXT_START = ANALYSIS_CHANNELS
 SHARED_MODEL_INPUT_SCHEMA_ID = "riichi-analysis-model-input-v3"
+V15_MODEL_INPUT_SCHEMA_ID = "riichi-analysis-model-input-v15"
 SHARED_MODEL_INPUT_CHANNELS = ANALYSIS_CHANNELS + RULE_CONTEXT_CHANNELS
 RULE_CONTEXT_START = ANALYSIS_CHANNELS
 
@@ -113,4 +114,17 @@ def shared_model_input_metadata() -> dict[str, object]:
         "ruleContext": rule_context_metadata(),
         "channels": SHARED_MODEL_INPUT_CHANNELS,
         "tileTypes": TILE_TYPES,
+    }
+
+
+def v15_model_input_metadata() -> dict[str, object]:
+    """Stored observation transport plus exact entity-owned public scalar facts."""
+
+    from .v15_facts import V15_FACTS_SCHEMA_ID, V15_FACTS_WIDTH
+
+    return {
+        **shared_model_input_metadata(),
+        "schema": V15_MODEL_INPUT_SCHEMA_ID,
+        "publicFactsSchema": V15_FACTS_SCHEMA_ID,
+        "publicFactsWidth": V15_FACTS_WIDTH,
     }

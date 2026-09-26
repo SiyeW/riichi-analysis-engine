@@ -30,10 +30,43 @@ FRAME_EVENTS = {
 }
 
 _TILE_NAMES = (
-    "1m", "2m", "3m", "4m", "5m", "5mr", "6m", "7m", "8m", "9m",
-    "1p", "2p", "3p", "4p", "5p", "5pr", "6p", "7p", "8p", "9p",
-    "1s", "2s", "3s", "4s", "5s", "5sr", "6s", "7s", "8s", "9s",
-    "E", "S", "W", "N", "P", "F", "C",
+    "1m",
+    "2m",
+    "3m",
+    "4m",
+    "5m",
+    "5mr",
+    "6m",
+    "7m",
+    "8m",
+    "9m",
+    "1p",
+    "2p",
+    "3p",
+    "4p",
+    "5p",
+    "5pr",
+    "6p",
+    "7p",
+    "8p",
+    "9p",
+    "1s",
+    "2s",
+    "3s",
+    "4s",
+    "5s",
+    "5sr",
+    "6s",
+    "7s",
+    "8s",
+    "9s",
+    "E",
+    "S",
+    "W",
+    "N",
+    "P",
+    "F",
+    "C",
 )
 _TILE_INDEX = {name: index for index, name in enumerate(_TILE_NAMES)}
 _BAKAZE_MAP = {"E": 0, "S": 1, "W": 2, "N": 3}
@@ -104,6 +137,9 @@ class PublicHistoryState:
 
     def reset(self) -> None:
         self.tehais = [np.zeros(TILE_DIM, dtype=np.int32) for _ in range(PLAYERS)]
+        # Public hand sizes are tracked independently of tile identities. An
+        # opponent's unknown draw ("?") still changes the size by one.
+        self.concealed_sizes = [0] * PLAYERS
         self.rivers: list[list[tuple[int, bool]]] = [[] for _ in range(PLAYERS)]
         self.kawa_views: list[list[list[KawaItem | None]]] = [
             [[] for _ in range(PLAYERS)] for _ in range(PLAYERS)
@@ -111,9 +147,7 @@ class PublicHistoryState:
         self.pending_call: list[CallContext | None] = [None] * PLAYERS
         self.pending_kans: list[list[KanContext]] = [[] for _ in range(PLAYERS)]
         self.reach_declared_pending = [False] * PLAYERS
-        self.melds: list[list[tuple[np.ndarray, bool]]] = [
-            [] for _ in range(PLAYERS)
-        ]
+        self.melds: list[list[tuple[np.ndarray, bool]]] = [[] for _ in range(PLAYERS)]
         self.riichi = [False] * PLAYERS
         self.riichi_accepted = [False] * PLAYERS
         self.dora_indicators: list[int] = []
@@ -142,9 +176,7 @@ class PublicHistoryState:
         for name in names:
             index = self._tile(name)
             if index is not None:
-                self.tehais[player][index] = max(
-                    0, self.tehais[player][index] - 1
-                )
+                self.tehais[player][index] = max(0, self.tehais[player][index] - 1)
 
     def _counts(self, names: list[str]) -> np.ndarray:
         counts = np.zeros(TILE_DIM, dtype=np.int32)
@@ -194,6 +226,7 @@ class PublicHistoryState:
             self.dora_indicators = [marker]
         self._add_public(event.get("dora_marker"))
         for player, hand in enumerate(event["tehais"]):
+            self.concealed_sizes[player] = len(hand)
             for name in hand:
                 index = self._tile(name)
                 if index is not None:
@@ -201,6 +234,7 @@ class PublicHistoryState:
 
     def _tsumo(self, event: dict[str, Any]) -> None:
         actor = int(event["actor"])
+        self.concealed_sizes[actor] += 1
         index = self._tile(event.get("pai"))
         if index is not None:
             self.tehais[actor][index] += 1
@@ -208,6 +242,7 @@ class PublicHistoryState:
 
     def _dahai(self, event: dict[str, Any]) -> None:
         actor = int(event["actor"])
+        self.concealed_sizes[actor] -= 1
         index = tile_index(event["pai"])
         is_riichi = self.reach_declared_pending[actor]
         self.tehais[actor][index] = max(0, self.tehais[actor][index] - 1)
@@ -235,6 +270,7 @@ class PublicHistoryState:
         if kind == "pon":
             self._pad_kawa_for_call(actor, target)
         consumed = list(event["consumed"])
+        self.concealed_sizes[actor] -= len(consumed)
         called = event["pai"]
         self._remove_hand(actor, consumed)
         for name in consumed:
@@ -270,6 +306,7 @@ class PublicHistoryState:
             )
         )
         if kind == "ankan":
+            self.concealed_sizes[actor] -= len(consumed)
             self._remove_hand(actor, consumed)
             for name in consumed:
                 self._add_public(name)
@@ -279,6 +316,7 @@ class PublicHistoryState:
             return
         if kind == "kakan":
             if called:
+                self.concealed_sizes[actor] -= 1
                 self._remove_hand(actor, [called])
                 self._add_public(called)
             tile34 = tile37_to_34(tile_index(called))
@@ -294,6 +332,7 @@ class PublicHistoryState:
                     self.melds[actor][slot] = (updated, False)
                     break
             return
+        self.concealed_sizes[actor] -= len(consumed)
         self._remove_hand(actor, consumed)
         for name in consumed:
             self._add_public(name)

@@ -7,6 +7,7 @@ from .architecture import (
     ModelArchitecture,
     SemanticModelArchitecture,
     StructuredModelArchitecture,
+    V15Architecture,
 )
 from .model import RiichiAnalysisModel, count_parameters
 
@@ -14,7 +15,10 @@ from .model import RiichiAnalysisModel, count_parameters
 def main() -> None:
     parser = argparse.ArgumentParser(description="Print the model parameter budget.")
     parser.add_argument(
-        "--model-format", type=int, choices=(7, 8, 9, 10, 11, 12, 13, 14), default=13
+        "--model-format",
+        type=int,
+        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15),
+        default=13,
     )
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
@@ -38,7 +42,9 @@ def main() -> None:
     parser.add_argument("--policy-context-blocks", type=int, default=6)
     parser.add_argument("--policy-context-width", type=int, default=384)
     parser.add_argument("--policy-width", type=int, default=1024)
-    parser.add_argument("--semantic-backbone", choices=("cnn", "transformer"), default="cnn")
+    parser.add_argument(
+        "--semantic-backbone", choices=("cnn", "transformer"), default="cnn"
+    )
     parser.add_argument("--semantic-width", type=int, default=256)
     parser.add_argument("--semantic-stem-width", type=int, default=384)
     parser.add_argument("--semantic-event-width", type=int, default=192)
@@ -48,15 +54,27 @@ def main() -> None:
     parser.add_argument("--semantic-attention-heads", type=int, default=8)
     parser.add_argument("--semantic-transformer-ff-multiplier", type=int, default=4)
     parser.add_argument("--semantic-transformer-tile-prior-blocks", type=int, default=0)
-    parser.add_argument("--semantic-transformer-event-prior-blocks", type=int, default=0)
+    parser.add_argument(
+        "--semantic-transformer-event-prior-blocks", type=int, default=0
+    )
     parser.add_argument("--semantic-prior-version", type=int, choices=(1, 2), default=2)
     parser.add_argument(
-        "--semantic-design-version", type=int, choices=(1, 2),
+        "--semantic-design-version",
+        type=int,
+        choices=(1, 2),
         help="semantic head revision; defaults to 2 for v13/v14 (v14 requires 2)",
     )
     args = parser.parse_args()
-    if args.model_format in {12, 13, 14}:
-        design_version = args.semantic_design_version or (2 if args.model_format in {13, 14} else 1)
+    if args.model_format == 15:
+        architecture = V15Architecture(
+            width=args.semantic_width,
+            attention_heads=args.semantic_attention_heads,
+            decoder_width=args.semantic_decoder_width,
+        )
+    elif args.model_format in {12, 13, 14}:
+        design_version = args.semantic_design_version or (
+            2 if args.model_format in {13, 14} else 1
+        )
         architecture = SemanticModelArchitecture(
             backbone=args.semantic_backbone,
             width=args.semantic_width,
@@ -77,26 +95,24 @@ def main() -> None:
             1024 if args.model_format == 11 else 768
         )
         task_width = args.task_width or (1024 if args.model_format == 11 else 512)
-        architecture = (
-            StructuredModelArchitecture(
-                shared_channels=args.shared_channels,
-                shared_blocks=args.shared_blocks,
-                family_latent_width=family_latent_width,
-                opponent_latent_width=args.opponent_latent_width,
-                policy_latent_width=args.policy_latent_width,
-                opponent_blocks=args.opponent_blocks,
-                hidden_blocks=args.hidden_blocks,
-                value_blocks=args.value_blocks,
-                kyoku_blocks=args.kyoku_blocks,
-                match_blocks=args.match_blocks,
-                policy_blocks=args.policy_blocks,
-                task_width=task_width,
-                tile_width=args.tile_width,
-                policy_context_channels=args.policy_context_channels,
-                policy_context_blocks=args.policy_context_blocks,
-                policy_context_width=args.policy_context_width,
-                policy_width=args.policy_width,
-            )
+        architecture = StructuredModelArchitecture(
+            shared_channels=args.shared_channels,
+            shared_blocks=args.shared_blocks,
+            family_latent_width=family_latent_width,
+            opponent_latent_width=args.opponent_latent_width,
+            policy_latent_width=args.policy_latent_width,
+            opponent_blocks=args.opponent_blocks,
+            hidden_blocks=args.hidden_blocks,
+            value_blocks=args.value_blocks,
+            kyoku_blocks=args.kyoku_blocks,
+            match_blocks=args.match_blocks,
+            policy_blocks=args.policy_blocks,
+            task_width=task_width,
+            tile_width=args.tile_width,
+            policy_context_channels=args.policy_context_channels,
+            policy_context_blocks=args.policy_context_blocks,
+            policy_context_width=args.policy_context_width,
+            policy_width=args.policy_width,
         )
     else:
         architecture = ModelArchitecture(

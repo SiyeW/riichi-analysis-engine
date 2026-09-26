@@ -170,6 +170,38 @@ def test_conversion_records_perspective_relative_hidden_baseline_anchors() -> No
     assert not bool(anchors[2])
 
 
+def test_v15_conversion_carries_exact_public_facts_without_changing_targets() -> None:
+    events = [
+        {
+            "type": "start_kyoku",
+            "bakaze": "E",
+            "kyoku": 1,
+            "honba": 12,
+            "kyotaku": 11,
+            "oya": 0,
+            "dora_marker": "9p",
+            "scores": [105_000, 22_000, -5_000, 18_000],
+            "tehais": [["1m"], [], [], []],
+        },
+        {"type": "dahai", "actor": 0, "pai": "1m"},
+        {"type": "ryukyoku", "deltas": [0, 0, 0, 0]},
+        {"type": "end_kyoku"},
+        {"type": "end_game"},
+    ]
+    converted = convert_game(
+        events,
+        "v15-facts-game",
+        player_state_type=_PassivePlayerState,
+        model_format=15,
+    )
+    facts = converted.arrays["v15_facts"]
+    assert facts.shape[1] == 57
+    assert 105_000 in facts[:, [0, 6, 12, 18]]
+    assert np.all(facts[:, 26] == 12)
+    assert np.all(facts[:, 27] == 11)
+    assert "hidden_baseline_anchor" in converted.arrays
+
+
 def test_conversion_keeps_only_exact_analysis_anchors_at_zero_rates() -> None:
     events = [
         {
