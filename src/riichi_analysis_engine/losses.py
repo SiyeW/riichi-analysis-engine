@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import torch
 from torch import Tensor, nn
@@ -15,11 +15,13 @@ from .hidden_transport import (
     physical_hidden_counts,
     projected_count_distributions,
 )
-from .joint_counts import project_joint_counts
+from .joint_counts import JointCountPrediction, project_joint_counts
 from .model_input import MODEL_INPUT_CHANNELS, SHARED_MODEL_INPUT_CHANNELS
 from .observation_layout import JIKAZE_CHANNEL, WIND_TILE_START
 from .prediction_values import DORA_TAIL_START, SCORE_VALUES, score_class_mask
 from .structured_outputs import fixed_total_values, zero_sum_accounts
+
+JointCountProjector = Callable[[Tensor, Tensor, Tensor], JointCountPrediction]
 
 # A term represents one independently supervised prediction, not a manually
 # chosen product priority. Their relative influence is learned during training
@@ -117,7 +119,8 @@ def masked_score_logits(outputs: Mapping[str, Tensor], observation: Tensor) -> T
 
 
 def _structured_multitask_losses(
-    outputs: Mapping[str, Tensor], batch: Mapping[str, Tensor]
+    outputs: Mapping[str, Tensor], batch: Mapping[str, Tensor],
+    joint_count_projector: JointCountProjector | None = None,
 ) -> tuple[dict[str, Tensor], dict[str, bool]]:
     losses: dict[str, Tensor] = {}
     active: dict[str, bool] = {}
@@ -195,7 +198,8 @@ def _structured_multitask_losses(
         anchor = batch.get("hidden_baseline_anchor")
         if anchor is None:
             raise ValueError("v14 hidden-count training requires baseline anchors")
-        prediction = project_joint_counts(outputs["hidden_joint_residual"], inventory, capacities)
+        projector = joint_count_projector or project_joint_counts
+        prediction = projector(outputs["hidden_joint_residual"], inventory, capacities)
         losses["hidden_allocation"] = prediction.loss(physical_counts, inventory, anchor.bool())
     elif "hidden_count_residual" in outputs:
         probability, baseline = projected_count_distributions(
@@ -294,7 +298,8 @@ def _structured_multitask_losses(
 
 
 def multitask_losses(
-    outputs: Mapping[str, Tensor], batch: Mapping[str, Tensor]
+    outputs: Mapping[str, Tensor], batch: Mapping[str, Tensor],
+    *, joint_count_projector: JointCountProjector | None = None,
 ) -> tuple[dict[str, Tensor], dict[str, bool]]:
     """Return raw proper losses and whether each has real supervision.
 
@@ -306,7 +311,7 @@ def multitask_losses(
     if any(key in outputs for key in (
         "hidden_source_affinity", "hidden_count_residual", "hidden_joint_residual"
     )):
-        return _structured_multitask_losses(outputs, batch)
+        return _structured_multitask_losses(outputs, batch, joint_count_projector)
 
     losses: dict[str, Tensor] = {}
     active: dict[str, bool] = {}
@@ -459,10 +464,11 @@ def multitask_loss(
     outputs: Mapping[str, Tensor],
     batch: Mapping[str, Tensor],
     balancer: LearnedUncertaintyBalancer | None = None,
+    *, joint_count_projector: JointCountProjector | None = None,
 ) -> tuple[Tensor, dict[str, Tensor], dict[str, bool], dict[str, Tensor]]:
     """Compute raw losses, then combine them with the supplied balancer."""
 
-    losses, active = multitask_losses(outputs, batch)
+    losses, active = multitask_losses(outputs, batch, joint_count_projector=joint_count_projector)
     if balancer is not None:
         missing = [name for name in balancer.names if name not in losses]
         if missing:

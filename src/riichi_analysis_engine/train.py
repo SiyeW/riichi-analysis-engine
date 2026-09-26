@@ -27,6 +27,7 @@ from .architecture import (
     StructuredModelArchitecture,
 )
 from .constants import OBS_CHANNELS
+from .count_acceleration import CudaGraphJointCounts
 from .dataset import PackDataset
 from .hidden_transport import (
     balanced_source_probabilities,
@@ -1309,6 +1310,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=314159)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--count-projection-execution", choices=("eager", "cuda-graph"), default="eager",
+        help="optional v14 training-only count replay; eager remains the portable default",
+    )
+    parser.add_argument(
         "--loss-term",
         action="append",
         default=[],
@@ -1352,6 +1357,11 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.benchmark = True
     amp_dtype = torch.float16 if device.type == "cuda" else None
+    if args.count_projection_execution == "cuda-graph" and (
+        args.model_format != 14 or device.type != "cuda"
+        or (args.loss_term and "hidden_allocation" not in args.loss_term)
+    ):
+        raise ValueError("CUDA count replay requires model format 14, CUDA, and the hidden_allocation loss")
 
     if args.model_format in {12, 13, 14}:
         design_version = args.semantic_design_version or (2 if args.model_format in {13, 14} else 1)
@@ -1765,6 +1775,11 @@ def main() -> None:
         else 0
     )
     model.train()
+    joint_count_projector = (
+        CudaGraphJointCounts(args.batch_size, device)
+        if args.count_projection_execution == "cuda-graph" and not args.validate_only
+        else None
+    )
     trainable_parameters = [*model.parameters(), *balancer.parameters()]
     for batch in train_loader:
         if interrupt_requested:
@@ -1813,7 +1828,7 @@ def main() -> None:
                     else:
                         outputs = forward_batch(model, batch)
                     total, losses, active, weights = multitask_loss(
-                        outputs, batch, balancer
+                        outputs, batch, balancer, joint_count_projector=joint_count_projector
                     )
                 if diagnose_gradients:
                     gradient_geometry = shared_gradient_geometry(losses, active, shared)

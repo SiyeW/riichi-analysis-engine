@@ -114,13 +114,35 @@ def project_joint_counts(
         raise ValueError("wrong joint hidden-count residual shape")
     if iterations <= 0:
         raise ValueError("joint projection iterations must be positive")
+    baseline, logits, column_target, red_target, source_target = joint_projection_inputs(
+        residual, inventory, capacities
+    )
+    return JointCountPrediction(
+        project_joint_probability(logits, column_target, red_target, source_target, iterations),
+        baseline,
+    )
+
+
+def joint_projection_inputs(
+    residual: Tensor, inventory: Tensor, capacities: Tensor
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Validate constraints outside the device-only iterative calculation."""
+    if residual.shape != (len(inventory), 4, 34, 10):
+        raise ValueError("wrong joint hidden-count residual shape")
     baseline = joint_count_baseline(inventory, capacities)
     logits = (
         baseline.clamp_min(torch.finfo(torch.float32).tiny).log() + residual.float()
     ).masked_fill(baseline == 0, -torch.inf)
-    total, red = _values(logits)
     column_target, red_target = family_inventory(inventory.float())
-    source_target = capacities.float()
+    return baseline, logits, column_target, red_target, capacities.float()
+
+
+def project_joint_probability(
+    logits: Tensor, column_target: Tensor, red_target: Tensor, source_target: Tensor,
+    iterations: int = 32,
+) -> Tensor:
+    """One mathematical implementation shared by eager and captured execution."""
+    total, red = _values(logits)
     row_bias = logits.new_zeros((len(logits), 4, 1, 1))
     column_bias = logits.new_zeros((len(logits), 1, 34, 1))
     red_bias = torch.zeros_like(column_bias)
@@ -149,4 +171,4 @@ def project_joint_counts(
         dt, dr = (d * et - b * er) / determinant, (a * er - b * et) / determinant
         column_bias = column_bias + dt.clamp(-1, 1)[:, None, :, None]
         red_bias = red_bias + dr.clamp(-1, 1)[:, None, :, None]
-    return JointCountPrediction(probability(), baseline)
+    return probability()
