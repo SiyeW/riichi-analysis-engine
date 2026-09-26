@@ -14,7 +14,7 @@ from .model import RiichiAnalysisModel, count_parameters
 def main() -> None:
     parser = argparse.ArgumentParser(description="Print the model parameter budget.")
     parser.add_argument(
-        "--model-format", type=int, choices=(7, 8, 9, 10, 11, 12, 13), default=13
+        "--model-format", type=int, choices=(7, 8, 9, 10, 11, 12, 13, 14), default=13
     )
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
@@ -52,11 +52,11 @@ def main() -> None:
     parser.add_argument("--semantic-prior-version", type=int, choices=(1, 2), default=2)
     parser.add_argument(
         "--semantic-design-version", type=int, choices=(1, 2),
-        help="v13 architecture revision; defaults to 2 for new models",
+        help="semantic head revision; defaults to 2 for v13/v14 (v14 requires 2)",
     )
     args = parser.parse_args()
-    if args.model_format in {12, 13}:
-        design_version = args.semantic_design_version or (2 if args.model_format == 13 else 1)
+    if args.model_format in {12, 13, 14}:
+        design_version = args.semantic_design_version or (2 if args.model_format in {13, 14} else 1)
         architecture = SemanticModelArchitecture(
             backbone=args.semantic_backbone,
             width=args.semantic_width,

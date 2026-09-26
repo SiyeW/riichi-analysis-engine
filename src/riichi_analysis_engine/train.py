@@ -36,6 +36,7 @@ from .hidden_transport import (
     physical_hidden_counts,
     projected_count_distributions,
 )
+from .joint_counts import joint_count_marginals, project_joint_counts
 from .kyoku_outcome import OUTCOME_DEAL_IN_INDICATORS, OUTCOME_WINNER_INDICATORS
 from .losses import (
     LOSS_TERMS,
@@ -228,14 +229,14 @@ def validate_dataset_input_contract(
 
     expected_schema = (
         SHARED_MODEL_INPUT_SCHEMA_ID
-        if model_format == 13
+        if model_format in {13, 14}
         else MODEL_INPUT_SCHEMA_ID
         if model_format in {9, 10, 11, 12}
         else LEGACY_MODEL_INPUT_SCHEMA_ID
     )
     expected_channels = (
         SHARED_MODEL_INPUT_CHANNELS
-        if model_format == 13
+        if model_format in {13, 14}
         else MODEL_INPUT_CHANNELS
         if model_format in {9, 10, 11, 12}
         else OBS_CHANNELS
@@ -248,16 +249,16 @@ def validate_dataset_input_contract(
         if (
             schema is None
             and channels is None
-            and model_format not in {9, 10, 11, 12, 13}
+            and model_format not in {9, 10, 11, 12, 13, 14}
         ):
             continue
         if schema != expected_schema or channels != expected_channels:
             raise RuntimeError(f"{split} dataset uses a different model-input contract")
         event_schema = metadata.get("eventMemorySchema")
-        if model_format in {12, 13} and event_schema != EVENT_MEMORY_SCHEMA_ID:
+        if model_format in {12, 13, 14} and event_schema != EVENT_MEMORY_SCHEMA_ID:
             raise RuntimeError(f"{split} dataset has no compatible event memory")
         target_schema = metadata.get("trainingTargetSchema")
-        if model_format == 13 and target_schema != TRAINING_TARGET_SCHEMA_ID:
+        if model_format in {13, 14} and target_schema != TRAINING_TARGET_SCHEMA_ID:
             raise RuntimeError(f"{split} dataset has no compatible training targets")
 
 
@@ -265,7 +266,7 @@ def forward_batch(
     model: RiichiAnalysisModel, batch: Mapping[str, torch.Tensor]
 ) -> dict[str, torch.Tensor]:
     observation = batch["obs"].float()
-    if model.format_version in {12, 13}:
+    if model.format_version in {12, 13, 14}:
         return model(observation, batch["event_tokens"], batch["event_mask"])
     return model(observation)
 
@@ -466,6 +467,7 @@ def validate(
         structured = (
             "hidden_source_affinity" in outputs
             or "hidden_count_residual" in outputs
+            or "hidden_joint_residual" in outputs
         )
         deal_in_probability = (
             conditional_deal_in_probabilities(outputs)
@@ -550,13 +552,21 @@ def validate(
                 batch["concealed_red_count"],
                 batch["wall_red_count"],
             )
-            if "hidden_count_residual" in outputs:
-                physical_distribution, baseline = projected_count_distributions(
-                    outputs["hidden_count_residual"], inventory, capacities
-                )
-                hidden_count, hidden_red = physical_count_marginals(
-                    physical_distribution
-                )
+            if "hidden_count_residual" in outputs or "hidden_joint_residual" in outputs:
+                if "hidden_joint_residual" in outputs:
+                    prediction = project_joint_counts(outputs["hidden_joint_residual"], inventory, capacities)
+                    hidden_count, hidden_red, physical_distribution = prediction.marginals()
+                    _, _, baseline = joint_count_marginals(prediction.baseline)
+                    add_metric("hiddenJointLoss", prediction.loss(
+                        _physical_counts, inventory, batch["hidden_baseline_anchor"].bool()
+                    ).expand(len(inventory)))
+                else:
+                    physical_distribution, baseline = projected_count_distributions(
+                        outputs["hidden_count_residual"], inventory, capacities
+                    )
+                    hidden_count, hidden_red = physical_count_marginals(
+                        physical_distribution
+                    )
                 count_values = torch.arange(
                     5, device=device, dtype=physical_distribution.dtype
                 )
@@ -1114,16 +1124,16 @@ def save_checkpoint(
                 {
                     "modelInput": (
                         shared_model_input_metadata()
-                        if model.format_version == 13
+                        if model.format_version in {13, 14}
                         else model_input_metadata()
                     )
                 }
-                if model.format_version in {9, 10, 11, 12, 13}
+                if model.format_version in {9, 10, 11, 12, 13, 14}
                 else {}
             ),
             **(
                 {"semanticInput": semantic_input_metadata()}
-                if model.format_version in {12, 13}
+                if model.format_version in {12, 13, 14}
                 else {}
             ),
             "optimizer": optimizer.state_dict(),
@@ -1172,7 +1182,7 @@ def main() -> None:
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(
-        "--model-format", type=int, choices=(7, 8, 9, 10, 11, 12, 13), default=13
+        "--model-format", type=int, choices=(7, 8, 9, 10, 11, 12, 13, 14), default=13
     )
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
@@ -1209,7 +1219,7 @@ def main() -> None:
     parser.add_argument("--semantic-prior-version", type=int, choices=(1, 2), default=2)
     parser.add_argument(
         "--semantic-design-version", type=int, choices=(1, 2),
-        help="v13 architecture revision; defaults to 2 for new runs",
+        help="semantic head revision; defaults to 2 for v13/v14 (v14 requires 2)",
     )
     parser.add_argument(
         "--analysis-channels", type=int, default=288, help=argparse.SUPPRESS
@@ -1329,8 +1339,8 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
     amp_dtype = torch.float16 if device.type == "cuda" else None
 
-    if args.model_format in {12, 13}:
-        design_version = args.semantic_design_version or (2 if args.model_format == 13 else 1)
+    if args.model_format in {12, 13, 14}:
+        design_version = args.semantic_design_version or (2 if args.model_format in {13, 14} else 1)
         architecture = SemanticModelArchitecture(
             backbone=args.semantic_backbone,
             width=args.semantic_width,
@@ -1439,24 +1449,24 @@ def main() -> None:
         if checkpoint.get("format") != f"riichi-analysis-model-v{args.model_format}":
             raise RuntimeError("resume checkpoint has an unsupported format")
         checkpoint_architecture = checkpoint.get("modelArchitecture")
-        if args.model_format in {12, 13}:
+        if args.model_format in {12, 13, 14}:
             checkpoint_architecture = SemanticModelArchitecture.from_dict(
                 checkpoint_architecture
             ).to_dict()
         if checkpoint_architecture != architecture.to_dict():
             raise RuntimeError("resume checkpoint uses a different model architecture")
-        if args.model_format in {9, 10, 11, 12, 13} and checkpoint.get(
+        if args.model_format in {9, 10, 11, 12, 13, 14} and checkpoint.get(
             "modelInput"
         ) != (
             shared_model_input_metadata()
-            if args.model_format == 13
+            if args.model_format in {13, 14}
             else model_input_metadata()
         ):
             raise RuntimeError(
                 "resume checkpoint uses a different model-input contract"
             )
         if (
-            args.model_format in {12, 13}
+            args.model_format in {12, 13, 14}
             and checkpoint.get("semanticInput") != semantic_input_metadata()
         ):
             raise RuntimeError(
@@ -1612,13 +1622,13 @@ def main() -> None:
         fixture = next(iter(validation_loader))
     except StopIteration:
         fixture = None
-    if args.model_format in {8, 9, 10, 11, 12, 13}:
+    if args.model_format in {8, 9, 10, 11, 12, 13, 14}:
         def validate_fixture(value: Mapping[str, torch.Tensor]) -> dict[str, int]:
-            if args.model_format in {12, 13}:
+            if args.model_format in {12, 13, 14}:
                 return validate_semantic_training_batch(
                     value,
                     require_analysis_active=args.model_format >= 10,
-                    require_hidden_baseline_anchor=args.model_format == 13,
+                    require_hidden_baseline_anchor=args.model_format in {13, 14},
                 )
             return validate_v8_training_batch(
                 value, require_analysis_active=args.model_format >= 10

@@ -524,8 +524,9 @@ def test_v12_runtime_reconstructs_semantic_contract(tmp_path, monkeypatch) -> No
     assert runtime.model.architecture == architecture
 
 
+@pytest.mark.parametrize("format_version", [13, 14])
 def test_v13_runtime_reconstructs_engine_owned_input_contract(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, format_version
 ) -> None:
     architecture = SemanticModelArchitecture(
         backbone="cnn",
@@ -536,13 +537,14 @@ def test_v13_runtime_reconstructs_engine_owned_input_contract(
         event_blocks=1,
         decoder_width=20,
         attention_heads=4,
+        semantic_design_version=2,
     )
     checkpoint = tmp_path / "weights-v13.pt"
     torch.save(
         {
-            "format": "riichi-analysis-model-v13",
+            "format": f"riichi-analysis-model-v{format_version}",
             "model": RiichiAnalysisModel(
-                format_version=13, architecture=architecture
+                format_version=format_version, architecture=architecture
             ).state_dict(),
             "architecture": {
                 "model": architecture.to_dict(),
@@ -562,7 +564,7 @@ def test_v13_runtime_reconstructs_engine_owned_input_contract(
 
     runtime = AnalysisRuntime(checkpoint, "cpu")
 
-    assert runtime.format_version == 13
+    assert runtime.format_version == format_version
     assert runtime.model.architecture == architecture
 
 

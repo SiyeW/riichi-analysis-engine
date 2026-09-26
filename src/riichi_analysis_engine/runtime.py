@@ -37,6 +37,7 @@ from .hidden_transport import (
     physical_count_marginals,
     projected_count_distributions,
 )
+from .joint_counts import project_joint_counts
 from .kyoku_outcome import OUTCOME_CLASSES, outcome_marginals
 from .model import RiichiAnalysisModel
 from .model_input import (
@@ -299,19 +300,20 @@ class AnalysisRuntime:
             "riichi-analysis-model-v11": 11,
             "riichi-analysis-model-v12": 12,
             "riichi-analysis-model-v13": 13,
+            "riichi-analysis-model-v14": 14,
         }
         if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
         self.format_version = formats[model_format]
-        if self.format_version in {9, 10, 11, 12, 13}:
+        if self.format_version in {9, 10, 11, 12, 13, 14}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict) or architecture.get("modelInput") != (
                 shared_model_input_metadata()
-                if self.format_version == 13
+                if self.format_version in {13, 14}
                 else model_input_metadata()
             ):
                 raise RuntimeError("weight file uses a different model-input contract")
-        if self.format_version in {12, 13}:
+        if self.format_version in {12, 13, 14}:
             architecture = payload.get("architecture")
             if (
                 not isinstance(architecture, dict)
@@ -331,14 +333,14 @@ class AnalysisRuntime:
                 or architecture.get("predictionValues") != expected_values
             ):
                 raise RuntimeError("weight file uses different prediction values")
-        if self.format_version in {6, 7, 8, 9, 10, 11, 12, 13}:
+        if self.format_version in {6, 7, 8, 9, 10, 11, 12, 13, 14}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict):
                 raise RuntimeError("weight file has no architecture metadata")
             try:
                 architecture_type = (
                     SemanticModelArchitecture
-                    if self.format_version in {12, 13}
+                    if self.format_version in {12, 13, 14}
                     else StructuredModelArchitecture
                     if self.format_version in {8, 9, 10, 11}
                     else ModelArchitecture
@@ -361,16 +363,16 @@ class AnalysisRuntime:
         self._sessions: dict[str, RuntimeSession] = {}
         observation_channels = (
             SHARED_MODEL_INPUT_CHANNELS
-            if self.format_version == 13
+            if self.format_version in {13, 14}
             else MODEL_INPUT_CHANNELS
-            if self.format_version in {9, 10, 11, 12, 13}
+            if self.format_version in {9, 10, 11, 12, 13, 14}
             else OBS_CHANNELS
             if self.format_version in {6, 7, 8}
             else MORTAL_OBS_CHANNELS
         )
         with torch.inference_mode():
             observation = torch.zeros(1, observation_channels, 34, device=self.device)
-            if self.format_version in {12, 13}:
+            if self.format_version in {12, 13, 14}:
                 self.model(
                     observation,
                     torch.zeros(
@@ -442,7 +444,7 @@ class AnalysisRuntime:
         rule_state: PublicRuleState | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         observation, mask = state.encode_obs(4, at_kan_select)
-        if self.format_version in {9, 10, 11, 12, 13}:
+        if self.format_version in {9, 10, 11, 12, 13, 14}:
             if analysis_observation is None:
                 raise ValueError(
                     "semantic model formats require the public-history observation"
@@ -461,7 +463,7 @@ class AnalysisRuntime:
                         rule_state=rule_state,
                     ),
                 )
-                if self.format_version == 13
+                if self.format_version in {13, 14}
                 else compose_model_input(
                     analysis_observation, extract_policy_context(observation)
                 )
@@ -499,7 +501,7 @@ class AnalysisRuntime:
             rule_state.process(event)
         analysis_observation = (
             self._analysis_observation(events, controlled_seat)
-            if self.format_version in {9, 10, 11, 12, 13}
+            if self.format_version in {9, 10, 11, 12, 13, 14}
             else None
         )
         observation, _mask = self._encode_observation(
@@ -556,7 +558,7 @@ class AnalysisRuntime:
         score_state = session.score_state
         analysis_observation = (
             session.analysis_observation()
-            if self.format_version in {9, 10, 11, 12, 13}
+            if self.format_version in {9, 10, 11, 12, 13, 14}
             else None
         )
         observation, _primary_mask = self._encode_observation(
@@ -568,7 +570,7 @@ class AnalysisRuntime:
         )
         tensor = torch.from_numpy(observation).unsqueeze(0).to(self.device)
         semantic_memory: tuple[torch.Tensor, torch.Tensor] | None = None
-        if self.format_version in {12, 13}:
+        if self.format_version in {12, 13, 14}:
             event_tokens, event_mask = session.semantic_event_memory()
             semantic_memory = (
                 event_tokens.to(self.device),
@@ -634,7 +636,13 @@ class AnalysisRuntime:
             )
             inventory_tensor = torch.from_numpy(physical_inventory).unsqueeze(0)
             capacity_tensor = torch.from_numpy(source_capacities).unsqueeze(0)
-            if "hidden_count_residual" in outputs:
+            if "hidden_joint_residual" in outputs:
+                prediction = project_joint_counts(
+                    outputs["hidden_joint_residual"].unsqueeze(0),
+                    inventory_tensor, capacity_tensor,
+                )
+                hidden_counts, hidden_red, _ = prediction.marginals()
+            elif "hidden_count_residual" in outputs:
                 physical_distribution, _baseline = projected_count_distributions(
                     outputs["hidden_count_residual"].unsqueeze(0),
                     inventory_tensor,
@@ -998,7 +1006,7 @@ class AnalysisRuntime:
                     torch.from_numpy(selection_observation).unsqueeze(0).to(self.device)
                 )
                 with torch.inference_mode():
-                    if semantic_state is not None and self.format_version == 13:
+                    if semantic_state is not None and self.format_version in {13, 14}:
                         # Rule facts enter the v13 readout queries. Replacing a
                         # context vector after encoding is not equivalent.
                         selection_policy = self.model.semantic_model(

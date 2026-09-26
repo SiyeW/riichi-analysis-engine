@@ -15,6 +15,7 @@ from .hidden_transport import (
     physical_hidden_counts,
     projected_count_distributions,
 )
+from .joint_counts import project_joint_counts
 from .model_input import MODEL_INPUT_CHANNELS, SHARED_MODEL_INPUT_CHANNELS
 from .observation_layout import JIKAZE_CHANNEL, WIND_TILE_START
 from .prediction_values import DORA_TAIL_START, SCORE_VALUES, score_class_mask
@@ -190,7 +191,13 @@ def _structured_multitask_losses(
         batch["concealed_red_count"],
         batch["wall_red_count"],
     )
-    if "hidden_count_residual" in outputs:
+    if "hidden_joint_residual" in outputs:
+        anchor = batch.get("hidden_baseline_anchor")
+        if anchor is None:
+            raise ValueError("v14 hidden-count training requires baseline anchors")
+        prediction = project_joint_counts(outputs["hidden_joint_residual"], inventory, capacities)
+        losses["hidden_allocation"] = prediction.loss(physical_counts, inventory, anchor.bool())
+    elif "hidden_count_residual" in outputs:
         probability, baseline = projected_count_distributions(
             outputs["hidden_count_residual"], inventory, capacities
         )
@@ -296,7 +303,9 @@ def multitask_losses(
     essential for dora/score heads, which have no label in a no-win batch.
     """
 
-    if "hidden_source_affinity" in outputs or "hidden_count_residual" in outputs:
+    if any(key in outputs for key in (
+        "hidden_source_affinity", "hidden_count_residual", "hidden_joint_residual"
+    )):
         return _structured_multitask_losses(outputs, batch)
 
     losses: dict[str, Tensor] = {}
