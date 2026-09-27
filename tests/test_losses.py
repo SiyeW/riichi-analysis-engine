@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from riichi_analysis_engine import losses as losses_module
 from riichi_analysis_engine.architecture import (
     ModelArchitecture,
     StructuredModelArchitecture,
@@ -224,7 +225,7 @@ def test_account_projections_enforce_their_conservation_laws() -> None:
     assert torch.allclose(scores.sum(-1), torch.tensor([10.5]), atol=1e-6)
 
 
-def test_v8_structured_losses_backpropagate() -> None:
+def test_v8_structured_losses_backpropagate(monkeypatch: pytest.MonkeyPatch) -> None:
     architecture = StructuredModelArchitecture(
         shared_channels=8,
         shared_blocks=1,
@@ -277,6 +278,23 @@ def test_v8_structured_losses_backpropagate() -> None:
     assert not active["dora_tail"]
     total.backward()
     assert model.shared_trunk.input.weight.grad is not None
+
+    def forbidden_hidden_counts(*_args: object) -> None:
+        raise AssertionError("excluded hidden loss must not calculate hidden counts")
+
+    monkeypatch.setattr(
+        losses_module, "physical_hidden_counts", forbidden_hidden_counts
+    )
+    no_hidden_terms = tuple(
+        name for name in LOSS_TERMS_V8 if name != "hidden_allocation"
+    )
+    no_hidden_total, no_hidden_losses, no_hidden_active, no_hidden_weights = (
+        multitask_loss(outputs, batch, LearnedUncertaintyBalancer(no_hidden_terms))
+    )
+    assert torch.isfinite(no_hidden_total)
+    assert tuple(no_hidden_losses) == no_hidden_terms
+    assert tuple(no_hidden_active) == no_hidden_terms
+    assert tuple(no_hidden_weights) == no_hidden_terms
 
 
 def test_structured_analysis_losses_use_only_the_canonical_frame_rows() -> None:
