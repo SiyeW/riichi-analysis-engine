@@ -56,13 +56,15 @@ from .model_input import (
     SHARED_MODEL_INPUT_CHANNELS,
     SHARED_MODEL_INPUT_SCHEMA_ID,
     V15_MODEL_INPUT_SCHEMA_ID,
+    V16_MODEL_INPUT_SCHEMA_ID,
     model_input_metadata,
     shared_model_input_metadata,
     v15_model_input_metadata,
+    v16_model_input_metadata,
 )
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
 from .semantic_input import EVENT_MEMORY_SCHEMA_ID, semantic_input_metadata
-from .storage import TRAINING_TARGET_SCHEMA_ID
+from .storage import TRAINING_TARGET_SCHEMA_ID, V16_TRAINING_TARGET_SCHEMA_ID
 from .structured_outputs import (
     conditional_deal_in_probabilities,
     fixed_total_values,
@@ -71,6 +73,7 @@ from .structured_outputs import (
 from .training_schema import (
     validate_semantic_training_batch,
     validate_v8_training_batch,
+    validate_v16_training_batch,
 )
 from .v15_facts import V15_FACTS_WIDTH
 
@@ -247,7 +250,9 @@ def validate_dataset_input_contract(
     """Fail before training when packs cannot supply the selected model input."""
 
     expected_schema = (
-        V15_MODEL_INPUT_SCHEMA_ID
+        V16_MODEL_INPUT_SCHEMA_ID
+        if model_format == 16
+        else V15_MODEL_INPUT_SCHEMA_ID
         if model_format == 15
         else SHARED_MODEL_INPUT_SCHEMA_ID
         if model_format in {13, 14}
@@ -257,7 +262,7 @@ def validate_dataset_input_contract(
     )
     expected_channels = (
         SHARED_MODEL_INPUT_CHANNELS
-        if model_format in {13, 14, 15}
+        if model_format in {13, 14, 15, 16}
         else MODEL_INPUT_CHANNELS
         if model_format in {9, 10, 11, 12}
         else OBS_CHANNELS
@@ -270,16 +275,24 @@ def validate_dataset_input_contract(
         if (
             schema is None
             and channels is None
-            and model_format not in {9, 10, 11, 12, 13, 14, 15}
+            and model_format not in {9, 10, 11, 12, 13, 14, 15, 16}
         ):
             continue
         if schema != expected_schema or channels != expected_channels:
             raise RuntimeError(f"{split} dataset uses a different model-input contract")
         event_schema = metadata.get("eventMemorySchema")
-        if model_format in {12, 13, 14, 15} and event_schema != EVENT_MEMORY_SCHEMA_ID:
+        if (
+            model_format in {12, 13, 14, 15, 16}
+            and event_schema != EVENT_MEMORY_SCHEMA_ID
+        ):
             raise RuntimeError(f"{split} dataset has no compatible event memory")
         target_schema = metadata.get("trainingTargetSchema")
-        if model_format in {13, 14, 15} and target_schema != TRAINING_TARGET_SCHEMA_ID:
+        expected_target = (
+            V16_TRAINING_TARGET_SCHEMA_ID
+            if model_format == 16
+            else TRAINING_TARGET_SCHEMA_ID
+        )
+        if model_format in {13, 14, 15, 16} and target_schema != expected_target:
             raise RuntimeError(f"{split} dataset has no compatible training targets")
 
 
@@ -287,6 +300,18 @@ def forward_batch(
     model: RiichiAnalysisModel, batch: Mapping[str, torch.Tensor]
 ) -> dict[str, torch.Tensor]:
     observation = batch["obs"].float()
+    if model.format_version == 16:
+        from .v16_candidates import candidate_features_from_codes
+
+        return model(
+            observation,
+            batch["event_tokens"],
+            batch["event_mask"],
+            batch["v15_facts"].float(),
+            batch["public_meld_count"],
+            candidate_features_from_codes(batch["candidate_codes"]),
+            batch["candidate_mask"],
+        )
     if model.format_version == 15:
         return model(
             observation,
@@ -400,6 +425,8 @@ def validate(
     # Label marginals, kept to build the null baseline each loss is compared
     # against: what a model that only knows the label distribution would score.
     policy_labels = np.zeros(46, dtype=np.int64)
+    complete_policy_null_sum = 0.0
+    complete_policy_null_count = 0
     shanten_labels = np.zeros(7, dtype=np.int64)
     balance_totals: dict[str, float] = {name: 0.0 for name in loss_terms}
     batches = 0
@@ -432,14 +459,20 @@ def validate(
             totals[name] += float(value)
         for name, value in weights.items():
             balance_totals[name] += float(value)
-        policy_valid = batch["policy"] >= 0
+        policy_target = batch.get("candidate_label", batch["policy"])
+        policy_mask = batch.get("candidate_mask", batch["action_mask"])
+        policy_valid = policy_target >= 0
         policy_labels += (
             torch.bincount(batch["policy"][policy_valid], minlength=46).cpu().numpy()
         )
-        policy_logits = outputs["policy"].masked_fill(~batch["action_mask"], -torch.inf)
+        if "candidate_label" in batch and policy_valid.any():
+            legal_counts = policy_mask[policy_valid].sum(dim=-1).float()
+            complete_policy_null_sum += float(legal_counts.log().sum())
+            complete_policy_null_count += int(policy_valid.sum())
+        policy_logits = outputs["policy"].masked_fill(~policy_mask.bool(), -torch.inf)
         add_metric(
             "policyAccuracy",
-            policy_logits.argmax(-1) == batch["policy"],
+            policy_logits.argmax(-1) == policy_target,
             policy_valid,
         )
         analysis_rows = batch.get("analysis_active")
@@ -706,18 +739,24 @@ def validate(
                 outputs["wall_red_count"].argmax(-1) == batch["wall_red_count"],
             )
             dora_point = F.softplus(outputs["dora_point"])
+        winner_mask = batch["winner_mask"].bool()
+        current_dora = batch.get("current_concealed_dora")
+        dora_target = current_dora if current_dora is not None else batch["dora"]
+        dora_mask = (
+            torch.ones_like(winner_mask) if current_dora is not None else winner_mask
+        )
         add_metric(
             "doraMae",
-            (dora_point - batch["dora"].float()).abs(),
-            batch["winner_mask"].bool(),
+            (dora_point - dora_target.float()).abs(),
+            dora_mask,
         )
-        winner_mask = batch["winner_mask"].bool()
-        if winner_mask.any():
+        if dora_mask.any():
             add_metric(
                 "doraDistributionAccuracy",
-                outputs["dora_distribution"][winner_mask].argmax(-1)
-                == batch["dora"].long()[winner_mask].clamp_max(DORA_TAIL_START),
+                outputs["dora_distribution"][dora_mask].argmax(-1)
+                == dora_target.long()[dora_mask].clamp_max(DORA_TAIL_START),
             )
+        if winner_mask.any():
             add_metric(
                 "scoreDistributionAccuracy",
                 masked_score_logits(outputs, batch["obs"])[winner_mask].argmax(-1)
@@ -787,7 +826,11 @@ def validate(
         if name in result and count:
             result[name] = conditional_loss_sums[name] / count
     nulls = {
-        "policy": _label_entropy(policy_labels),
+        "policy": (
+            complete_policy_null_sum / complete_policy_null_count
+            if complete_policy_null_count
+            else _label_entropy(policy_labels)
+        ),
         "shanten": _label_entropy(shanten_labels),
     }
     for name, value in nulls.items():
@@ -1168,19 +1211,21 @@ def save_checkpoint(
             **(
                 {
                     "modelInput": (
-                        v15_model_input_metadata()
+                        v16_model_input_metadata()
+                        if model.format_version == 16
+                        else v15_model_input_metadata()
                         if model.format_version == 15
                         else shared_model_input_metadata()
                         if model.format_version in {13, 14}
                         else model_input_metadata()
                     )
                 }
-                if model.format_version in {9, 10, 11, 12, 13, 14, 15}
+                if model.format_version in {9, 10, 11, 12, 13, 14, 15, 16}
                 else {}
             ),
             **(
                 {"semanticInput": semantic_input_metadata()}
-                if model.format_version in {12, 13, 14, 15}
+                if model.format_version in {12, 13, 14, 15, 16}
                 else {}
             ),
             "optimizer": optimizer.state_dict(),
@@ -1231,7 +1276,7 @@ def main() -> None:
     parser.add_argument(
         "--model-format",
         type=int,
-        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15),
+        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
         default=13,
     )
     parser.add_argument("--shared-channels", type=int, default=256)
@@ -1399,7 +1444,7 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
     amp_dtype = torch.float16 if device.type == "cuda" else None
     if args.count_projection_execution == "cuda-graph" and (
-        args.model_format not in {14, 15}
+        args.model_format not in {14, 15, 16}
         or device.type != "cuda"
         or (args.loss_term and "hidden_allocation" not in args.loss_term)
     ):
@@ -1407,7 +1452,7 @@ def main() -> None:
             "CUDA count replay requires model format 14/15, CUDA, and the hidden_allocation loss"
         )
 
-    if args.model_format == 15:
+    if args.model_format in {15, 16}:
         architecture = V15Architecture(
             width=args.semantic_width,
             blocks=args.v15_blocks,
@@ -1528,7 +1573,7 @@ def main() -> None:
         if checkpoint.get("format") != f"riichi-analysis-model-v{args.model_format}":
             raise RuntimeError("resume checkpoint has an unsupported format")
         checkpoint_architecture = checkpoint.get("modelArchitecture")
-        if args.model_format == 15:
+        if args.model_format in {15, 16}:
             checkpoint_architecture = V15Architecture.from_dict(
                 checkpoint_architecture
             ).to_dict()
@@ -1538,10 +1583,12 @@ def main() -> None:
             ).to_dict()
         if checkpoint_architecture != architecture.to_dict():
             raise RuntimeError("resume checkpoint uses a different model architecture")
-        if args.model_format in {9, 10, 11, 12, 13, 14, 15} and checkpoint.get(
+        if args.model_format in {9, 10, 11, 12, 13, 14, 15, 16} and checkpoint.get(
             "modelInput"
         ) != (
-            v15_model_input_metadata()
+            v16_model_input_metadata()
+            if args.model_format == 16
+            else v15_model_input_metadata()
             if args.model_format == 15
             else shared_model_input_metadata()
             if args.model_format in {13, 14}
@@ -1551,7 +1598,7 @@ def main() -> None:
                 "resume checkpoint uses a different model-input contract"
             )
         if (
-            args.model_format in {12, 13, 14, 15}
+            args.model_format in {12, 13, 14, 15, 16}
             and checkpoint.get("semanticInput") != semantic_input_metadata()
         ):
             raise RuntimeError(
@@ -1705,14 +1752,17 @@ def main() -> None:
         fixture = next(iter(validation_loader))
     except StopIteration:
         fixture = None
-    if args.model_format in {8, 9, 10, 11, 12, 13, 14, 15}:
+    if args.model_format in {8, 9, 10, 11, 12, 13, 14, 15, 16}:
 
         def validate_fixture(value: Mapping[str, torch.Tensor]) -> dict[str, int]:
-            if args.model_format in {12, 13, 14, 15}:
+            if args.model_format in {12, 13, 14, 15, 16}:
+                if args.model_format == 16:
+                    return validate_v16_training_batch(value)
                 result = validate_semantic_training_batch(
                     value,
                     require_analysis_active=args.model_format >= 10,
-                    require_hidden_baseline_anchor=args.model_format in {13, 14, 15},
+                    require_hidden_baseline_anchor=args.model_format
+                    in {13, 14, 15, 16},
                 )
                 if args.model_format == 15:
                     facts = value.get("v15_facts")

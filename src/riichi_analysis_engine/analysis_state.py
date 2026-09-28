@@ -12,6 +12,8 @@ from typing import Any
 
 import numpy as np
 
+from .constants import TILE37_TO_ACTION
+
 PLAYERS = 4
 TILE_DIM = 37
 VISIBILITY_HIDDEN = "hidden"
@@ -160,6 +162,25 @@ class PublicHistoryState:
         self.honba = 0
         self.kyotaku = 0
         self.scores = [25_000] * PLAYERS
+
+    def physical_meld_counts(self, perspective: int) -> np.ndarray:
+        """Four relative players by canonical physical tile, including ankans."""
+
+        if not 0 <= perspective < PLAYERS:
+            raise ValueError("perspective must be one of four players")
+        result = np.zeros((PLAYERS, TILE_DIM), dtype=np.uint8)
+        for relative in range(PLAYERS):
+            absolute = (perspective + relative) % PLAYERS
+            for counts, _closed in self.melds[absolute]:
+                for source_index in np.flatnonzero(counts):
+                    target_index = TILE37_TO_ACTION[_TILE_NAMES[int(source_index)]]
+                    result[relative, target_index] += int(counts[source_index])
+        return result
+
+    def visible_dora_markers(self) -> tuple[str, ...]:
+        """Physical names of all indicators currently face up."""
+
+        return tuple(_TILE_NAMES[index] for index in self.dora_indicators)
 
     @staticmethod
     def _tile(name: str | None) -> int | None:

@@ -127,15 +127,19 @@ def _structured_multitask_losses(
 ) -> tuple[dict[str, Tensor], dict[str, bool]]:
     losses: dict[str, Tensor] = {}
     active: dict[str, bool] = {}
-    policy_valid = batch["policy"] >= 0
-    policy_logits = outputs["policy"].masked_fill(~batch["action_mask"], -torch.inf)
+    policy_labels = batch.get("candidate_label", batch["policy"])
+    policy_mask = batch.get("candidate_mask", batch["action_mask"])
+    policy_valid = policy_labels >= 0
+    policy_logits = outputs["policy"].masked_fill(~policy_mask.bool(), -torch.inf)
     if policy_valid.any():
         losses["policy"] = F.cross_entropy(
-            policy_logits[policy_valid], batch["policy"][policy_valid].long()
+            policy_logits[policy_valid], policy_labels[policy_valid].long()
         )
         active["policy"] = True
     else:
-        losses["policy"] = outputs["policy"].sum() * 0
+        losses["policy"] = (
+            outputs["policy"].masked_fill(~policy_mask.bool(), 0).sum() * 0
+        )
         active["policy"] = False
 
     analysis_rows = batch.get("analysis_active")
@@ -240,13 +244,21 @@ def _structured_multitask_losses(
         active["hidden_allocation"] = True
 
     winner_mask = batch["winner_mask"].bool()
-    if winner_mask.any():
-        dora_labels = batch["dora"].long()
+    current_dora = batch.get("current_concealed_dora")
+    dora_labels = (current_dora if current_dora is not None else batch["dora"]).long()
+    dora_mask = (
+        torch.ones_like(winner_mask) if current_dora is not None else winner_mask
+    )
+    if dora_mask.any():
         losses["dora_distribution"] = F.cross_entropy(
-            outputs["dora_distribution"][winner_mask],
-            dora_labels[winner_mask].clamp_max(DORA_TAIL_START),
+            outputs["dora_distribution"][dora_mask],
+            dora_labels[dora_mask].clamp_max(DORA_TAIL_START),
         )
         active["dora_distribution"] = True
+    else:
+        losses["dora_distribution"] = outputs["dora_distribution"].sum() * 0
+        active["dora_distribution"] = False
+    if winner_mask.any():
         score_labels = batch["score"].long()[winner_mask]
         score_indices = score_class_indices(score_labels)
         score_logits = masked_score_logits(outputs, batch["obs"])
@@ -259,17 +271,14 @@ def _structured_multitask_losses(
         score_loss = F.cross_entropy(score_logits[winner_mask], score_indices)
         score_active = True
     else:
-        zero = outputs["dora_distribution"].sum() * 0
-        losses["dora_distribution"] = zero
-        active["dora_distribution"] = False
-        score_loss = zero
+        score_loss = outputs["score_distribution"].sum() * 0
         score_active = False
 
-    tail_mask = winner_mask & (batch["dora"] >= DORA_TAIL_START)
+    tail_mask = dora_mask & (dora_labels >= DORA_TAIL_START)
     if tail_mask.any():
         tail_mean = DORA_TAIL_START + F.softplus(outputs["dora_tail"])
         losses["dora_tail"] = F.mse_loss(
-            tail_mean[tail_mask], batch["dora"].float()[tail_mask]
+            tail_mean[tail_mask], dora_labels.float()[tail_mask]
         )
         active["dora_tail"] = True
     else:
@@ -339,15 +348,19 @@ def multitask_losses(
 
     losses: dict[str, Tensor] = {}
     active: dict[str, bool] = {}
-    policy_valid = batch["policy"] >= 0
-    policy_logits = outputs["policy"].masked_fill(~batch["action_mask"], -torch.inf)
+    policy_labels = batch.get("candidate_label", batch["policy"])
+    policy_mask = batch.get("candidate_mask", batch["action_mask"])
+    policy_valid = policy_labels >= 0
+    policy_logits = outputs["policy"].masked_fill(~policy_mask.bool(), -torch.inf)
     if policy_valid.any():
         losses["policy"] = F.cross_entropy(
-            policy_logits[policy_valid], batch["policy"][policy_valid].long()
+            policy_logits[policy_valid], policy_labels[policy_valid].long()
         )
         active["policy"] = True
     else:
-        losses["policy"] = outputs["policy"].sum() * 0
+        losses["policy"] = (
+            outputs["policy"].masked_fill(~policy_mask.bool(), 0).sum() * 0
+        )
         active["policy"] = False
 
     losses["shanten"] = F.cross_entropy(

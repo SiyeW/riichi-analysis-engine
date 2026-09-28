@@ -57,6 +57,18 @@ class V15Input(nn.Module):
         )
         self.type_norms = nn.ModuleList(nn.LayerNorm(width) for _ in range(5))
 
+    def encode_event_tiles(self, fields: Tensor) -> Tensor:
+        main_tile = fields[..., EVENT_TILE]
+        result = self.tile_roles[0](self.tile_identity(main_tile)) * (
+            main_tile != 0
+        ).unsqueeze(-1)
+        for offset, projection in enumerate(self.tile_roles[1:]):
+            tile = fields[..., EVENT_CONSUMED_START + offset]
+            result = result + projection(self.tile_identity(tile)) * (
+                tile != 0
+            ).unsqueeze(-1)
+        return result
+
     def forward(
         self,
         observation: Tensor,
@@ -131,7 +143,6 @@ class V15Input(nn.Module):
         fields = event_tokens.long()
         actor = fields[..., EVENT_ACTOR]
         target = fields[..., EVENT_TARGET]
-        main_tile = fields[..., EVENT_TILE]
         events = (
             self.event_type(fields[..., EVENT_TYPE])
             + self.tsumogiri(fields[..., EVENT_FLAGS] & 1)
@@ -139,15 +150,7 @@ class V15Input(nn.Module):
             + self.target_role(self.player_identity(target))
             * (target != 0).unsqueeze(-1)
         )
-        for offset, projection in enumerate(self.tile_roles):
-            tile = (
-                main_tile
-                if offset == 0
-                else fields[..., EVENT_CONSUMED_START + offset - 1]
-            )
-            events = events + projection(self.tile_identity(tile)) * (
-                tile != 0
-            ).unsqueeze(-1)
+        events = events + self.encode_event_tiles(fields)
         events = (
             events
             + _sinusoidal_positions(events.shape[1], events.shape[-1], events)[None]

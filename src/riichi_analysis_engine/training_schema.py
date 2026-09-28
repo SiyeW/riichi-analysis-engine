@@ -37,6 +37,7 @@ from .semantic_input import (
     PUBLIC_EVENT_TYPE_TO_ID,
     PUBLIC_EVENT_TYPES,
 )
+from .v16_candidates import ACTION_KINDS, CANDIDATE_CAPACITY, CANDIDATE_CODE_WIDTH
 
 V8_TRAINING_FIELDS = frozenset(
     {
@@ -260,7 +261,9 @@ def validate_semantic_training_batch(
     missing = sorted(SEMANTIC_TRAINING_FIELDS.difference(batch))
     if missing:
         _fail(f"missing fields: {', '.join(missing)}")
-    tokens = _shape(batch, "event_tokens", (batch["event_tokens"].shape[1], EVENT_FIELDS))
+    tokens = _shape(
+        batch, "event_tokens", (batch["event_tokens"].shape[1], EVENT_FIELDS)
+    )
     mask = _shape(batch, "event_mask", (tokens.shape[1],))
     if len(tokens) != result["samples"]:
         _fail("event memory batch length differs from obs")
@@ -272,20 +275,22 @@ def validate_semantic_training_batch(
     if (tokens[~mask] != 0).any():
         _fail("padded event tokens must be zero")
     valid = tokens[mask].long()
-    if ((valid[:, EVENT_TYPE] < 1) | (valid[:, EVENT_TYPE] > len(PUBLIC_EVENT_TYPES))).any():
+    if (
+        (valid[:, EVENT_TYPE] < 1) | (valid[:, EVENT_TYPE] > len(PUBLIC_EVENT_TYPES))
+    ).any():
         _fail("event memory contains an unsupported event type")
     for field in (EVENT_ACTOR, EVENT_TARGET):
         if ((valid[:, field] < 0) | (valid[:, field] > 4)).any():
             _fail("event memory contains an invalid player reference")
     if ((valid[:, EVENT_TILE] < 0) | (valid[:, EVENT_TILE] > 37)).any():
         _fail("event memory contains an invalid physical tile reference")
-    if not (
-        tokens[:, 0, EVENT_TYPE] == PUBLIC_EVENT_TYPE_TO_ID["start_kyoku"]
-    ).all():
+    if not (tokens[:, 0, EVENT_TYPE] == PUBLIC_EVENT_TYPE_TO_ID["start_kyoku"]).all():
         _fail("event memory must begin at start_kyoku")
     opponent_draw = (
-        tokens[..., EVENT_TYPE] == PUBLIC_EVENT_TYPE_TO_ID["tsumo"]
-    ) & (tokens[..., EVENT_ACTOR] != 1) & mask
+        (tokens[..., EVENT_TYPE] == PUBLIC_EVENT_TYPE_TO_ID["tsumo"])
+        & (tokens[..., EVENT_ACTOR] != 1)
+        & mask
+    )
     if (tokens[..., EVENT_TILE][opponent_draw] != 0).any():
         _fail("opponent draw identity leaked into semantic event memory")
     anchor = batch.get("hidden_baseline_anchor")
@@ -307,3 +312,51 @@ def validate_semantic_training_batch(
             else {}
         ),
     }
+
+
+def validate_v16_training_batch(batch: Mapping[str, Tensor]) -> dict[str, int]:
+    """Require exact current facts and complete policy candidates in v16 packs."""
+
+    result = validate_semantic_training_batch(
+        batch, require_hidden_baseline_anchor=True
+    )
+    rows = result["samples"]
+    codes = _shape(batch, "candidate_codes", (CANDIDATE_CAPACITY, CANDIDATE_CODE_WIDTH))
+    mask = _shape(batch, "candidate_mask", (CANDIDATE_CAPACITY,)).bool()
+    labels = _shape(batch, "candidate_label", ()).long()
+    if any(len(value) != rows for value in (codes, mask, labels)):
+        _fail("complete policy candidates do not match the batch length")
+    if (codes[~mask] != 0).any():
+        _fail("padded complete candidates must be zero")
+    valid_codes = codes[mask]
+    if len(valid_codes) and (
+        ((valid_codes[:, 0] < 1) | (valid_codes[:, 0] > len(ACTION_KINDS))).any()
+        or (valid_codes[:, 1] > 37).any()
+        or (valid_codes[:, 2] > 4).any()
+        or (valid_codes[:, 3] > 1).any()
+        or (valid_codes[:, 4:8] > 37).any()
+        or (valid_codes[:, 8] > 1).any()
+    ):
+        _fail("complete candidate contains an invalid field code")
+    if (mask[:, 1:] & ~mask[:, :-1]).any():
+        _fail("complete candidates must use a contiguous prefix")
+    if (mask.sum(-1) > CANDIDATE_CAPACITY).any():
+        _fail("too many complete candidates")
+    active = batch["policy"] >= 0
+    if (active != (labels >= 0)).any():
+        _fail("complete policy labels and coarse labels disagree on active rows")
+    if active.any():
+        if (labels[active] >= CANDIDATE_CAPACITY).any():
+            _fail("complete policy label exceeds candidate capacity")
+        selected = mask[torch.arange(rows, device=mask.device)[active], labels[active]]
+        if not selected.all():
+            _fail("complete policy label does not select a legal candidate")
+    if mask[~active].any():
+        _fail("analysis-only rows must not invent legal candidates")
+    meld = _shape(batch, "public_meld_count", (4, 37))
+    dora = _shape(batch, "current_concealed_dora", (3,))
+    if len(meld) != rows or len(dora) != rows:
+        _fail("v16 exact facts do not match the batch length")
+    if (meld < 0).any() or (dora < 0).any():
+        _fail("v16 exact facts contain negative counts")
+    return {**result, "completePolicyRows": int(active.sum())}

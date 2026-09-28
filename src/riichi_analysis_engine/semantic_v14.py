@@ -172,11 +172,6 @@ class V14Decoder(nn.Module):
         count_tiles[:, (4, 13, 22)] = self.five_fusion(
             torch.cat((state.tiles[:, (4, 13, 22)], state.tiles[:, 34:]), dim=-1)
         ).to(count_tiles.dtype)
-        # 0..36 are discard identities; 37..45 are non-discard actions.
-        action_tiles = torch.cat(
-            (tiles, tiles.new_zeros(len(tiles), ACTION_SPACE - 37, tiles.shape[-1])),
-            dim=1,
-        )
         seeds = {
             name: opponents
             for name in (
@@ -193,12 +188,20 @@ class V14Decoder(nn.Module):
         )
         for name in ("outcome", "kyoku_accounts", "placement", "match_score"):
             seeds[name] = global_state[:, None]
-        seeds["policy"] = (
+        seeds["policy"] = self.policy_seeds(state, tiles)
+        return {name: seed + self.task_queries[name] for name, seed in seeds.items()}
+
+    def policy_seeds(self, state: V14State, tiles: Tensor) -> Tensor:
+        # 0..36 are discard identities; 37..45 are non-discard actions.
+        action_tiles = torch.cat(
+            (tiles, tiles.new_zeros(len(tiles), ACTION_SPACE - 37, tiles.shape[-1])),
+            dim=1,
+        )
+        return (
             self.source_projection(state.players[:, 0])[:, None]
             + self.action_keys.weight[None]
             + action_tiles
         )
-        return {name: seed + self.task_queries[name] for name, seed in seeds.items()}
 
     def task_states(self, state: V14State) -> dict[str, Tensor]:
         seeds = self.question_seeds(state)
@@ -224,6 +227,12 @@ class V14Decoder(nn.Module):
             dim=1,
         )
         memory = self.memory_norm(memory)
+        raw_memory = getattr(state, "raw_memory", None)
+        if raw_memory is not None:
+            if raw_memory.shape != memory.shape:
+                raise ValueError("raw facts must align with the shared memory")
+            memory = torch.cat((memory, raw_memory), dim=1)
+            mask = torch.cat((mask, mask), dim=1)
         query = (
             query
             + self.task_attention(

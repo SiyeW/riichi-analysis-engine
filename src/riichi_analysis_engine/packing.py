@@ -30,12 +30,17 @@ from pathlib import Path
 import numpy as np
 
 from .constants import OBS_CHANNELS
-from .model_input import SHARED_MODEL_INPUT_SCHEMA_ID, V15_MODEL_INPUT_SCHEMA_ID
+from .model_input import (
+    SHARED_MODEL_INPUT_SCHEMA_ID,
+    V15_MODEL_INPUT_SCHEMA_ID,
+    V16_MODEL_INPUT_SCHEMA_ID,
+)
 from .semantic_input import EVENT_MEMORY_SCHEMA_ID
 from .storage import (
     PACK_CATALOG_FIELDS,
     SUPPORTED_STORAGE_FORMATS,
     TRAINING_TARGET_SCHEMA_ID,
+    V16_TRAINING_TARGET_SCHEMA_ID,
     concatenate_packed,
     normalize_packed_metadata,
     permute_packed,
@@ -519,13 +524,22 @@ def audit_packs(
                 if "training_target_schema" in source.files
                 else None
             )
+            expected_target = (
+                V16_TRAINING_TARGET_SCHEMA_ID
+                if pack_schema == V16_MODEL_INPUT_SCHEMA_ID
+                else TRAINING_TARGET_SCHEMA_ID
+            )
             if pack_target_schema is not None and (
                 pack_schema
-                not in {SHARED_MODEL_INPUT_SCHEMA_ID, V15_MODEL_INPUT_SCHEMA_ID}
-                or pack_target_schema != TRAINING_TARGET_SCHEMA_ID
+                not in {
+                    SHARED_MODEL_INPUT_SCHEMA_ID,
+                    V15_MODEL_INPUT_SCHEMA_ID,
+                    V16_MODEL_INPUT_SCHEMA_ID,
+                }
+                or pack_target_schema != expected_target
             ):
                 raise ValueError(f"{name} has an unsupported training-target schema")
-            if pack_schema == V15_MODEL_INPUT_SCHEMA_ID:
+            if pack_schema in {V15_MODEL_INPUT_SCHEMA_ID, V16_MODEL_INPUT_SCHEMA_ID}:
                 from .v15_facts import V15_FACTS_WIDTH
 
                 if "v15_facts" not in source.files or source["v15_facts"].shape != (
@@ -533,6 +547,27 @@ def audit_packs(
                     V15_FACTS_WIDTH,
                 ):
                     raise ValueError(f"{name} lacks complete v15 public facts")
+            if pack_schema == V16_MODEL_INPUT_SCHEMA_ID:
+                from .v16_candidates import CANDIDATE_CAPACITY, CANDIDATE_CODE_WIDTH
+
+                if (
+                    "public_meld_count" not in source.files
+                    or source["public_meld_count"].shape != (len(games), 4, 37)
+                    or "current_concealed_dora" not in source.files
+                    or source["current_concealed_dora"].shape != (len(games), 3)
+                ):
+                    raise ValueError(f"{name} lacks complete v16 public facts/targets")
+                if (
+                    "candidate_codes" not in source.files
+                    or source["candidate_codes"].shape
+                    != (len(games), CANDIDATE_CAPACITY, CANDIDATE_CODE_WIDTH)
+                    or "candidate_mask" not in source.files
+                    or source["candidate_mask"].shape
+                    != (len(games), CANDIDATE_CAPACITY)
+                    or "candidate_label" not in source.files
+                    or source["candidate_label"].shape != (len(games),)
+                ):
+                    raise ValueError(f"{name} lacks complete v16 action candidates")
             catalog_fields = PACK_CATALOG_FIELDS.intersection(source.files)
             if catalog_fields:
                 if catalog_fields != PACK_CATALOG_FIELDS:

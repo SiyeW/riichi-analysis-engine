@@ -19,6 +19,7 @@ from .model_input import (
     SHARED_MODEL_INPUT_CHANNELS,
     SHARED_MODEL_INPUT_SCHEMA_ID,
     V15_MODEL_INPUT_SCHEMA_ID,
+    V16_MODEL_INPUT_SCHEMA_ID,
 )
 from .semantic_input import EVENT_FIELDS, EVENT_MEMORY_SCHEMA_ID
 
@@ -37,6 +38,7 @@ LEGACY_STAGED_GAME_FORMATS = frozenset(
 )
 PACK_FORMAT = "riichi-analysis-global-pack-v3"
 TRAINING_TARGET_SCHEMA_ID = "riichi-analysis-training-target-v13"
+V16_TRAINING_TARGET_SCHEMA_ID = "riichi-analysis-training-target-v16-current-dora"
 PACKED_METADATA_FIELDS = frozenset(
     {
         "storage_format",
@@ -138,10 +140,35 @@ def pack_shard_arrays(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     obs = pack_observations(payload.pop("obs"))
     if obs.channels == SHARED_MODEL_INPUT_CHANNELS:
         input_schema = (
-            V15_MODEL_INPUT_SCHEMA_ID
+            V16_MODEL_INPUT_SCHEMA_ID
+            if "public_meld_count" in payload
+            else V15_MODEL_INPUT_SCHEMA_ID
             if "v15_facts" in payload
             else SHARED_MODEL_INPUT_SCHEMA_ID
         )
+        if "public_meld_count" in payload:
+            from .v16_candidates import CANDIDATE_CAPACITY, CANDIDATE_CODE_WIDTH
+
+            if payload["public_meld_count"].shape != (len(obs.nonzero), 4, 37):
+                raise ValueError("v16 public meld counts do not match observation rows")
+            if payload.get("current_concealed_dora", np.empty(0)).shape != (
+                len(obs.nonzero),
+                3,
+            ):
+                raise ValueError("v16 current concealed dora labels are missing")
+            if payload.get("candidate_codes", np.empty(0)).shape != (
+                len(obs.nonzero),
+                CANDIDATE_CAPACITY,
+                CANDIDATE_CODE_WIDTH,
+            ):
+                raise ValueError("v16 complete action codes are missing")
+            if payload.get("candidate_mask", np.empty(0)).shape != (
+                len(obs.nonzero),
+                CANDIDATE_CAPACITY,
+            ) or payload.get("candidate_label", np.empty(0)).shape != (
+                len(obs.nonzero),
+            ):
+                raise ValueError("v16 complete action masks or labels are missing")
         if "v15_facts" in payload:
             from .v15_facts import V15_FACTS_WIDTH
 

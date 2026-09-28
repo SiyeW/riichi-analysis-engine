@@ -17,7 +17,7 @@ def main() -> None:
     parser.add_argument(
         "--model-format",
         type=int,
-        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15),
+        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
         default=13,
     )
     parser.add_argument("--shared-channels", type=int, default=256)
@@ -52,6 +52,8 @@ def main() -> None:
     parser.add_argument("--semantic-event-blocks", type=int, default=4)
     parser.add_argument("--semantic-decoder-width", type=int, default=512)
     parser.add_argument("--semantic-attention-heads", type=int, default=8)
+    parser.add_argument("--v15-blocks", type=int, default=4)
+    parser.add_argument("--v15-feed-forward-width", type=int, default=512)
     parser.add_argument("--semantic-transformer-ff-multiplier", type=int, default=4)
     parser.add_argument("--semantic-transformer-tile-prior-blocks", type=int, default=0)
     parser.add_argument(
@@ -65,10 +67,12 @@ def main() -> None:
         help="semantic head revision; defaults to 2 for v13/v14 (v14 requires 2)",
     )
     args = parser.parse_args()
-    if args.model_format == 15:
+    if args.model_format in {15, 16}:
         architecture = V15Architecture(
             width=args.semantic_width,
+            blocks=args.v15_blocks,
             attention_heads=args.semantic_attention_heads,
+            feed_forward_width=args.v15_feed_forward_width,
             decoder_width=args.semantic_decoder_width,
         )
     elif args.model_format in {12, 13, 14}:

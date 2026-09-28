@@ -17,11 +17,13 @@ import numpy as np
 from .analysis_observation import IncrementalTilePlaneEncoder
 from .analysis_state import PublicHistoryState
 from .constants import OBS_VERSION, relative_players
+from .current_dora import current_concealed_dora
 from .frame_sampling import SAMPLING_STRATA, FrameSamplingPlan
 from .model_input import (
     MODEL_INPUT_SCHEMA_ID,
     SHARED_MODEL_INPUT_SCHEMA_ID,
     V15_MODEL_INPUT_SCHEMA_ID,
+    V16_MODEL_INPUT_SCHEMA_ID,
     compose_model_input,
     compose_shared_model_input,
     extract_policy_context,
@@ -44,10 +46,13 @@ from .semantic_input import EVENT_MEMORY_SCHEMA_ID, PublicEventHistoryEncoder
 from .storage import (
     STAGED_GAME_FORMAT,
     TRAINING_TARGET_SCHEMA_ID,
+    V16_TRAINING_TARGET_SCHEMA_ID,
     read_chunk_archive_meta,
     save_chunk_archive,
 )
 from .v15_facts import encode_v15_facts
+from .v16_candidates import CANDIDATE_CAPACITY, CANDIDATE_CODE_WIDTH, pack_candidate_set
+from .v16_legal_candidates import chosen_candidate_index, legal_candidates
 
 
 @dataclass(frozen=True)
@@ -305,6 +310,9 @@ def convert_game(
         analysis_active: bool,
         hidden_baseline_anchor: bool,
         at_kan_select: bool = False,
+        candidate_codes: np.ndarray | None = None,
+        candidate_mask: np.ndarray | None = None,
+        candidate_label: int = -1,
     ) -> None:
         analysis = analysis_encoder.encode(event, perspective)
         rule_context = (
@@ -316,7 +324,7 @@ def convert_game(
                 seat=perspective,
                 rule_state=rule_state,
             )
-            if model_format in {13, 15}
+            if model_format in {13, 15, 16}
             else None
         )
         observation = (
@@ -324,7 +332,7 @@ def convert_game(
                 analysis,
                 rule_context,
             )
-            if model_format in {13, 15}
+            if model_format in {13, 15, 16}
             else compose_model_input(
                 analysis, extract_policy_context(mortal_observation)
             )
@@ -351,12 +359,34 @@ def convert_game(
             "history_length": np.uint16(history_length),
             **targets,
         }
-        if model_format in {13, 15}:
+        if model_format in {13, 15, 16}:
             values["hidden_baseline_anchor"] = np.bool_(hidden_baseline_anchor)
-        if model_format == 15:
+        if model_format in {15, 16}:
             values["v15_facts"] = encode_v15_facts(
                 public_state, perspective, rule_context
             )
+        if model_format == 16:
+            if candidate_codes is None:
+                candidate_codes = np.zeros(
+                    (CANDIDATE_CAPACITY, CANDIDATE_CODE_WIDTH), dtype=np.uint8
+                )
+                candidate_mask = np.zeros(CANDIDATE_CAPACITY, dtype=bool)
+            if candidate_mask is None:
+                raise ValueError("v16 candidate codes require a matching mask")
+            values["candidate_codes"] = candidate_codes
+            values["candidate_mask"] = candidate_mask
+            values["candidate_label"] = np.int8(candidate_label)
+            opponents = relative_players(perspective)
+            values["current_concealed_dora"] = np.asarray(
+                [
+                    current_concealed_dora(
+                        full_state.hands[seat], full_state.dora_markers
+                    )
+                    for seat in opponents
+                ],
+                dtype=np.uint8,
+            )
+            values["public_meld_count"] = public_state.physical_meld_counts(perspective)
         for name, value in values.items():
             samples.setdefault(name, []).append(value)
 
@@ -426,6 +456,25 @@ def convert_game(
             mortal_observation, mask = encode_primary(perspective)
             if not bool(mask.any()):
                 continue
+            candidate_codes = None
+            candidate_mask = None
+            candidate_label = -1
+            if model_format == 16:
+                complete = legal_candidates(
+                    full_state, perspective, mask, cans, states[perspective]
+                )
+                try:
+                    candidate_label = chosen_candidate_index(
+                        complete, events, index, perspective, policy
+                    )
+                except ValueError as error:
+                    raise ValueError(
+                        f"complete policy mismatch at {source_id}:{index}, "
+                        f"seat={perspective}, coarse={policy}: {error}"
+                    ) from error
+                candidate_codes, candidate_mask = pack_candidate_set(
+                    complete, perspective
+                )
             frame_counts[policy_stratum]["kept"] += 1
             append_sample(
                 index,
@@ -439,9 +488,12 @@ def convert_game(
                 policy=policy,
                 analysis_active=(keep_analysis and perspective == analysis_perspective),
                 hidden_baseline_anchor=bool(hidden_baseline_anchors[perspective]),
+                candidate_codes=candidate_codes,
+                candidate_mask=candidate_mask,
+                candidate_label=candidate_label,
             )
             sampled.add(perspective)
-            if kan_tile is not None:
+            if kan_tile is not None and model_format != 16:
                 kan_observation, kan_mask = states[perspective].encode_obs(
                     OBS_VERSION, True
                 )
@@ -520,7 +572,9 @@ def convert_record_to_archive(
                 meta.get("format") == STAGED_GAME_FORMAT
                 and meta.get("modelInputSchema")
                 == (
-                    V15_MODEL_INPUT_SCHEMA_ID
+                    V16_MODEL_INPUT_SCHEMA_ID
+                    if model_format == 16
+                    else V15_MODEL_INPUT_SCHEMA_ID
                     if model_format == 15
                     else SHARED_MODEL_INPUT_SCHEMA_ID
                     if model_format == 13
@@ -528,8 +582,13 @@ def convert_record_to_archive(
                 )
                 and meta.get("eventMemorySchema") == EVENT_MEMORY_SCHEMA_ID
                 and (
-                    model_format not in {13, 15}
-                    or meta.get("trainingTargetSchema") == TRAINING_TARGET_SCHEMA_ID
+                    model_format not in {13, 15, 16}
+                    or meta.get("trainingTargetSchema")
+                    == (
+                        V16_TRAINING_TARGET_SCHEMA_ID
+                        if model_format == 16
+                        else TRAINING_TARGET_SCHEMA_ID
+                    )
                 )
                 and meta.get("frameSampling")
                 == (sampling_plan.metadata() if sampling_plan else None)
@@ -542,8 +601,14 @@ def convert_record_to_archive(
                     counts if isinstance(counts, dict) else {},
                     None,
                 )
+            if model_format == 16:
+                raise ValueError(
+                    "existing v16 stage has a different contract; preserve it"
+                )
             destination.unlink()
         except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
+            if model_format == 16:
+                raise
             destination.unlink()
     if mortal_python_root not in sys.path:
         sys.path.insert(0, mortal_python_root)
@@ -573,7 +638,11 @@ def convert_record_to_archive(
                 "frameCounts": converted.frame_counts,
             },
             training_target_schema=(
-                TRAINING_TARGET_SCHEMA_ID if model_format in {13, 15} else None
+                V16_TRAINING_TARGET_SCHEMA_ID
+                if model_format == 16
+                else TRAINING_TARGET_SCHEMA_ID
+                if model_format in {13, 15}
+                else None
             ),
         )
         return (
@@ -609,7 +678,9 @@ def main() -> None:
     parser.add_argument("--summary-name", default="summary.json")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--model-format", type=int, choices=(12, 13, 15), default=13)
+    parser.add_argument(
+        "--model-format", type=int, choices=(12, 13, 15, 16), default=13
+    )
     parser.add_argument("--frame-sampling-seed", type=int)
     parser.add_argument("--rare-action-frame-rate", type=float, default=1.0)
     parser.add_argument("--state-change-frame-rate", type=float, default=0.5)

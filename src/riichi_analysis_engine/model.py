@@ -340,7 +340,24 @@ class RiichiAnalysisModel(nn.Module):
         ) = None,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}:
+        if format_version not in {
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+        }:
             raise ValueError(f"unsupported model format version: {format_version}")
         if architecture is not None and format_version not in {
             6,
@@ -353,6 +370,7 @@ class RiichiAnalysisModel(nn.Module):
             13,
             14,
             15,
+            16,
         }:
             raise ValueError(
                 "only model formats v6 and later accept architecture metadata"
@@ -365,8 +383,9 @@ class RiichiAnalysisModel(nn.Module):
             | V15Architecture
             | None
         ) = None
-        if format_version == 15:
+        if format_version in {15, 16}:
             from .semantic_v15 import SemanticV15Model
+            from .semantic_v16 import SemanticV16Model
 
             if any(
                 value is not None
@@ -379,7 +398,11 @@ class RiichiAnalysisModel(nn.Module):
             if not isinstance(configured, V15Architecture):
                 raise TypeError("v15 requires V15Architecture")
             self.architecture = configured
-            self.semantic_model = SemanticV15Model(configured)
+            self.semantic_model = (
+                SemanticV16Model(configured)
+                if format_version == 16
+                else SemanticV15Model(configured)
+            )
             return
         if format_version in {12, 13, 14}:
             if any(
@@ -628,7 +651,27 @@ class RiichiAnalysisModel(nn.Module):
         event_tokens: Tensor | None = None,
         event_mask: Tensor | None = None,
         v15_facts: Tensor | None = None,
+        public_meld_count: Tensor | None = None,
+        candidate_features: Tensor | None = None,
+        candidate_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
+        if self.format_version == 16:
+            if any(
+                value is None
+                for value in (event_tokens, event_mask, v15_facts, public_meld_count)
+            ):
+                raise ValueError(
+                    "v16 requires events, public facts and exact meld counts"
+                )
+            return self.semantic_model(
+                observation,
+                event_tokens,
+                event_mask,
+                v15_facts,
+                public_meld_count,
+                candidate_features,
+                candidate_mask,
+            )
         if self.format_version == 15:
             if event_tokens is None or event_mask is None or v15_facts is None:
                 raise ValueError("v15 requires public facts and event memory")
@@ -975,7 +1018,7 @@ class RiichiAnalysisModel(nn.Module):
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
-    if model.format_version == 15:
+    if model.format_version in {15, 16}:
         modules = {
             "input": model.semantic_model.input,
             "backbone": model.semantic_model.blocks,
