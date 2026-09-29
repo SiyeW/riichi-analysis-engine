@@ -32,6 +32,14 @@ def test_training_revision_uses_checkpoint_environment() -> None:
     ("format_version", "architecture"),
     [
         (
+            14,
+            SemanticModelArchitecture(
+                width=16, stem_width=24, event_width=12, backbone_blocks=2,
+                event_blocks=1, decoder_width=20, attention_heads=4,
+                semantic_design_version=2,
+            ),
+        ),
+        (
             6,
             ModelArchitecture(
                 analysis_channels=16,
@@ -159,6 +167,20 @@ def test_training_revision_uses_checkpoint_environment() -> None:
                 attention_heads=4,
             ),
         ),
+        (
+            13,
+            SemanticModelArchitecture(
+                backbone="cnn",
+                width=16,
+                stem_width=24,
+                event_width=12,
+                backbone_blocks=1,
+                event_blocks=1,
+                decoder_width=20,
+                attention_heads=4,
+                semantic_design_version=2,
+            ),
+        ),
     ],
 )
 def test_export_preserves_model_architecture(
@@ -185,13 +207,13 @@ def test_export_preserves_model_architecture(
             "complete": False,
         },
     }
-    if format_version in {9, 10, 11, 12, 13}:
+    if format_version in {9, 10, 11, 12, 13, 14}:
         checkpoint["modelInput"] = (
             shared_model_input_metadata()
-            if format_version == 13
+            if format_version in {13, 14}
             else model_input_metadata()
         )
-    if format_version in {12, 13}:
+    if format_version in {12, 13, 14}:
         checkpoint["semanticInput"] = semantic_input_metadata()
     torch.save(checkpoint, source)
     monkeypatch.setattr(sys, "argv", ["export_weights", str(source), str(destination)])
@@ -201,13 +223,13 @@ def test_export_preserves_model_architecture(
     exported = torch.load(destination, map_location="cpu", weights_only=True)
     assert exported["format"] == f"riichi-analysis-model-v{format_version}"
     assert exported["architecture"]["model"] == architecture.to_dict()
-    if format_version in {9, 10, 11, 12, 13}:
+    if format_version in {9, 10, 11, 12, 13, 14}:
         assert exported["architecture"]["modelInput"] == (
             shared_model_input_metadata()
-            if format_version == 13
+            if format_version in {13, 14}
             else model_input_metadata()
         )
-    if format_version in {12, 13}:
+    if format_version in {12, 13, 14}:
         assert exported["architecture"]["semanticInput"] == semantic_input_metadata()
     assert exported["training"]["step"] == 10
     assert exported["training"]["samplesSeen"] == 320

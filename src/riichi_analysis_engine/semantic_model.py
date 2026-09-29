@@ -68,7 +68,11 @@ class SemanticInputStem(nn.Module):
     """Turn audited planes and event fields into entity-aligned tokens."""
 
     def __init__(
-        self, architecture: SemanticModelArchitecture, *, shared_rule_context: bool
+        self,
+        architecture: SemanticModelArchitecture,
+        *,
+        shared_rule_context: bool,
+        role_aware_events: bool = False,
     ) -> None:
         super().__init__()
         width = architecture.width
@@ -89,6 +93,13 @@ class SemanticInputStem(nn.Module):
         self.event_target = nn.Embedding(5, event_width)
         self.event_tile = nn.Embedding(PHYSICAL_TILE_TYPES + 1, event_width)
         self.event_flags = nn.Embedding(256, event_width)
+        # Old weight formats keep their exact historical event sum. New formats
+        # distinguish the main tile from the unordered multiset of hand tiles.
+        self.event_tile_fusion = (
+            nn.Linear(event_width * 2, event_width, bias=False)
+            if role_aware_events
+            else None
+        )
         self.event_output = nn.Sequential(
             nn.LayerNorm(event_width),
             nn.Linear(event_width, width),
@@ -151,26 +162,40 @@ class SemanticInputStem(nn.Module):
             )
             tile_state = tile_state + self.rule_tiles(physical_rule_tiles)
 
-        fields = event_tokens.long()
-        event_state = (
-            self.event_type(fields[..., EVENT_TYPE])
-            + self.event_actor(fields[..., EVENT_ACTOR])
-            + self.event_target(fields[..., EVENT_TARGET])
-            + self.event_tile(fields[..., EVENT_TILE])
-            + self.event_flags(fields[..., EVENT_FLAGS])
-        )
-        for offset in range(MAX_EVENT_CONSUMED):
-            event_state = event_state + self.event_tile(
-                fields[..., EVENT_CONSUMED_START + offset]
-            )
-        event_state = self.event_output(event_state)
-        event_state = event_state * event_mask.unsqueeze(-1)
+        event_state = self.encode_events(event_tokens) * event_mask.unsqueeze(-1)
         context = (
             self.encode_rule_context(observation)
             if self.shared_rule_context
             else self.encode_policy_context(observation)
         )
         return tile_state, event_state, context
+
+    def encode_events(self, event_tokens: Tensor) -> Tensor:
+        fields = event_tokens.long()
+        main_tile = self.event_tile(fields[..., EVENT_TILE])
+        if self.event_tile_fusion is not None:
+            consumed = fields[
+                ..., EVENT_CONSUMED_START : EVENT_CONSUMED_START + MAX_EVENT_CONSUMED
+            ]
+            hand_tiles = (
+                self.event_tile(consumed) * (consumed != 0).unsqueeze(-1)
+            ).sum(-2)
+            main_tile = self.event_tile_fusion(
+                torch.cat((main_tile, hand_tiles), dim=-1)
+            )
+        event_state = (
+            self.event_type(fields[..., EVENT_TYPE])
+            + self.event_actor(fields[..., EVENT_ACTOR])
+            + self.event_target(fields[..., EVENT_TARGET])
+            + main_tile
+            + self.event_flags(fields[..., EVENT_FLAGS])
+        )
+        if self.event_tile_fusion is None:
+            for offset in range(MAX_EVENT_CONSUMED):
+                event_state = event_state + self.event_tile(
+                    fields[..., EVENT_CONSUMED_START + offset]
+                )
+        return self.event_output(event_state)
 
     def encode_rule_context(self, observation: Tensor) -> Tensor:
         start = RULE_CONTEXT_START + RULE_TILE_CHANNELS
@@ -520,9 +545,12 @@ class StructuredSemanticDecoder(nn.Module):
         self.furiten = nn.Sequential(
             nn.Linear(width, hidden), nn.GELU(), nn.Linear(hidden, 1)
         )
+        self.joint_wait = (
+            shared_rule_context and architecture.semantic_design_version == 1
+        )
         self.wait: PairwiseLogits | JointOpponentWaitHead = (
             JointOpponentWaitHead(width, hidden)
-            if shared_rule_context
+            if self.joint_wait
             else PairwiseLogits(width, hidden)
         )
         if shared_rule_context:
@@ -562,7 +590,7 @@ class StructuredSemanticDecoder(nn.Module):
             "furiten_no_yaku": self.furiten(opponents).squeeze(-1),
             "deal_in_tile": (
                 self.wait(opponents, state.global_state)
-                if self.shared_rule_context
+                if self.joint_wait
                 else self.wait(opponents, base_tiles)
             ),
             "dora_distribution": self.dora(opponents),
@@ -607,6 +635,9 @@ class SemanticRiichiModel(nn.Module):
         super().__init__()
         self.architecture = architecture
         self.shared_rule_context = shared_rule_context
+        self.direct_rule_context = (
+            shared_rule_context and architecture.semantic_design_version >= 2
+        )
         self.input = SemanticInputStem(
             architecture, shared_rule_context=shared_rule_context
         )
@@ -634,6 +665,11 @@ class SemanticRiichiModel(nn.Module):
             event_mask,
             context if self.shared_rule_context else None,
         )
+        if self.direct_rule_context:
+            # The original v13 CNN only put this context in attention queries;
+            # it had no guaranteed path into the resulting entity values.
+            players = players + context.unsqueeze(1)
+            global_state = global_state + context
         return SemanticState(
             tiles=tiles,
             players=players,
@@ -646,11 +682,7 @@ class SemanticRiichiModel(nn.Module):
 
     def decode_policy(self, state: SemanticState, observation: Tensor) -> Tensor:
         if self.shared_rule_context:
-            current = state.decision_context
-            if current is None:
-                raise RuntimeError("shared rule context is missing from semantic state")
-            updated = self.input.encode_rule_context(observation)
-            return self.decoder.policy(state.global_state - current + updated, None)
+            raise ValueError("v13 policy context changes require exact re-encoding")
         return self.decoder.policy(
             state.global_state,
             self.input.encode_policy_context(observation),

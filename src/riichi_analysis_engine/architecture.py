@@ -150,6 +150,7 @@ class SemanticModelArchitecture:
     transformer_tile_prior_blocks: int = 0
     transformer_event_prior_blocks: int = 0
     semantic_prior_version: int = 2
+    semantic_design_version: int = 1
 
     def __post_init__(self) -> None:
         if self.backbone not in {"cnn", "transformer"}:
@@ -179,13 +180,14 @@ class SemanticModelArchitecture:
         invalid = [name for name, value in non_negative.items() if value < 0]
         if invalid:
             raise ValueError(
-                "architecture block counts must be non-negative: "
-                f"{', '.join(invalid)}"
+                f"architecture block counts must be non-negative: {', '.join(invalid)}"
             )
         if self.width % self.attention_heads:
             raise ValueError("semantic width must be divisible by attention heads")
         if self.semantic_prior_version not in {1, 2}:
             raise ValueError("semantic prior version must be 1 or 2")
+        if self.semantic_design_version not in {1, 2}:
+            raise ValueError("semantic design version must be 1 or 2")
 
     def to_dict(self) -> dict[str, str | int]:
         return asdict(self)
@@ -200,6 +202,7 @@ class SemanticModelArchitecture:
             "transformer_tile_prior_blocks",
             "transformer_event_prior_blocks",
             "semantic_prior_version",
+            "semantic_design_version",
         }
         missing = expected - set(value)
         extra = set(value) - expected
@@ -209,9 +212,7 @@ class SemanticModelArchitecture:
                 f"(missing={sorted(missing)}, extra={sorted(extra)})"
             )
         if type(value["backbone"]) is not str or not all(
-            type(item) is int
-            for name, item in value.items()
-            if name != "backbone"
+            type(item) is int for name, item in value.items() if name != "backbone"
         ):
             raise ValueError("model architecture values have invalid types")
         # v12 checkpoints written before the prior-enhanced Transformer did not
@@ -222,6 +223,42 @@ class SemanticModelArchitecture:
             "transformer_tile_prior_blocks": 0,
             "transformer_event_prior_blocks": 0,
             "semantic_prior_version": 1,
+            "semantic_design_version": 1,
             **value,
         }
         return cls(**compatible)
+
+
+@dataclass(frozen=True)
+class V15Architecture:
+    """Complete trainable shape of the mixed-entity v15 model."""
+
+    observation_version: int = 4
+    width: int = 256
+    blocks: int = 4
+    attention_heads: int = 8
+    feed_forward_width: int = 512
+    decoder_width: int = 512
+
+    def __post_init__(self) -> None:
+        if self.observation_version != 4:
+            raise ValueError("v15 requires observation version 4")
+        if any(
+            value <= 0
+            for name, value in asdict(self).items()
+            if name != "observation_version"
+        ):
+            raise ValueError("v15 architecture dimensions must be positive")
+        if self.width % self.attention_heads:
+            raise ValueError("v15 width must divide evenly among attention heads")
+
+    def to_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Any) -> V15Architecture:
+        if not isinstance(value, dict) or set(value) != set(cls.__dataclass_fields__):
+            raise ValueError("v15 architecture fields do not match")
+        if not all(type(item) is int for item in value.values()):
+            raise ValueError("v15 architecture values must be integers")
+        return cls(**value)

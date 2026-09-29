@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -24,8 +25,10 @@ from .architecture import (
     ModelArchitecture,
     SemanticModelArchitecture,
     StructuredModelArchitecture,
+    V15Architecture,
 )
 from .constants import OBS_CHANNELS
+from .count_acceleration import CudaGraphJointCounts
 from .dataset import PackDataset
 from .hidden_transport import (
     balanced_source_probabilities,
@@ -35,6 +38,7 @@ from .hidden_transport import (
     physical_hidden_counts,
     projected_count_distributions,
 )
+from .joint_counts import joint_count_marginals, project_joint_counts
 from .kyoku_outcome import OUTCOME_DEAL_IN_INDICATORS, OUTCOME_WINNER_INDICATORS
 from .losses import (
     LOSS_TERMS,
@@ -51,12 +55,16 @@ from .model_input import (
     MODEL_INPUT_SCHEMA_ID,
     SHARED_MODEL_INPUT_CHANNELS,
     SHARED_MODEL_INPUT_SCHEMA_ID,
+    V15_MODEL_INPUT_SCHEMA_ID,
+    V16_MODEL_INPUT_SCHEMA_ID,
     model_input_metadata,
     shared_model_input_metadata,
+    v15_model_input_metadata,
+    v16_model_input_metadata,
 )
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
 from .semantic_input import EVENT_MEMORY_SCHEMA_ID, semantic_input_metadata
-from .storage import TRAINING_TARGET_SCHEMA_ID
+from .storage import TRAINING_TARGET_SCHEMA_ID, V16_TRAINING_TARGET_SCHEMA_ID
 from .structured_outputs import (
     conditional_deal_in_probabilities,
     fixed_total_values,
@@ -65,7 +73,9 @@ from .structured_outputs import (
 from .training_schema import (
     validate_semantic_training_batch,
     validate_v8_training_batch,
+    validate_v16_training_batch,
 )
+from .v15_facts import V15_FACTS_WIDTH
 
 
 class TrainingInterrupted(Exception):
@@ -88,11 +98,25 @@ def gradient_total_norm(parameters: list[torch.nn.Parameter]) -> float:
 def gradients_are_finite(parameters: list[torch.nn.Parameter]) -> bool:
     """Return whether every materialized gradient can be applied safely."""
 
-    return all(
-        bool(torch.isfinite(parameter.grad).all())
+    finite = [
+        torch.isfinite(parameter.grad).all()
         for parameter in parameters
         if parameter.grad is not None
-    )
+    ]
+    # Keep reductions on the training device: a Python bool per parameter would
+    # synchronize the CUDA stream hundreds of times on every optimizer step.
+    return not finite or bool(torch.stack(finite).all())
+
+
+def gradient_max_abs(parameters: list[torch.nn.Parameter]) -> float:
+    """Measure the largest unscaled gradient with one device-to-host read."""
+
+    maxima = [
+        parameter.grad.detach().abs().max()
+        for parameter in parameters
+        if parameter.grad is not None and parameter.grad.numel()
+    ]
+    return float(torch.stack(maxima).max()) if maxima else 0.0
 
 
 def shared_gradient_geometry(
@@ -226,15 +250,19 @@ def validate_dataset_input_contract(
     """Fail before training when packs cannot supply the selected model input."""
 
     expected_schema = (
-        SHARED_MODEL_INPUT_SCHEMA_ID
-        if model_format == 13
+        V16_MODEL_INPUT_SCHEMA_ID
+        if model_format == 16
+        else V15_MODEL_INPUT_SCHEMA_ID
+        if model_format == 15
+        else SHARED_MODEL_INPUT_SCHEMA_ID
+        if model_format in {13, 14}
         else MODEL_INPUT_SCHEMA_ID
         if model_format in {9, 10, 11, 12}
         else LEGACY_MODEL_INPUT_SCHEMA_ID
     )
     expected_channels = (
         SHARED_MODEL_INPUT_CHANNELS
-        if model_format == 13
+        if model_format in {13, 14, 15, 16}
         else MODEL_INPUT_CHANNELS
         if model_format in {9, 10, 11, 12}
         else OBS_CHANNELS
@@ -247,16 +275,24 @@ def validate_dataset_input_contract(
         if (
             schema is None
             and channels is None
-            and model_format not in {9, 10, 11, 12, 13}
+            and model_format not in {9, 10, 11, 12, 13, 14, 15, 16}
         ):
             continue
         if schema != expected_schema or channels != expected_channels:
             raise RuntimeError(f"{split} dataset uses a different model-input contract")
         event_schema = metadata.get("eventMemorySchema")
-        if model_format in {12, 13} and event_schema != EVENT_MEMORY_SCHEMA_ID:
+        if (
+            model_format in {12, 13, 14, 15, 16}
+            and event_schema != EVENT_MEMORY_SCHEMA_ID
+        ):
             raise RuntimeError(f"{split} dataset has no compatible event memory")
         target_schema = metadata.get("trainingTargetSchema")
-        if model_format == 13 and target_schema != TRAINING_TARGET_SCHEMA_ID:
+        expected_target = (
+            V16_TRAINING_TARGET_SCHEMA_ID
+            if model_format == 16
+            else TRAINING_TARGET_SCHEMA_ID
+        )
+        if model_format in {13, 14, 15, 16} and target_schema != expected_target:
             raise RuntimeError(f"{split} dataset has no compatible training targets")
 
 
@@ -264,7 +300,26 @@ def forward_batch(
     model: RiichiAnalysisModel, batch: Mapping[str, torch.Tensor]
 ) -> dict[str, torch.Tensor]:
     observation = batch["obs"].float()
-    if model.format_version in {12, 13}:
+    if model.format_version == 16:
+        from .v16_candidates import candidate_features_from_codes
+
+        return model(
+            observation,
+            batch["event_tokens"],
+            batch["event_mask"],
+            batch["v15_facts"].float(),
+            batch["public_meld_count"],
+            candidate_features_from_codes(batch["candidate_codes"]),
+            batch["candidate_mask"],
+        )
+    if model.format_version == 15:
+        return model(
+            observation,
+            batch["event_tokens"],
+            batch["event_mask"],
+            batch["v15_facts"].float(),
+        )
+    if model.format_version in {12, 13, 14}:
         return model(observation, batch["event_tokens"], batch["event_mask"])
     return model(observation)
 
@@ -310,6 +365,7 @@ def resume_training_cursor(
     batch_size: int,
     *,
     allow_complete: bool = False,
+    allow_batch_size_transition: bool = False,
 ) -> tuple[int, int]:
     """Validate and return the next unread sample and completed update count."""
 
@@ -324,7 +380,10 @@ def resume_training_cursor(
         raise RuntimeError("resume checkpoint has an invalid pass-complete marker")
     if complete and not allow_complete:
         raise RuntimeError("resume checkpoint has already completed its training pass")
-    if int(cursor.get("batchSize", -1)) != batch_size:
+    saved_batch_size = int(cursor.get("batchSize", -1))
+    if saved_batch_size <= 0:
+        raise RuntimeError("resume checkpoint has an invalid training batch size")
+    if saved_batch_size != batch_size and not allow_batch_size_transition:
         raise RuntimeError("resume checkpoint uses a different training batch size")
 
     saved_datasets = checkpoint.get("datasets")
@@ -366,6 +425,8 @@ def validate(
     # Label marginals, kept to build the null baseline each loss is compared
     # against: what a model that only knows the label distribution would score.
     policy_labels = np.zeros(46, dtype=np.int64)
+    complete_policy_null_sum = 0.0
+    complete_policy_null_count = 0
     shanten_labels = np.zeros(7, dtype=np.int64)
     balance_totals: dict[str, float] = {name: 0.0 for name in loss_terms}
     batches = 0
@@ -373,6 +434,10 @@ def validate(
     metric_counts: dict[str, int] = {}
     deal_in_positive_histogram = np.zeros(1_000, dtype=np.int64)
     deal_in_negative_histogram = np.zeros(1_000, dtype=np.int64)
+    eligible_positive_histogram = np.zeros(1_000, dtype=np.int64)
+    eligible_negative_histogram = np.zeros(1_000, dtype=np.int64)
+    conditional_loss_sums = {"furiten_no_yaku": 0.0, "deal_in_tile": 0.0}
+    conditional_loss_counts = {"furiten_no_yaku": 0, "deal_in_tile": 0}
 
     def add_metric(
         name: str, values: torch.Tensor, mask: torch.Tensor | None = None
@@ -394,14 +459,20 @@ def validate(
             totals[name] += float(value)
         for name, value in weights.items():
             balance_totals[name] += float(value)
-        policy_valid = batch["policy"] >= 0
+        policy_target = batch.get("candidate_label", batch["policy"])
+        policy_mask = batch.get("candidate_mask", batch["action_mask"])
+        policy_valid = policy_target >= 0
         policy_labels += (
             torch.bincount(batch["policy"][policy_valid], minlength=46).cpu().numpy()
         )
-        policy_logits = outputs["policy"].masked_fill(~batch["action_mask"], -torch.inf)
+        if "candidate_label" in batch and policy_valid.any():
+            legal_counts = policy_mask[policy_valid].sum(dim=-1).float()
+            complete_policy_null_sum += float(legal_counts.log().sum())
+            complete_policy_null_count += int(policy_valid.sum())
+        policy_logits = outputs["policy"].masked_fill(~policy_mask.bool(), -torch.inf)
         add_metric(
             "policyAccuracy",
-            policy_logits.argmax(-1) == batch["policy"],
+            policy_logits.argmax(-1) == policy_target,
             policy_valid,
         )
         analysis_rows = batch.get("analysis_active")
@@ -457,6 +528,7 @@ def validate(
         structured = (
             "hidden_source_affinity" in outputs
             or "hidden_count_residual" in outputs
+            or "hidden_joint_residual" in outputs
         )
         deal_in_probability = (
             conditional_deal_in_probabilities(outputs)
@@ -477,6 +549,63 @@ def validate(
         deal_in_negative_histogram += (
             torch.bincount(deal_in_bins[~deal_in_target], minlength=1_000).cpu().numpy()
         )
+        tenpai = batch["shanten"] == 0
+        eligible_wait = tenpai & ~batch["furiten_no_yaku"].bool()
+        eligible_cells = eligible_wait.unsqueeze(-1).expand_as(deal_in_target)
+        positive_cells = eligible_cells & deal_in_target
+        negative_cells = eligible_cells & ~deal_in_target
+        conditional_loss_sums["furiten_no_yaku"] += float(
+            F.binary_cross_entropy_with_logits(
+                outputs["furiten_no_yaku"][tenpai],
+                batch["furiten_no_yaku"][tenpai].float(),
+                reduction="sum",
+            )
+        )
+        conditional_loss_counts["furiten_no_yaku"] += int(tenpai.sum())
+        conditional_loss_sums["deal_in_tile"] += float(
+            F.binary_cross_entropy_with_logits(
+                outputs["deal_in_tile"][eligible_cells],
+                batch["deal_in_tile"][eligible_cells].float(),
+                reduction="sum",
+            )
+        )
+        conditional_loss_counts["deal_in_tile"] += int(eligible_cells.sum())
+        add_metric("dealInEligiblePositiveMean", deal_in_probability, positive_cells)
+        add_metric("dealInEligibleNegativeMean", deal_in_probability, negative_cells)
+        conditional_wait_probability = outputs["deal_in_tile"].sigmoid()
+        add_metric(
+            "dealInEligibleConditionalPositiveMean",
+            conditional_wait_probability,
+            positive_cells,
+        )
+        add_metric(
+            "dealInEligibleConditionalNegativeMean",
+            conditional_wait_probability,
+            negative_cells,
+        )
+        wait_nll = F.binary_cross_entropy_with_logits(
+            outputs["deal_in_tile"], batch["deal_in_tile"].float(), reduction="none"
+        )
+        add_metric("dealInEligibleConditionalPositiveNll", wait_nll, positive_cells)
+        add_metric("dealInEligibleConditionalNegativeNll", wait_nll, negative_cells)
+        honor_cells = torch.zeros_like(eligible_cells)
+        honor_cells[..., 27:] = True
+        add_metric(
+            "dealInHonorPositiveMean",
+            deal_in_probability,
+            positive_cells & honor_cells,
+        )
+        add_metric(
+            "dealInHonorNegativeMean",
+            deal_in_probability,
+            negative_cells & honor_cells,
+        )
+        eligible_positive_histogram += (
+            torch.bincount(deal_in_bins[positive_cells], minlength=1_000).cpu().numpy()
+        )
+        eligible_negative_histogram += (
+            torch.bincount(deal_in_bins[negative_cells], minlength=1_000).cpu().numpy()
+        )
         if structured:
             _physical_counts, inventory, capacities = physical_hidden_counts(
                 batch["concealed_count"],
@@ -484,27 +613,48 @@ def validate(
                 batch["concealed_red_count"],
                 batch["wall_red_count"],
             )
-            if "hidden_count_residual" in outputs:
-                physical_distribution, baseline = projected_count_distributions(
-                    outputs["hidden_count_residual"], inventory, capacities
-                )
-                hidden_count, hidden_red = physical_count_marginals(
-                    physical_distribution
-                )
+            if "hidden_count_residual" in outputs or "hidden_joint_residual" in outputs:
+                if "hidden_joint_residual" in outputs:
+                    prediction = project_joint_counts(
+                        outputs["hidden_joint_residual"], inventory, capacities
+                    )
+                    hidden_count, hidden_red, physical_distribution = (
+                        prediction.marginals()
+                    )
+                    _, _, baseline = joint_count_marginals(prediction.baseline)
+                    add_metric(
+                        "hiddenJointLoss",
+                        prediction.loss(
+                            _physical_counts,
+                            inventory,
+                            batch["hidden_baseline_anchor"].bool(),
+                        ).expand(len(inventory)),
+                    )
+                else:
+                    physical_distribution, baseline = projected_count_distributions(
+                        outputs["hidden_count_residual"], inventory, capacities
+                    )
+                    hidden_count, hidden_red = physical_count_marginals(
+                        physical_distribution
+                    )
                 count_values = torch.arange(
                     5, device=device, dtype=physical_distribution.dtype
                 )
                 expected_physical = (physical_distribution * count_values).sum(-1)
                 anchor = batch["hidden_baseline_anchor"].bool()
-                active_family = (inventory[:, None, :] > 0).expand(
-                    -1, 4, -1
+                active_family = (inventory[:, None, :] > 0).expand(-1, 4, -1)
+                model_nll = (
+                    -physical_distribution.clamp_min(1e-12)
+                    .log()
+                    .gather(-1, _physical_counts.long().unsqueeze(-1))
+                    .squeeze(-1)
                 )
-                model_nll = -physical_distribution.clamp_min(1e-12).log().gather(
-                    -1, _physical_counts.long().unsqueeze(-1)
-                ).squeeze(-1)
-                theory_nll = -baseline.clamp_min(1e-12).log().gather(
-                    -1, _physical_counts.long().unsqueeze(-1)
-                ).squeeze(-1)
+                theory_nll = (
+                    -baseline.clamp_min(1e-12)
+                    .log()
+                    .gather(-1, _physical_counts.long().unsqueeze(-1))
+                    .squeeze(-1)
+                )
                 add_metric("hiddenCountNll", model_nll, active_family)
                 add_metric("hiddenTheoryNll", theory_nll, active_family)
                 evidence_family = active_family & ~anchor[:, None, None]
@@ -589,18 +739,24 @@ def validate(
                 outputs["wall_red_count"].argmax(-1) == batch["wall_red_count"],
             )
             dora_point = F.softplus(outputs["dora_point"])
+        winner_mask = batch["winner_mask"].bool()
+        current_dora = batch.get("current_concealed_dora")
+        dora_target = current_dora if current_dora is not None else batch["dora"]
+        dora_mask = (
+            torch.ones_like(winner_mask) if current_dora is not None else winner_mask
+        )
         add_metric(
             "doraMae",
-            (dora_point - batch["dora"].float()).abs(),
-            batch["winner_mask"].bool(),
+            (dora_point - dora_target.float()).abs(),
+            dora_mask,
         )
-        winner_mask = batch["winner_mask"].bool()
-        if winner_mask.any():
+        if dora_mask.any():
             add_metric(
                 "doraDistributionAccuracy",
-                outputs["dora_distribution"][winner_mask].argmax(-1)
-                == batch["dora"].long()[winner_mask].clamp_max(DORA_TAIL_START),
+                outputs["dora_distribution"][dora_mask].argmax(-1)
+                == dora_target.long()[dora_mask].clamp_max(DORA_TAIL_START),
             )
+        if winner_mask.any():
             add_metric(
                 "scoreDistributionAccuracy",
                 masked_score_logits(outputs, batch["obs"])[winner_mask].argmax(-1)
@@ -666,8 +822,15 @@ def validate(
     if should_stop is not None and should_stop():
         raise TrainingInterrupted
     result = {name: value / max(1, batches) for name, value in totals.items()}
+    for name, count in conditional_loss_counts.items():
+        if name in result and count:
+            result[name] = conditional_loss_sums[name] / count
     nulls = {
-        "policy": _label_entropy(policy_labels),
+        "policy": (
+            complete_policy_null_sum / complete_policy_null_count
+            if complete_policy_null_count
+            else _label_entropy(policy_labels)
+        ),
         "shanten": _label_entropy(shanten_labels),
     }
     for name, value in nulls.items():
@@ -690,6 +853,21 @@ def validate(
         result["metric/dealInAveragePrecisionApprox"] = float(
             np.sum(precision * recall_increment)
         )
+    eligible_positive_descending = eligible_positive_histogram[::-1].cumsum()
+    eligible_negative_descending = eligible_negative_histogram[::-1].cumsum()
+    eligible_positive_count = int(eligible_positive_histogram.sum())
+    if eligible_positive_count:
+        precision = eligible_positive_descending / np.maximum(
+            1, eligible_positive_descending + eligible_negative_descending
+        )
+        recall_increment = eligible_positive_histogram[::-1] / eligible_positive_count
+        result["metric/dealInEligibleAveragePrecisionApprox"] = float(
+            np.sum(precision * recall_increment)
+        )
+    result["metric/dealInEligibleCells"] = float(
+        conditional_loss_counts["deal_in_tile"]
+    )
+    result["metric/dealInEligiblePositiveCells"] = float(eligible_positive_count)
     result.update(
         {
             f"metric/{name}": metric_sums[name] / max(1, metric_counts[name])
@@ -743,6 +921,80 @@ def tail_learning_rate_factor(
         return 1.0
     progress = min(1.0, (samples_after_update - start) / tail_decay_samples)
     return 1.0 + (final_factor - 1.0) * progress
+
+
+def resolve_learning_rate_schedule(
+    requested: dict[str, object],
+    saved: dict[str, object] | None,
+    *,
+    next_sample: int,
+    allow_transition: bool,
+    validate_only: bool,
+) -> dict[str, object]:
+    """Keep a single-pass rate change explicit and tied to its exact cursor."""
+
+    if saved is None:
+        if allow_transition:
+            raise RuntimeError("learning-rate transition requires a saved schedule")
+        return requested
+    if validate_only:
+        return saved
+    if not allow_transition:
+        if saved != requested:
+            # A phased checkpoint can be resumed without spelling out its
+            # history again, provided the active rates and tail still match.
+            phases = saved.get("learningRatePhases")
+            if not isinstance(phases, list) or not phases:
+                raise RuntimeError(
+                    "resume checkpoint uses a different learning-rate schedule"
+                )
+            comparison = dict(saved)
+            comparison.pop("learningRatePhases")
+            if comparison != requested:
+                raise RuntimeError(
+                    "resume checkpoint uses a different learning-rate schedule"
+                )
+        return saved
+    if next_sample <= 0:
+        raise RuntimeError("learning-rate transition requires a positive exact cursor")
+    if requested["warmupSteps"] or requested["cooldownSteps"]:
+        raise RuntimeError("learning-rate transition requires a plateau schedule")
+    old = dict(saved)
+    phases = old.pop("learningRatePhases", None)
+    if phases is None:
+        phases = [{"startSample": 0, "learningRate": old["learningRate"]}]
+    if (
+        not isinstance(phases, list)
+        or not phases
+        or any(
+            not isinstance(phase, dict)
+            or not isinstance(phase.get("startSample"), int)
+            or not isinstance(phase.get("learningRate"), (float, int))
+            or phase["learningRate"] <= 0
+            or phase["startSample"] >= next_sample
+            for phase in phases
+        )
+        or phases[0]["startSample"] != 0
+        or phases[-1]["learningRate"] != old["learningRate"]
+        or any(
+            left["startSample"] >= right["startSample"]
+            for left, right in pairwise(phases)
+        )
+    ):
+        raise RuntimeError("resume checkpoint has invalid learning-rate phases")
+    old["learningRate"] = requested["learningRate"]
+    old["peakLearningRate"] = requested["peakLearningRate"]
+    if old != requested:
+        raise RuntimeError("learning-rate transition changed another schedule field")
+    if requested["learningRate"] == saved["learningRate"]:
+        raise RuntimeError("learning-rate transition did not change the rate")
+    return {
+        **requested,
+        "learningRatePhases": [
+            *phases,
+            {"startSample": next_sample, "learningRate": requested["learningRate"]},
+        ],
+    }
 
 
 def _label_entropy(counts: np.ndarray) -> float:
@@ -932,6 +1184,7 @@ def save_checkpoint(
     validation: dict[str, float] | None,
     learning_rate_schedule: dict[str, object] | None = None,
     resume_allowed: bool = True,
+    batch_size_phases: list[dict[str, int]] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -947,23 +1200,32 @@ def save_checkpoint(
                 "batchesConsumed": step,
                 "batchSize": batch_size,
                 "complete": pass_complete,
+                **(
+                    {"batchSizePhases": batch_size_phases}
+                    if batch_size_phases is not None
+                    else {}
+                ),
             },
             "model": model.state_dict(),
             "modelArchitecture": architecture.to_dict(),
             **(
                 {
                     "modelInput": (
-                        shared_model_input_metadata()
-                        if model.format_version == 13
+                        v16_model_input_metadata()
+                        if model.format_version == 16
+                        else v15_model_input_metadata()
+                        if model.format_version == 15
+                        else shared_model_input_metadata()
+                        if model.format_version in {13, 14}
                         else model_input_metadata()
                     )
                 }
-                if model.format_version in {9, 10, 11, 12, 13}
+                if model.format_version in {9, 10, 11, 12, 13, 14, 15, 16}
                 else {}
             ),
             **(
                 {"semanticInput": semantic_input_metadata()}
-                if model.format_version in {12, 13}
+                if model.format_version in {12, 13, 14, 15, 16}
                 else {}
             ),
             "optimizer": optimizer.state_dict(),
@@ -1012,7 +1274,10 @@ def main() -> None:
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(
-        "--model-format", type=int, choices=(7, 8, 9, 10, 11, 12, 13), default=13
+        "--model-format",
+        type=int,
+        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
+        default=13,
     )
     parser.add_argument("--shared-channels", type=int, default=256)
     parser.add_argument("--shared-blocks", type=int, default=30)
@@ -1041,12 +1306,20 @@ def main() -> None:
     parser.add_argument("--semantic-event-blocks", type=int, default=4)
     parser.add_argument("--semantic-decoder-width", type=int, default=512)
     parser.add_argument("--semantic-attention-heads", type=int, default=8)
+    parser.add_argument("--v15-blocks", type=int, default=4)
+    parser.add_argument("--v15-feed-forward-width", type=int, default=512)
     parser.add_argument("--semantic-transformer-ff-multiplier", type=int, default=4)
     parser.add_argument("--semantic-transformer-tile-prior-blocks", type=int, default=0)
     parser.add_argument(
         "--semantic-transformer-event-prior-blocks", type=int, default=0
     )
     parser.add_argument("--semantic-prior-version", type=int, choices=(1, 2), default=2)
+    parser.add_argument(
+        "--semantic-design-version",
+        type=int,
+        choices=(1, 2),
+        help="semantic head revision; defaults to 2 for v13/v14 (v14 requires 2)",
+    )
     parser.add_argument(
         "--analysis-channels", type=int, default=288, help=argparse.SUPPRESS
     )
@@ -1104,12 +1377,28 @@ def main() -> None:
     parser.add_argument("--keep-checkpoints", type=int, default=3)
     parser.add_argument("--resume", type=Path)
     parser.add_argument(
+        "--allow-batch-size-transition",
+        action="store_true",
+        help="explicitly continue a single pass with a new batch size",
+    )
+    parser.add_argument(
+        "--allow-learning-rate-transition",
+        action="store_true",
+        help="explicitly change the model learning rate at the exact resume cursor",
+    )
+    parser.add_argument(
         "--validate-only",
         action="store_true",
         help="validate a saved checkpoint without consuming more training samples",
     )
     parser.add_argument("--seed", type=int, default=314159)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--count-projection-execution",
+        choices=("eager", "cuda-graph"),
+        default="eager",
+        help="optional v14 training-only count replay; eager remains the portable default",
+    )
     parser.add_argument(
         "--loss-term",
         action="append",
@@ -1119,6 +1408,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_steps < 0:
         raise ValueError("max steps must be non-negative")
+    if args.allow_batch_size_transition and args.resume is None:
+        raise ValueError("batch-size transition requires --resume")
+    if args.allow_learning_rate_transition and args.resume is None:
+        raise ValueError("learning-rate transition requires --resume")
     if args.loader_prefetch <= 0:
         raise ValueError("loader prefetch must be positive")
     if args.max_analysis_samples < 0:
@@ -1150,8 +1443,28 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.benchmark = True
     amp_dtype = torch.float16 if device.type == "cuda" else None
+    if args.count_projection_execution == "cuda-graph" and (
+        args.model_format not in {14, 15, 16}
+        or device.type != "cuda"
+        or (args.loss_term and "hidden_allocation" not in args.loss_term)
+    ):
+        raise ValueError(
+            "CUDA count replay requires model format 14/15, CUDA, and the hidden_allocation loss"
+        )
 
-    if args.model_format in {12, 13}:
+    if args.model_format in {15, 16}:
+        architecture = V15Architecture(
+            width=args.semantic_width,
+            blocks=args.v15_blocks,
+            attention_heads=args.semantic_attention_heads,
+            feed_forward_width=args.v15_feed_forward_width,
+            decoder_width=args.semantic_decoder_width,
+        )
+        available_loss_terms = LOSS_TERMS_V8
+    elif args.model_format in {12, 13, 14}:
+        design_version = args.semantic_design_version or (
+            2 if args.model_format in {13, 14} else 1
+        )
         architecture = SemanticModelArchitecture(
             backbone=args.semantic_backbone,
             width=args.semantic_width,
@@ -1165,6 +1478,7 @@ def main() -> None:
             transformer_tile_prior_blocks=args.semantic_transformer_tile_prior_blocks,
             transformer_event_prior_blocks=args.semantic_transformer_event_prior_blocks,
             semantic_prior_version=args.semantic_prior_version,
+            semantic_design_version=design_version,
         )
         available_loss_terms = LOSS_TERMS_V8
     elif args.model_format in {8, 9, 10, 11}:
@@ -1249,6 +1563,7 @@ def main() -> None:
         "workers": args.loader_workers,
         "prefetchBatches": args.loader_prefetch if args.loader_workers else 0,
     }
+    batch_size_phases = [{"startSample": 0, "batchSize": args.batch_size}]
     if args.resume is not None:
         resume_path = resolve_resume_path(args.resume)
         print(json.dumps({"resumedFrom": str(resume_path)}))
@@ -1258,24 +1573,32 @@ def main() -> None:
         if checkpoint.get("format") != f"riichi-analysis-model-v{args.model_format}":
             raise RuntimeError("resume checkpoint has an unsupported format")
         checkpoint_architecture = checkpoint.get("modelArchitecture")
-        if args.model_format in {12, 13}:
+        if args.model_format in {15, 16}:
+            checkpoint_architecture = V15Architecture.from_dict(
+                checkpoint_architecture
+            ).to_dict()
+        elif args.model_format in {12, 13, 14}:
             checkpoint_architecture = SemanticModelArchitecture.from_dict(
                 checkpoint_architecture
             ).to_dict()
         if checkpoint_architecture != architecture.to_dict():
             raise RuntimeError("resume checkpoint uses a different model architecture")
-        if args.model_format in {9, 10, 11, 12, 13} and checkpoint.get(
+        if args.model_format in {9, 10, 11, 12, 13, 14, 15, 16} and checkpoint.get(
             "modelInput"
         ) != (
-            shared_model_input_metadata()
-            if args.model_format == 13
+            v16_model_input_metadata()
+            if args.model_format == 16
+            else v15_model_input_metadata()
+            if args.model_format == 15
+            else shared_model_input_metadata()
+            if args.model_format in {13, 14}
             else model_input_metadata()
         ):
             raise RuntimeError(
                 "resume checkpoint uses a different model-input contract"
             )
         if (
-            args.model_format in {12, 13}
+            args.model_format in {12, 13, 14, 15, 16}
             and checkpoint.get("semanticInput") != semantic_input_metadata()
         ):
             raise RuntimeError(
@@ -1299,7 +1622,39 @@ def main() -> None:
             datasets,
             args.batch_size,
             allow_complete=args.validate_only,
+            allow_batch_size_transition=args.allow_batch_size_transition,
         )
+        saved_cursor = checkpoint["trainingCursor"]
+        saved_batch_size = int(saved_cursor["batchSize"])
+        saved_phases = saved_cursor.get("batchSizePhases")
+        if saved_phases is None:
+            batch_size_phases = [{"startSample": 0, "batchSize": saved_batch_size}]
+        elif (
+            not isinstance(saved_phases, list)
+            or not saved_phases
+            or any(
+                not isinstance(phase, dict)
+                or not isinstance(phase.get("startSample"), int)
+                or not isinstance(phase.get("batchSize"), int)
+                or phase["batchSize"] <= 0
+                or phase["startSample"] < 0
+                or phase["startSample"] >= samples_seen
+                for phase in saved_phases
+            )
+            or saved_phases[0]["startSample"] != 0
+            or saved_phases[-1]["batchSize"] != saved_batch_size
+            or any(
+                left["startSample"] >= right["startSample"]
+                for left, right in pairwise(saved_phases)
+            )
+        ):
+            raise RuntimeError("resume checkpoint has invalid batch-size phases")
+        else:
+            batch_size_phases = [dict(phase) for phase in saved_phases]
+        if args.batch_size != saved_batch_size:
+            batch_size_phases.append(
+                {"startSample": samples_seen, "batchSize": args.batch_size}
+            )
         analysis_samples_seen = int(
             checkpoint.get(
                 "analysisSamplesSeen",
@@ -1358,12 +1713,13 @@ def main() -> None:
         learning_rate_schedule["sampleLimit"] = sample_limit
     if args.resume is not None:
         saved_schedule = checkpoint.get("learningRateSchedule")
-        if args.validate_only and isinstance(saved_schedule, dict):
-            learning_rate_schedule = saved_schedule
-        elif saved_schedule is not None and saved_schedule != learning_rate_schedule:
-            raise RuntimeError(
-                "resume checkpoint uses a different learning-rate schedule"
-            )
+        learning_rate_schedule = resolve_learning_rate_schedule(
+            learning_rate_schedule,
+            saved_schedule,
+            next_sample=samples_seen,
+            allow_transition=args.allow_learning_rate_transition,
+            validate_only=args.validate_only,
+        )
         if (
             not args.validate_only
             and saved_schedule is None
@@ -1396,14 +1752,28 @@ def main() -> None:
         fixture = next(iter(validation_loader))
     except StopIteration:
         fixture = None
-    if args.model_format in {8, 9, 10, 11, 12, 13}:
+    if args.model_format in {8, 9, 10, 11, 12, 13, 14, 15, 16}:
+
         def validate_fixture(value: Mapping[str, torch.Tensor]) -> dict[str, int]:
-            if args.model_format in {12, 13}:
-                return validate_semantic_training_batch(
+            if args.model_format in {12, 13, 14, 15, 16}:
+                if args.model_format == 16:
+                    return validate_v16_training_batch(value)
+                result = validate_semantic_training_batch(
                     value,
                     require_analysis_active=args.model_format >= 10,
-                    require_hidden_baseline_anchor=args.model_format == 13,
+                    require_hidden_baseline_anchor=args.model_format
+                    in {13, 14, 15, 16},
                 )
+                if args.model_format == 15:
+                    facts = value.get("v15_facts")
+                    if facts is None or facts.shape != (
+                        len(value["obs"]),
+                        V15_FACTS_WIDTH,
+                    ):
+                        raise ValueError("v15 batch lacks exact public facts")
+                    if not torch.isfinite(facts).all():
+                        raise ValueError("v15 public facts contain a non-finite value")
+                return result
             return validate_v8_training_batch(
                 value, require_analysis_active=args.model_format >= 10
             )
@@ -1416,9 +1786,7 @@ def main() -> None:
                 else {
                     "train": None,
                     "validation": (
-                        validate_fixture(fixture)
-                        if fixture is not None
-                        else None
+                        validate_fixture(fixture) if fixture is not None else None
                     ),
                 }
             )
@@ -1430,9 +1798,7 @@ def main() -> None:
             training_contract = {
                 "train": validate_fixture(train_fixture),
                 "validation": (
-                    validate_fixture(fixture)
-                    if fixture is not None
-                    else None
+                    validate_fixture(fixture) if fixture is not None else None
                 ),
             }
     else:
@@ -1457,6 +1823,7 @@ def main() -> None:
             "sampleLimit": sample_limit,
             "analysisSamplesSeen": analysis_samples_seen,
             "analysisSampleLimit": args.max_analysis_samples or None,
+            "batchSizePhases": batch_size_phases,
         },
         "environment": environment,
         "trainingContract": training_contract,
@@ -1500,6 +1867,7 @@ def main() -> None:
             environment=environment,
             validation=validation,
             learning_rate_schedule=learning_rate_schedule,
+            batch_size_phases=batch_size_phases,
             resume_allowed=(
                 True
                 if args.resume is None
@@ -1523,6 +1891,11 @@ def main() -> None:
         else 0
     )
     model.train()
+    joint_count_projector = (
+        CudaGraphJointCounts(args.batch_size, device)
+        if args.count_projection_execution == "cuda-graph" and not args.validate_only
+        else None
+    )
     trainable_parameters = [*model.parameters(), *balancer.parameters()]
     for batch in train_loader:
         if interrupt_requested:
@@ -1571,7 +1944,10 @@ def main() -> None:
                     else:
                         outputs = forward_batch(model, batch)
                     total, losses, active, weights = multitask_loss(
-                        outputs, batch, balancer
+                        outputs,
+                        batch,
+                        balancer,
+                        joint_count_projector=joint_count_projector,
                     )
                 if diagnose_gradients:
                     gradient_geometry = shared_gradient_geometry(losses, active, shared)
@@ -1590,12 +1966,12 @@ def main() -> None:
                 raise
             scaler.unscale_(optimizer)
             if gradients_are_finite(trainable_parameters):
-                gradient_norm = gradient_total_norm(trainable_parameters)
-                gradient_max = max(
-                    float(parameter.grad.abs().max())
-                    for parameter in trainable_parameters
-                    if parameter.grad is not None
-                )
+                # Finiteness is a safety check on EVERY step. Norm/max are
+                # telemetry only; compute them precisely when they are logged,
+                # before the optimizer, without changing or clipping gradients.
+                if step == 0 or (step + 1) % 100 == 0 or gradient_geometry:
+                    gradient_norm = gradient_total_norm(trainable_parameters)
+                    gradient_max = gradient_max_abs(trainable_parameters)
                 scaler.step(optimizer)
                 scaler.update()
                 break

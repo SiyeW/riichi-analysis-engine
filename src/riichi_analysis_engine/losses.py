@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import torch
 from torch import Tensor, nn
@@ -15,10 +15,13 @@ from .hidden_transport import (
     physical_hidden_counts,
     projected_count_distributions,
 )
+from .joint_counts import JointCountPrediction, project_joint_counts
 from .model_input import MODEL_INPUT_CHANNELS, SHARED_MODEL_INPUT_CHANNELS
 from .observation_layout import JIKAZE_CHANNEL, WIND_TILE_START
 from .prediction_values import DORA_TAIL_START, SCORE_VALUES, score_class_mask
 from .structured_outputs import fixed_total_values, zero_sum_accounts
+
+JointCountProjector = Callable[[Tensor, Tensor, Tensor], JointCountPrediction]
 
 # A term represents one independently supervised prediction, not a manually
 # chosen product priority. Their relative influence is learned during training
@@ -116,19 +119,27 @@ def masked_score_logits(outputs: Mapping[str, Tensor], observation: Tensor) -> T
 
 
 def _structured_multitask_losses(
-    outputs: Mapping[str, Tensor], batch: Mapping[str, Tensor]
+    outputs: Mapping[str, Tensor],
+    batch: Mapping[str, Tensor],
+    joint_count_projector: JointCountProjector | None = None,
+    *,
+    include_hidden_allocation: bool = True,
 ) -> tuple[dict[str, Tensor], dict[str, bool]]:
     losses: dict[str, Tensor] = {}
     active: dict[str, bool] = {}
-    policy_valid = batch["policy"] >= 0
-    policy_logits = outputs["policy"].masked_fill(~batch["action_mask"], -torch.inf)
+    policy_labels = batch.get("candidate_label", batch["policy"])
+    policy_mask = batch.get("candidate_mask", batch["action_mask"])
+    policy_valid = policy_labels >= 0
+    policy_logits = outputs["policy"].masked_fill(~policy_mask.bool(), -torch.inf)
     if policy_valid.any():
         losses["policy"] = F.cross_entropy(
-            policy_logits[policy_valid], batch["policy"][policy_valid].long()
+            policy_logits[policy_valid], policy_labels[policy_valid].long()
         )
         active["policy"] = True
     else:
-        losses["policy"] = outputs["policy"].sum() * 0
+        losses["policy"] = (
+            outputs["policy"].masked_fill(~policy_mask.bool(), 0).sum() * 0
+        )
         active["policy"] = False
 
     analysis_rows = batch.get("analysis_active")
@@ -184,47 +195,70 @@ def _structured_multitask_losses(
     )
     active["deal_in_tile"] = bool(eligible_wait.any())
 
-    physical_counts, inventory, capacities = physical_hidden_counts(
-        batch["concealed_count"],
-        batch["wall_count"],
-        batch["concealed_red_count"],
-        batch["wall_red_count"],
-    )
-    if "hidden_count_residual" in outputs:
-        probability, baseline = projected_count_distributions(
-            outputs["hidden_count_residual"], inventory, capacities
-        )
-        anchor = batch.get("hidden_baseline_anchor")
-        if anchor is None:
-            raise ValueError("v13 hidden-count training requires baseline anchors")
-        losses["hidden_allocation"] = hidden_count_distribution_loss(
-            probability,
-            baseline,
-            physical_counts,
-            inventory,
-            anchor.bool(),
-        )
+    if not include_hidden_allocation:
+        losses["hidden_allocation"] = outputs["shanten"].new_zeros(())
+        active["hidden_allocation"] = False
     else:
-        source_probability = balanced_source_probabilities(
-            physical_affinities(
-                outputs["hidden_source_affinity"], outputs["hidden_red_source"]
-            ),
-            inventory,
-            capacities,
+        physical_counts, inventory, capacities = physical_hidden_counts(
+            batch["concealed_count"],
+            batch["wall_count"],
+            batch["concealed_red_count"],
+            batch["wall_red_count"],
         )
-        losses["hidden_allocation"] = hidden_transport_nll(
-            source_probability, physical_counts
-        )
-    active["hidden_allocation"] = True
+        if "hidden_joint_residual" in outputs:
+            anchor = batch.get("hidden_baseline_anchor")
+            if anchor is None:
+                raise ValueError("v14 hidden-count training requires baseline anchors")
+            projector = joint_count_projector or project_joint_counts
+            prediction = projector(
+                outputs["hidden_joint_residual"], inventory, capacities
+            )
+            losses["hidden_allocation"] = prediction.loss(
+                physical_counts, inventory, anchor.bool()
+            )
+        elif "hidden_count_residual" in outputs:
+            probability, baseline = projected_count_distributions(
+                outputs["hidden_count_residual"], inventory, capacities
+            )
+            anchor = batch.get("hidden_baseline_anchor")
+            if anchor is None:
+                raise ValueError("v13 hidden-count training requires baseline anchors")
+            losses["hidden_allocation"] = hidden_count_distribution_loss(
+                probability,
+                baseline,
+                physical_counts,
+                inventory,
+                anchor.bool(),
+            )
+        else:
+            source_probability = balanced_source_probabilities(
+                physical_affinities(
+                    outputs["hidden_source_affinity"], outputs["hidden_red_source"]
+                ),
+                inventory,
+                capacities,
+            )
+            losses["hidden_allocation"] = hidden_transport_nll(
+                source_probability, physical_counts
+            )
+        active["hidden_allocation"] = True
 
     winner_mask = batch["winner_mask"].bool()
-    if winner_mask.any():
-        dora_labels = batch["dora"].long()
+    current_dora = batch.get("current_concealed_dora")
+    dora_labels = (current_dora if current_dora is not None else batch["dora"]).long()
+    dora_mask = (
+        torch.ones_like(winner_mask) if current_dora is not None else winner_mask
+    )
+    if dora_mask.any():
         losses["dora_distribution"] = F.cross_entropy(
-            outputs["dora_distribution"][winner_mask],
-            dora_labels[winner_mask].clamp_max(DORA_TAIL_START),
+            outputs["dora_distribution"][dora_mask],
+            dora_labels[dora_mask].clamp_max(DORA_TAIL_START),
         )
         active["dora_distribution"] = True
+    else:
+        losses["dora_distribution"] = outputs["dora_distribution"].sum() * 0
+        active["dora_distribution"] = False
+    if winner_mask.any():
         score_labels = batch["score"].long()[winner_mask]
         score_indices = score_class_indices(score_labels)
         score_logits = masked_score_logits(outputs, batch["obs"])
@@ -237,17 +271,14 @@ def _structured_multitask_losses(
         score_loss = F.cross_entropy(score_logits[winner_mask], score_indices)
         score_active = True
     else:
-        zero = outputs["dora_distribution"].sum() * 0
-        losses["dora_distribution"] = zero
-        active["dora_distribution"] = False
-        score_loss = zero
+        score_loss = outputs["score_distribution"].sum() * 0
         score_active = False
 
-    tail_mask = winner_mask & (batch["dora"] >= DORA_TAIL_START)
+    tail_mask = dora_mask & (dora_labels >= DORA_TAIL_START)
     if tail_mask.any():
         tail_mean = DORA_TAIL_START + F.softplus(outputs["dora_tail"])
         losses["dora_tail"] = F.mse_loss(
-            tail_mean[tail_mask], batch["dora"].float()[tail_mask]
+            tail_mean[tail_mask], dora_labels.float()[tail_mask]
         )
         active["dora_tail"] = True
     else:
@@ -287,7 +318,11 @@ def _structured_multitask_losses(
 
 
 def multitask_losses(
-    outputs: Mapping[str, Tensor], batch: Mapping[str, Tensor]
+    outputs: Mapping[str, Tensor],
+    batch: Mapping[str, Tensor],
+    *,
+    joint_count_projector: JointCountProjector | None = None,
+    include_hidden_allocation: bool = True,
 ) -> tuple[dict[str, Tensor], dict[str, bool]]:
     """Return raw proper losses and whether each has real supervision.
 
@@ -296,20 +331,36 @@ def multitask_losses(
     essential for dora/score heads, which have no label in a no-win batch.
     """
 
-    if "hidden_source_affinity" in outputs or "hidden_count_residual" in outputs:
-        return _structured_multitask_losses(outputs, batch)
+    if any(
+        key in outputs
+        for key in (
+            "hidden_source_affinity",
+            "hidden_count_residual",
+            "hidden_joint_residual",
+        )
+    ):
+        return _structured_multitask_losses(
+            outputs,
+            batch,
+            joint_count_projector,
+            include_hidden_allocation=include_hidden_allocation,
+        )
 
     losses: dict[str, Tensor] = {}
     active: dict[str, bool] = {}
-    policy_valid = batch["policy"] >= 0
-    policy_logits = outputs["policy"].masked_fill(~batch["action_mask"], -torch.inf)
+    policy_labels = batch.get("candidate_label", batch["policy"])
+    policy_mask = batch.get("candidate_mask", batch["action_mask"])
+    policy_valid = policy_labels >= 0
+    policy_logits = outputs["policy"].masked_fill(~policy_mask.bool(), -torch.inf)
     if policy_valid.any():
         losses["policy"] = F.cross_entropy(
-            policy_logits[policy_valid], batch["policy"][policy_valid].long()
+            policy_logits[policy_valid], policy_labels[policy_valid].long()
         )
         active["policy"] = True
     else:
-        losses["policy"] = outputs["policy"].sum() * 0
+        losses["policy"] = (
+            outputs["policy"].masked_fill(~policy_mask.bool(), 0).sum() * 0
+        )
         active["policy"] = False
 
     losses["shanten"] = F.cross_entropy(
@@ -450,10 +501,19 @@ def multitask_loss(
     outputs: Mapping[str, Tensor],
     batch: Mapping[str, Tensor],
     balancer: LearnedUncertaintyBalancer | None = None,
+    *,
+    joint_count_projector: JointCountProjector | None = None,
 ) -> tuple[Tensor, dict[str, Tensor], dict[str, bool], dict[str, Tensor]]:
     """Compute raw losses, then combine them with the supplied balancer."""
 
-    losses, active = multitask_losses(outputs, batch)
+    losses, active = multitask_losses(
+        outputs,
+        batch,
+        joint_count_projector=joint_count_projector,
+        include_hidden_allocation=(
+            balancer is None or "hidden_allocation" in balancer.names
+        ),
+    )
     if balancer is not None:
         missing = [name for name in balancer.names if name not in losses]
         if missing:

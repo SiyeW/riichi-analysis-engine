@@ -13,9 +13,15 @@ from .architecture import (
     ModelArchitecture,
     SemanticModelArchitecture,
     StructuredModelArchitecture,
+    V15Architecture,
 )
 from .model import RiichiAnalysisModel, count_parameters
-from .model_input import model_input_metadata, shared_model_input_metadata
+from .model_input import (
+    model_input_metadata,
+    shared_model_input_metadata,
+    v15_model_input_metadata,
+    v16_model_input_metadata,
+)
 from .prediction_values import DORA_VALUES, SCORE_VALUES
 from .semantic_input import semantic_input_metadata
 
@@ -72,6 +78,9 @@ def main() -> None:
         "riichi-analysis-model-v11": 11,
         "riichi-analysis-model-v12": 12,
         "riichi-analysis-model-v13": 13,
+        "riichi-analysis-model-v14": 14,
+        "riichi-analysis-model-v15": 15,
+        "riichi-analysis-model-v16": 16,
     }
     if model_format not in formats:
         raise RuntimeError("checkpoint has an unsupported format")
@@ -80,12 +89,15 @@ def main() -> None:
         ModelArchitecture
         | StructuredModelArchitecture
         | SemanticModelArchitecture
+        | V15Architecture
         | None
     ) = None
-    if format_version in {6, 7, 8, 9, 10, 11, 12, 13}:
+    if format_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}:
         architecture_type = (
-            SemanticModelArchitecture
-            if format_version in {12, 13}
+            V15Architecture
+            if format_version in {15, 16}
+            else SemanticModelArchitecture
+            if format_version in {12, 13, 14}
             else StructuredModelArchitecture
             if format_version in {8, 9, 10, 11}
             else ModelArchitecture
@@ -138,16 +150,20 @@ def main() -> None:
         },
         "training": training,
     }
-    if format_version in {9, 10, 11, 12, 13}:
+    if format_version in {9, 10, 11, 12, 13, 14, 15, 16}:
         expected_input = (
-            shared_model_input_metadata()
-            if format_version == 13
+            v16_model_input_metadata()
+            if format_version == 16
+            else v15_model_input_metadata()
+            if format_version == 15
+            else shared_model_input_metadata()
+            if format_version in {13, 14}
             else model_input_metadata()
         )
         if checkpoint.get("modelInput") != expected_input:
             raise RuntimeError("checkpoint uses a different model-input contract")
         payload["architecture"]["modelInput"] = expected_input
-    if format_version in {12, 13}:
+    if format_version in {12, 13, 14, 15, 16}:
         expected_semantic_input = semantic_input_metadata()
         if checkpoint.get("semanticInput") != expected_semantic_input:
             raise RuntimeError("checkpoint uses a different semantic-input contract")

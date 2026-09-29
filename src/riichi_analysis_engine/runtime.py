@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from .architecture import (
     ModelArchitecture,
     SemanticModelArchitecture,
     StructuredModelArchitecture,
+    V15Architecture,
 )
 from .constants import (
     MORTAL_OBS_CHANNELS,
@@ -30,6 +32,7 @@ from .constants import (
     relative_players,
     tile34_index,
 )
+from .current_dora import add_known_dora_to_distribution, known_meld_dora
 from .hidden_transport import (
     balanced_source_probabilities,
     count_marginals,
@@ -37,16 +40,20 @@ from .hidden_transport import (
     physical_count_marginals,
     projected_count_distributions,
 )
+from .joint_counts import project_joint_counts
 from .kyoku_outcome import OUTCOME_CLASSES, outcome_marginals
 from .model import RiichiAnalysisModel
 from .model_input import (
     MODEL_INPUT_CHANNELS,
+    RULE_CONTEXT_START,
     SHARED_MODEL_INPUT_CHANNELS,
     compose_model_input,
     compose_shared_model_input,
     extract_policy_context,
     model_input_metadata,
     shared_model_input_metadata,
+    v15_model_input_metadata,
+    v16_model_input_metadata,
 )
 from .observations import add_all_player_ranks
 from .prediction_values import DORA_VALUES, SCORE_VALUES, score_class_mask
@@ -68,6 +75,8 @@ from .structured_outputs import (
     fixed_total_values,
     zero_sum_accounts,
 )
+from .v15_facts import V15_FACTS_WIDTH, encode_v15_facts
+from .v16_candidates import encode_candidate_set
 
 PERMUTATIONS = tuple(itertools.permutations(range(4)))
 
@@ -299,19 +308,26 @@ class AnalysisRuntime:
             "riichi-analysis-model-v11": 11,
             "riichi-analysis-model-v12": 12,
             "riichi-analysis-model-v13": 13,
+            "riichi-analysis-model-v14": 14,
+            "riichi-analysis-model-v15": 15,
+            "riichi-analysis-model-v16": 16,
         }
         if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
         self.format_version = formats[model_format]
-        if self.format_version in {9, 10, 11, 12, 13}:
+        if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict) or architecture.get("modelInput") != (
-                shared_model_input_metadata()
-                if self.format_version == 13
+                v16_model_input_metadata()
+                if self.format_version == 16
+                else v15_model_input_metadata()
+                if self.format_version == 15
+                else shared_model_input_metadata()
+                if self.format_version in {13, 14}
                 else model_input_metadata()
             ):
                 raise RuntimeError("weight file uses a different model-input contract")
-        if self.format_version in {12, 13}:
+        if self.format_version in {12, 13, 14, 15, 16}:
             architecture = payload.get("architecture")
             if (
                 not isinstance(architecture, dict)
@@ -331,14 +347,16 @@ class AnalysisRuntime:
                 or architecture.get("predictionValues") != expected_values
             ):
                 raise RuntimeError("weight file uses different prediction values")
-        if self.format_version in {6, 7, 8, 9, 10, 11, 12, 13}:
+        if self.format_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict):
                 raise RuntimeError("weight file has no architecture metadata")
             try:
                 architecture_type = (
-                    SemanticModelArchitecture
-                    if self.format_version in {12, 13}
+                    V15Architecture
+                    if self.format_version in {15, 16}
+                    else SemanticModelArchitecture
+                    if self.format_version in {12, 13, 14}
                     else StructuredModelArchitecture
                     if self.format_version in {8, 9, 10, 11}
                     else ModelArchitecture
@@ -361,16 +379,32 @@ class AnalysisRuntime:
         self._sessions: dict[str, RuntimeSession] = {}
         observation_channels = (
             SHARED_MODEL_INPUT_CHANNELS
-            if self.format_version == 13
+            if self.format_version in {13, 14, 15, 16}
             else MODEL_INPUT_CHANNELS
-            if self.format_version in {9, 10, 11, 12, 13}
+            if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16}
             else OBS_CHANNELS
             if self.format_version in {6, 7, 8}
             else MORTAL_OBS_CHANNELS
         )
         with torch.inference_mode():
             observation = torch.zeros(1, observation_channels, 34, device=self.device)
-            if self.format_version in {12, 13}:
+            if self.format_version in {15, 16}:
+                facts = torch.zeros(1, V15_FACTS_WIDTH, device=self.device)
+                facts[:, 24] = 1
+                self.model(
+                    observation,
+                    torch.zeros(
+                        1, 1, EVENT_FIELDS, dtype=torch.uint8, device=self.device
+                    ),
+                    torch.ones(1, 1, dtype=torch.bool, device=self.device),
+                    facts,
+                    *(
+                        (torch.zeros(1, 4, 37, device=self.device),)
+                        if self.format_version == 16
+                        else ()
+                    ),
+                )
+            elif self.format_version in {12, 13, 14}:
                 self.model(
                     observation,
                     torch.zeros(
@@ -442,7 +476,7 @@ class AnalysisRuntime:
         rule_state: PublicRuleState | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         observation, mask = state.encode_obs(4, at_kan_select)
-        if self.format_version in {9, 10, 11, 12, 13}:
+        if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16}:
             if analysis_observation is None:
                 raise ValueError(
                     "semantic model formats require the public-history observation"
@@ -461,7 +495,7 @@ class AnalysisRuntime:
                         rule_state=rule_state,
                     ),
                 )
-                if self.format_version == 13
+                if self.format_version in {13, 14, 15, 16}
                 else compose_model_input(
                     analysis_observation, extract_policy_context(observation)
                 )
@@ -499,7 +533,7 @@ class AnalysisRuntime:
             rule_state.process(event)
         analysis_observation = (
             self._analysis_observation(events, controlled_seat)
-            if self.format_version in {9, 10, 11, 12, 13}
+            if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16}
             else None
         )
         observation, _mask = self._encode_observation(
@@ -541,6 +575,8 @@ class AnalysisRuntime:
     ) -> tuple[dict[str, dict[str, Any]], float]:
         started = time.perf_counter()
         session = self._prepare_session(events, controlled_seat, session_id)
+        if session.terminal:
+            raise ValueError("terminal round events have no prediction frame")
         request_key = json.dumps(
             [protocol_minor, requested],
             ensure_ascii=False,
@@ -554,7 +590,7 @@ class AnalysisRuntime:
         score_state = session.score_state
         analysis_observation = (
             session.analysis_observation()
-            if self.format_version in {9, 10, 11, 12, 13}
+            if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16}
             else None
         )
         observation, _primary_mask = self._encode_observation(
@@ -566,7 +602,7 @@ class AnalysisRuntime:
         )
         tensor = torch.from_numpy(observation).unsqueeze(0).to(self.device)
         semantic_memory: tuple[torch.Tensor, torch.Tensor] | None = None
-        if self.format_version in {12, 13}:
+        if self.format_version in {12, 13, 14, 15, 16}:
             event_tokens, event_mask = session.semantic_event_memory()
             semantic_memory = (
                 event_tokens.to(self.device),
@@ -575,8 +611,36 @@ class AnalysisRuntime:
         with torch.inference_mode():
             semantic_state = None
             if semantic_memory is not None:
+                facts = (
+                    torch.from_numpy(
+                        encode_v15_facts(
+                            session.public_state,
+                            controlled_seat,
+                            observation[RULE_CONTEXT_START:],
+                        )
+                    )
+                    .unsqueeze(0)
+                    .to(self.device)
+                    if self.format_version in {15, 16}
+                    else None
+                )
                 semantic_state = self.model.semantic_model.encode(
-                    tensor, *semantic_memory
+                    tensor,
+                    *semantic_memory,
+                    *((facts,) if facts is not None else ()),
+                    *(
+                        (
+                            torch.from_numpy(
+                                session.public_state.physical_meld_counts(
+                                    controlled_seat
+                                )
+                            )
+                            .unsqueeze(0)
+                            .to(self.device),
+                        )
+                        if self.format_version == 16
+                        else ()
+                    ),
                 )
                 raw = self.model.semantic_model.decode(semantic_state)
             else:
@@ -632,7 +696,14 @@ class AnalysisRuntime:
             )
             inventory_tensor = torch.from_numpy(physical_inventory).unsqueeze(0)
             capacity_tensor = torch.from_numpy(source_capacities).unsqueeze(0)
-            if "hidden_count_residual" in outputs:
+            if "hidden_joint_residual" in outputs:
+                prediction = project_joint_counts(
+                    outputs["hidden_joint_residual"].unsqueeze(0),
+                    inventory_tensor,
+                    capacity_tensor,
+                )
+                hidden_counts, hidden_red, _ = prediction.marginals()
+            elif "hidden_count_residual" in outputs:
                 physical_distribution, _baseline = projected_count_distributions(
                     outputs["hidden_count_residual"].unsqueeze(0),
                     inventory_tensor,
@@ -760,6 +831,20 @@ class AnalysisRuntime:
                 )
             else:
                 dora_point = F.softplus(outputs["dora_point"]).numpy()
+            if self.format_version == 16:
+                known = known_meld_dora(
+                    session.public_state.physical_meld_counts(controlled_seat),
+                    session.public_state.visible_dora_markers(),
+                )[1:]
+                dora_distribution = np.stack(
+                    [
+                        add_known_dora_to_distribution(probabilities, int(count))
+                        for probabilities, count in zip(
+                            dora_distribution, known, strict=True
+                        )
+                    ]
+                )
+                dora_point = dora_point + known
             score_logits = outputs["score_distribution"].clone()
             for index, seat in enumerate(opponents):
                 valid = torch.as_tensor(
@@ -976,6 +1061,53 @@ class AnalysisRuntime:
             candidates = policy_request.get("parameters", {}).get("candidates")
             if not isinstance(candidates, list) or not candidates:
                 raise ValueError("action-recommendation requires non-empty candidates")
+            if self.format_version == 16:
+                if semantic_state is None:
+                    raise RuntimeError("v16 requires a shared semantic state")
+                identifiers = [candidate.get("candidateId") for candidate in candidates]
+                if any(not isinstance(item, str) for item in identifiers) or len(
+                    set(identifiers)
+                ) != len(identifiers):
+                    raise ValueError("candidate IDs must be distinct strings")
+                actions = [candidate.get("action") for candidate in candidates]
+                if any(not isinstance(action, dict) for action in actions):
+                    raise ValueError("each candidate requires a complete action")
+                features = (
+                    torch.from_numpy(encode_candidate_set(actions, controlled_seat))
+                    .unsqueeze(0)
+                    .to(self.device)
+                )
+                with torch.inference_mode():
+                    candidate_state = replace(
+                        semantic_state,
+                        candidate_features=features,
+                        candidate_mask=torch.ones(
+                            (1, len(actions)), device=self.device, dtype=torch.bool
+                        ),
+                    )
+                    logits = self.model.semantic_model.decode(candidate_state)[
+                        "policy"
+                    ][0]
+                    probabilities = logits.float().softmax(-1).cpu().numpy()
+                values = {
+                    identifier: _finite(probability)
+                    for identifier, probability in zip(
+                        identifiers, probabilities, strict=True
+                    )
+                }
+                best = best_candidate(candidates, values)
+                results["action-recommendation"] = {
+                    "bestCandidateId": best["candidateId"],
+                    "candidates": [
+                        {
+                            "candidateId": candidate["candidateId"],
+                            "metrics": {"policy": values[candidate["candidateId"]]},
+                        }
+                        for candidate in candidates
+                    ],
+                }
+                session.result_cache[request_key] = results
+                return results, (time.perf_counter() - started) * 1000.0
             needs_kan_selection = any(
                 isinstance(candidate, dict)
                 and isinstance(candidate.get("action"), dict)
@@ -996,13 +1128,41 @@ class AnalysisRuntime:
                     torch.from_numpy(selection_observation).unsqueeze(0).to(self.device)
                 )
                 with torch.inference_mode():
-                    selection_policy = (
-                        self.model.semantic_model.decode_policy(
+                    if semantic_state is not None and self.format_version in {
+                        13,
+                        14,
+                        15,
+                    }:
+                        # Rule facts enter the v13 readout queries. Replacing a
+                        # context vector after encoding is not equivalent.
+                        selection_facts = (
+                            torch.from_numpy(
+                                encode_v15_facts(
+                                    session.public_state,
+                                    controlled_seat,
+                                    selection_observation[RULE_CONTEXT_START:],
+                                )
+                            )
+                            .unsqueeze(0)
+                            .to(self.device)
+                            if self.format_version == 15
+                            else None
+                        )
+                        selection_policy = self.model.semantic_model(
+                            selection_tensor,
+                            *semantic_memory,
+                            *(
+                                (selection_facts,)
+                                if selection_facts is not None
+                                else ()
+                            ),
+                        )["policy"]
+                    elif semantic_state is not None:
+                        selection_policy = self.model.semantic_model.decode_policy(
                             semantic_state, selection_tensor
                         )
-                        if semantic_state is not None
-                        else self.model(selection_tensor)["policy"]
-                    )
+                    else:
+                        selection_policy = self.model(selection_tensor)["policy"]
                     kan_selection_logits = selection_policy[0].float().cpu().numpy()
             values = complete_candidate_policy(
                 outputs["policy"].numpy(),

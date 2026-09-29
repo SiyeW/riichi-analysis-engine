@@ -39,6 +39,8 @@ whether it creates discard furiten, and kan candidates. Global rule features
 cover exact shanten, separate discard/temporary/riichi furiten, riichi state,
 interaction phase, and legal action classes. These features enter the shared
 tile and global representations, so every prediction family can use them.
+Architecture revision 2 also adds the global rule context directly to player
+and global readout states. Revision 1 weights retain their original topology.
 
 The exact shanten and ukeire kernel uses the same audited libriichi lookup-table
 method as the validated reference opponent model. Conversion and runtime call the
@@ -46,8 +48,15 @@ same implementation; neither path asks the network to approximate these rules.
 
 Concrete candidate identity remains policy-specific. The policy decoder scores
 the fixed action vocabulary and the authoritative action mask removes illegal
-candidates. Conditional kan selection updates the rule context without
-recomputing public history.
+candidates. Conditional kan selection re-encodes the changed rule context before
+scoring; the earlier context-substitution shortcut was not equivalent to the
+shared readout path.
+
+The wait decoder is selected by architecture revision. Revision 1 emits all
+34 conditional waits from each opponent/global state pair. Revision 2 restores
+the opponent-by-tile decoder used by v12 while retaining v13's rule context and
+categorical hidden-count distribution. Stored architecture metadata fixes the
+decoder choice so existing v13 weights are not reinterpreted.
 
 ## Deliberate exclusions
 
@@ -59,6 +68,8 @@ recomputing public history.
   discard. It supplies facts and leaves strategic consequences to the model.
 
 Terminal `hora` and `ryukyoku` events remain labels rather than model inputs.
+The runtime rejects predictions after a terminal event until the next round
+starts.
 For the frame immediately before a win, analysis supervision is assigned to an
 actual winner instead of a random seat; a multiple-ron frame selects one winner
 deterministically so every frame still contributes exactly one analysis row.

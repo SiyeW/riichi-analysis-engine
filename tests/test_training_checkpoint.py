@@ -5,6 +5,7 @@ from riichi_analysis_engine.architecture import StructuredModelArchitecture
 from riichi_analysis_engine.losses import LOSS_TERMS_V8, LearnedUncertaintyBalancer
 from riichi_analysis_engine.model import RiichiAnalysisModel
 from riichi_analysis_engine.train import (
+    gradient_max_abs,
     gradients_are_finite,
     resume_training_cursor,
     save_checkpoint,
@@ -22,6 +23,22 @@ def test_gradient_finiteness_checks_every_materialized_gradient() -> None:
 
     finite.grad = torch.tensor([float("inf")])
     assert not gradients_are_finite([finite, unused])
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"))])
+def test_gradient_device_reductions_preserve_statistics_and_values(device) -> None:
+    parameters = [torch.nn.Parameter(torch.zeros(2, device=device)) for _ in range(3)]
+    parameters[0].grad = torch.tensor([3.0, -4.0], device=device)
+    parameters[1].grad = torch.tensor([-8.0, 6.0], device=device)
+    before = [p.grad.clone() for p in parameters if p.grad is not None]
+    assert gradients_are_finite(parameters)
+    assert gradient_max_abs(parameters) == 8.0
+    for p, expected in zip(parameters, before):
+        assert torch.equal(p.grad, expected)
+    parameters[1].grad[0] = float("nan")
+    assert not gradients_are_finite(parameters)
+    assert gradients_are_finite([])
+    assert gradient_max_abs([]) == 0.0
 
 
 def test_v8_checkpoint_records_architecture_and_learned_loss_state(tmp_path) -> None:
@@ -125,6 +142,19 @@ def test_resume_cursor_requires_the_same_manifests_and_exact_counters() -> None:
     }
 
     assert resume_training_cursor(checkpoint, datasets, 8) == (13, 2)
+
+    with pytest.raises(RuntimeError, match="different training batch size"):
+        resume_training_cursor(checkpoint, datasets, 16)
+    assert resume_training_cursor(
+        checkpoint, datasets, 16, allow_batch_size_transition=True
+    ) == (13, 2)
+
+    checkpoint["trainingCursor"]["batchSize"] = -1
+    with pytest.raises(RuntimeError, match="invalid training batch size"):
+        resume_training_cursor(
+            checkpoint, datasets, 16, allow_batch_size_transition=True
+        )
+    checkpoint["trainingCursor"]["batchSize"] = 8
 
     changed = {**datasets, "train": {"manifestSha256": "train-b"}}
     with pytest.raises(RuntimeError, match="different train manifest"):

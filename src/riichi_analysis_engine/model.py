@@ -10,6 +10,7 @@ from .architecture import (
     ModelArchitecture,
     SemanticModelArchitecture,
     StructuredModelArchitecture,
+    V15Architecture,
 )
 from .constants import ACTION_SPACE, MORTAL_OBS_CHANNELS, OBS_CHANNELS, TILE_TYPES
 from .kyoku_outcome import OUTCOME_COUNT
@@ -334,11 +335,29 @@ class RiichiAnalysisModel(nn.Module):
             ModelArchitecture
             | StructuredModelArchitecture
             | SemanticModelArchitecture
+            | V15Architecture
             | None
         ) = None,
     ) -> None:
         super().__init__()
-        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}:
+        if format_version not in {
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+        }:
             raise ValueError(f"unsupported model format version: {format_version}")
         if architecture is not None and format_version not in {
             6,
@@ -349,6 +368,9 @@ class RiichiAnalysisModel(nn.Module):
             11,
             12,
             13,
+            14,
+            15,
+            16,
         }:
             raise ValueError(
                 "only model formats v6 and later accept architecture metadata"
@@ -358,9 +380,31 @@ class RiichiAnalysisModel(nn.Module):
             ModelArchitecture
             | StructuredModelArchitecture
             | SemanticModelArchitecture
+            | V15Architecture
             | None
         ) = None
-        if format_version in {12, 13}:
+        if format_version in {15, 16}:
+            from .semantic_v15 import SemanticV15Model
+            from .semantic_v16 import SemanticV16Model
+
+            if any(
+                value is not None
+                for value in (channels, blocks, state_width, future_width)
+            ):
+                raise ValueError(
+                    "v15 architecture must be configured through its metadata"
+                )
+            configured = architecture or V15Architecture()
+            if not isinstance(configured, V15Architecture):
+                raise TypeError("v15 requires V15Architecture")
+            self.architecture = configured
+            self.semantic_model = (
+                SemanticV16Model(configured)
+                if format_version == 16
+                else SemanticV15Model(configured)
+            )
+            return
+        if format_version in {12, 13, 14}:
             if any(
                 value is not None
                 for value in (channels, blocks, state_width, future_width)
@@ -368,14 +412,26 @@ class RiichiAnalysisModel(nn.Module):
                 raise ValueError(
                     "semantic architecture must be configured through its metadata"
                 )
-            configured = architecture or SemanticModelArchitecture()
+            configured = architecture or SemanticModelArchitecture(
+                semantic_design_version=2 if format_version in {13, 14} else 1
+            )
             if not isinstance(configured, SemanticModelArchitecture):
                 raise TypeError(
                     "semantic model formats require SemanticModelArchitecture"
                 )
+            if format_version == 12 and configured.semantic_design_version != 1:
+                raise ValueError("v12 requires semantic design version 1")
+            if format_version == 14:
+                from .semantic_v14 import SemanticV14Model
+
+                if configured.semantic_design_version != 2:
+                    raise ValueError("v14 requires semantic design version 2")
+                self.architecture = configured
+                self.semantic_model = SemanticV14Model(configured)
+                return
             self.architecture = configured
             self.semantic_model = SemanticRiichiModel(
-                configured, shared_rule_context=format_version == 13
+                configured, shared_rule_context=format_version in {13, 14}
             )
             return
         if format_version in {8, 9, 10, 11}:
@@ -594,8 +650,33 @@ class RiichiAnalysisModel(nn.Module):
         observation: Tensor,
         event_tokens: Tensor | None = None,
         event_mask: Tensor | None = None,
+        v15_facts: Tensor | None = None,
+        public_meld_count: Tensor | None = None,
+        candidate_features: Tensor | None = None,
+        candidate_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        if self.format_version in {12, 13}:
+        if self.format_version == 16:
+            if any(
+                value is None
+                for value in (event_tokens, event_mask, v15_facts, public_meld_count)
+            ):
+                raise ValueError(
+                    "v16 requires events, public facts and exact meld counts"
+                )
+            return self.semantic_model(
+                observation,
+                event_tokens,
+                event_mask,
+                v15_facts,
+                public_meld_count,
+                candidate_features,
+                candidate_mask,
+            )
+        if self.format_version == 15:
+            if event_tokens is None or event_mask is None or v15_facts is None:
+                raise ValueError("v15 requires public facts and event memory")
+            return self.semantic_model(observation, event_tokens, event_mask, v15_facts)
+        if self.format_version in {12, 13, 14}:
             if event_tokens is None or event_mask is None:
                 raise ValueError("model format v12 requires semantic event memory")
             return self.semantic_model(observation, event_tokens, event_mask)
@@ -937,7 +1018,19 @@ class RiichiAnalysisModel(nn.Module):
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
-    if model.format_version in {12, 13}:
+    if model.format_version in {15, 16}:
+        modules = {
+            "input": model.semantic_model.input,
+            "backbone": model.semantic_model.blocks,
+            "decoder": model.semantic_model.decoder,
+        }
+        counts = {
+            name: sum(parameter.numel() for parameter in module.parameters())
+            for name, module in modules.items()
+        }
+        counts["total"] = sum(parameter.numel() for parameter in model.parameters())
+        return counts
+    if model.format_version in {12, 13, 14}:
         groups = {
             "input": model.semantic_model.input,
             "backbone": model.semantic_model.backbone,

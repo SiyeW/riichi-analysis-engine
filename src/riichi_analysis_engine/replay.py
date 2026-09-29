@@ -202,12 +202,17 @@ class FullState:
     )
     dora_markers: list[str] = field(default_factory=list)
     riichi: list[bool] = field(default_factory=lambda: [False] * 4)
+    riichi_accepted: list[bool] = field(default_factory=lambda: [False] * 4)
     honba: int = 0
     kyotaku: int = 0
     oya: int = 0
     bakaze: str = "E"
     last_discard: str | None = None
+    last_discard_actor: int | None = None
+    last_draw: str | None = None
+    last_draw_actor: int | None = None
     last_kan_tile: str | None = None
+    last_kan_actor: int | None = None
 
     def process(self, event: dict[str, Any]) -> None:
         kind = event["type"]
@@ -217,12 +222,17 @@ class FullState:
             self.scores = np.asarray(event.get("scores", [25_000] * 4), dtype=np.int32)
             self.dora_markers = [event["dora_marker"]]
             self.riichi = [False] * 4
+            self.riichi_accepted = [False] * 4
             self.honba = int(event.get("honba", 0))
             self.kyotaku = int(event.get("kyotaku", 0))
             self.oya = int(event["oya"])
             self.bakaze = event["bakaze"]
             self.last_discard = None
+            self.last_discard_actor = None
+            self.last_draw = None
+            self.last_draw_actor = None
             self.last_kan_tile = None
+            self.last_kan_actor = None
             self.wall = np.full(34, 4, dtype=np.int16)
             self.wall_red = np.ones(3, dtype=np.int8)
             for hand in event["tehais"]:
@@ -240,6 +250,8 @@ class FullState:
         elif kind == "tsumo":
             actor, tile = int(event["actor"]), event["pai"]
             self.hands[actor][tile] += 1
+            self.last_draw = tile
+            self.last_draw_actor = actor
             index = tile34_index(tile)
             if self.wall[index] == 0:
                 raise ValueError(f"negative wall count after drawing {tile}")
@@ -254,7 +266,11 @@ class FullState:
             actor, tile = int(event["actor"]), event["pai"]
             _remove_one(self.hands[actor], tile)
             self.last_discard = tile
+            self.last_discard_actor = actor
+            self.last_draw = None
+            self.last_draw_actor = None
             self.last_kan_tile = None
+            self.last_kan_actor = None
         elif kind in {"chi", "pon", "daiminkan"}:
             actor = int(event["actor"])
             consumed = list(event["consumed"])
@@ -262,14 +278,20 @@ class FullState:
                 _remove_one(self.hands[actor], tile)
             called = event["pai"]
             self.melds[actor].append(consumed + [called])
+            self.last_draw = None
+            self.last_draw_actor = None
             self.last_kan_tile = called if kind == "daiminkan" else None
+            self.last_kan_actor = actor if kind == "daiminkan" else None
         elif kind == "ankan":
             actor = int(event["actor"])
             consumed = list(event["consumed"])
             for tile in consumed:
                 _remove_one(self.hands[actor], tile)
             self.melds[actor].append(consumed)
+            self.last_draw = None
+            self.last_draw_actor = None
             self.last_kan_tile = consumed[0]
+            self.last_kan_actor = actor
         elif kind == "kakan":
             actor, tile = int(event["actor"]), event["pai"]
             _remove_one(self.hands[actor], tile)
@@ -281,10 +303,14 @@ class FullState:
             else:
                 raise ValueError(f"kakan without a matching pon: {event}")
             self.last_kan_tile = tile
+            self.last_kan_actor = actor
+            self.last_draw = None
+            self.last_draw_actor = None
         elif kind == "reach":
             self.riichi[int(event["actor"])] = True
         elif kind == "reach_accepted":
             actor = int(event["actor"])
+            self.riichi_accepted[actor] = True
             self.kyotaku += 1
             if isinstance(event.get("scores"), list):
                 self.scores = np.asarray(event["scores"], dtype=np.int32)

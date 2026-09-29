@@ -66,6 +66,24 @@ class _CountingPlayerState(_PassivePlayerState):
         return super().encode_obs(version, kan_select)
 
 
+class _OneDiscardPlayerState(_PassivePlayerState):
+    def __init__(self, player: int) -> None:
+        super().__init__(player)
+        self.last_kind = ""
+
+    def update(self, event: str) -> SimpleNamespace:
+        self.last_kind = json.loads(event)["type"]
+        return SimpleNamespace(
+            can_discard=self.player == 0 and self.last_kind == "tsumo"
+        )
+
+    def encode_obs(self, _version: int, _kan_select: bool):
+        mask = np.zeros(ACTION_SPACE, dtype=bool)
+        if self.player == 0 and self.last_kind == "tsumo":
+            mask[4] = True  # ordinary 5m
+        return np.zeros((MORTAL_OBS_CHANNELS, TILE_TYPES), dtype=np.float32), mask
+
+
 def test_analysis_perspective_is_identity_deterministic() -> None:
     first = [_analysis_perspective("game", index) for index in range(16)]
 
@@ -168,6 +186,180 @@ def test_conversion_records_perspective_relative_hidden_baseline_anchors() -> No
     assert bool(anchors[0])
     assert bool(anchors[1]) == bool(perspectives[1] == 0)
     assert not bool(anchors[2])
+
+
+def test_v15_conversion_carries_exact_public_facts_without_changing_targets() -> None:
+    events = [
+        {
+            "type": "start_kyoku",
+            "bakaze": "E",
+            "kyoku": 1,
+            "honba": 12,
+            "kyotaku": 11,
+            "oya": 0,
+            "dora_marker": "9p",
+            "scores": [105_000, 22_000, -5_000, 18_000],
+            "tehais": [["1m"], [], [], []],
+        },
+        {"type": "dahai", "actor": 0, "pai": "1m"},
+        {"type": "ryukyoku", "deltas": [0, 0, 0, 0]},
+        {"type": "end_kyoku"},
+        {"type": "end_game"},
+    ]
+    converted = convert_game(
+        events,
+        "v15-facts-game",
+        player_state_type=_PassivePlayerState,
+        model_format=15,
+    )
+    facts = converted.arrays["v15_facts"]
+    assert facts.shape[1] == 57
+    assert 105_000 in facts[:, [0, 6, 12, 18]]
+    assert np.all(facts[:, 26] == 12)
+    assert np.all(facts[:, 27] == 11)
+    assert "hidden_baseline_anchor" in converted.arrays
+
+
+def test_v16_analysis_only_rows_keep_empty_complete_candidate_sets() -> None:
+    events = [
+        {
+            "type": "start_kyoku",
+            "bakaze": "E",
+            "kyoku": 1,
+            "honba": 0,
+            "kyotaku": 0,
+            "oya": 0,
+            "dora_marker": "1m",
+            "scores": [25_000] * 4,
+            "tehais": [["2m"], [], [], []],
+        },
+        {"type": "ryukyoku", "deltas": [0, 0, 0, 0]},
+        {"type": "end_kyoku"},
+        {"type": "end_game"},
+    ]
+    converted = convert_game(
+        events,
+        "v16-analysis-row",
+        player_state_type=_PassivePlayerState,
+        model_format=16,
+    )
+    arrays = converted.arrays
+    assert arrays["candidate_codes"].shape == (1, 32, 9)
+    assert arrays["candidate_mask"].shape == (1, 32)
+    assert arrays["candidate_label"].tolist() == [-1]
+    assert not arrays["candidate_mask"].any()
+    assert arrays["public_meld_count"].shape == (1, 4, 37)
+    assert arrays["current_concealed_dora"].shape == (1, 3)
+
+
+def test_v16_conversion_labels_the_complete_hand_discard_not_tsumogiri() -> None:
+    events = [
+        {
+            "type": "start_kyoku",
+            "bakaze": "E",
+            "kyoku": 1,
+            "honba": 0,
+            "kyotaku": 0,
+            "oya": 0,
+            "dora_marker": "1m",
+            "scores": [25_000] * 4,
+            "tehais": [["5m"], [], [], []],
+        },
+        {"type": "tsumo", "actor": 0, "pai": "5m"},
+        {"type": "dahai", "actor": 0, "pai": "5m", "tsumogiri": False},
+        {"type": "ryukyoku", "deltas": [0, 0, 0, 0]},
+        {"type": "end_kyoku"},
+        {"type": "end_game"},
+    ]
+    arrays = convert_game(
+        events,
+        "v16-discard-row",
+        player_state_type=_OneDiscardPlayerState,
+        model_format=16,
+    ).arrays
+    policy_rows = np.flatnonzero(arrays["candidate_label"] >= 0)
+    assert len(policy_rows) == 1
+    row = policy_rows[0]
+    assert arrays["candidate_mask"][row].sum() == 2
+    # The freshly drawn copy is first; the observed hand discard is second.
+    assert arrays["candidate_label"][row] == 1
+    assert arrays["candidate_codes"][row, 0, 3] == 1
+    assert arrays["candidate_codes"][row, 1, 3] == 0
+
+
+def test_v16_converted_rows_have_finite_forward_and_loss() -> None:
+    import torch
+
+    from riichi_analysis_engine.losses import multitask_loss
+    from riichi_analysis_engine.model import RiichiAnalysisModel
+    from riichi_analysis_engine.semantic_input import materialize_event_memory
+    from riichi_analysis_engine.storage import pack_shard_arrays, unpack_shard_arrays
+    from riichi_analysis_engine.train import forward_batch
+    from riichi_analysis_engine.training_schema import validate_v16_training_batch
+
+    events = [
+        {
+            "type": "start_kyoku",
+            "bakaze": "E",
+            "kyoku": 1,
+            "honba": 0,
+            "kyotaku": 0,
+            "oya": 0,
+            "dora_marker": "1m",
+            "scores": [25_000] * 4,
+            "tehais": [["5m"], [], [], []],
+        },
+        {"type": "tsumo", "actor": 0, "pai": "5m"},
+        {"type": "dahai", "actor": 0, "pai": "5m", "tsumogiri": False},
+        {"type": "ryukyoku", "deltas": [0, 0, 0, 0]},
+        {"type": "end_kyoku"},
+        {"type": "end_game"},
+    ]
+    converted = convert_game(
+        events,
+        "v16-train-step",
+        player_state_type=_OneDiscardPlayerState,
+        model_format=16,
+    )
+    arrays = converted.arrays
+    stored = unpack_shard_arrays(pack_shard_arrays(arrays))
+    for key in (
+        "candidate_codes",
+        "candidate_mask",
+        "candidate_label",
+        "public_meld_count",
+        "current_concealed_dora",
+    ):
+        np.testing.assert_array_equal(stored[key], arrays[key])
+    tokens, mask = materialize_event_memory(
+        converted.event_catalog,
+        arrays["history_start"],
+        arrays["history_length"],
+        arrays["perspective"],
+    )
+    batch = {
+        name: torch.from_numpy(np.asarray(value)) for name, value in arrays.items()
+    }
+    batch["event_tokens"] = torch.from_numpy(tokens)
+    batch["event_mask"] = torch.from_numpy(mask)
+    assert validate_v16_training_batch(batch)["completePolicyRows"] == 1
+    model = RiichiAnalysisModel(format_version=16)
+    outputs = forward_batch(model, batch)
+    assert torch.isfinite(outputs["policy"][batch["candidate_mask"]]).all()
+    total, losses, _active, _weights = multitask_loss(outputs, batch)
+    assert torch.isfinite(total)
+    assert all(torch.isfinite(value) for value in losses.values())
+    total.backward()
+    assert any(parameter.grad is not None for parameter in model.parameters())
+    analysis_only = batch["candidate_label"] < 0
+    assert analysis_only.any()
+    passive = {name: value[analysis_only] for name, value in batch.items()}
+    passive_outputs = forward_batch(model, passive)
+    passive_total, passive_losses, _active, _weights = multitask_loss(
+        passive_outputs, passive
+    )
+    assert torch.isfinite(passive_total)
+    assert torch.isfinite(passive_losses["policy"])
 
 
 def test_conversion_keeps_only_exact_analysis_anchors_at_zero_rates() -> None:

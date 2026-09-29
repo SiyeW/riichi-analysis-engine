@@ -18,6 +18,8 @@ from .model_input import (
     MODEL_INPUT_SCHEMA_ID,
     SHARED_MODEL_INPUT_CHANNELS,
     SHARED_MODEL_INPUT_SCHEMA_ID,
+    V15_MODEL_INPUT_SCHEMA_ID,
+    V16_MODEL_INPUT_SCHEMA_ID,
 )
 from .semantic_input import EVENT_FIELDS, EVENT_MEMORY_SCHEMA_ID
 
@@ -36,6 +38,7 @@ LEGACY_STAGED_GAME_FORMATS = frozenset(
 )
 PACK_FORMAT = "riichi-analysis-global-pack-v3"
 TRAINING_TARGET_SCHEMA_ID = "riichi-analysis-training-target-v13"
+V16_TRAINING_TARGET_SCHEMA_ID = "riichi-analysis-training-target-v16-current-dora"
 PACKED_METADATA_FIELDS = frozenset(
     {
         "storage_format",
@@ -117,7 +120,9 @@ def unpack_action_masks(masks: np.ndarray) -> np.ndarray:
     masks = np.asarray(masks, dtype=np.uint8)
     if masks.ndim != 2 or masks.shape[1] != ACTION_BYTES:
         raise ValueError(f"wrong packed action-mask shape: {masks.shape}")
-    return np.unpackbits(masks, axis=1, count=ACTION_SPACE, bitorder="little").astype(bool)
+    return np.unpackbits(masks, axis=1, count=ACTION_SPACE, bitorder="little").astype(
+        bool
+    )
 
 
 def _sample_count(packed: dict[str, np.ndarray]) -> int:
@@ -134,7 +139,41 @@ def pack_shard_arrays(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     payload = dict(arrays)
     obs = pack_observations(payload.pop("obs"))
     if obs.channels == SHARED_MODEL_INPUT_CHANNELS:
-        input_schema = SHARED_MODEL_INPUT_SCHEMA_ID
+        input_schema = (
+            V16_MODEL_INPUT_SCHEMA_ID
+            if "public_meld_count" in payload
+            else V15_MODEL_INPUT_SCHEMA_ID
+            if "v15_facts" in payload
+            else SHARED_MODEL_INPUT_SCHEMA_ID
+        )
+        if "public_meld_count" in payload:
+            from .v16_candidates import CANDIDATE_CAPACITY, CANDIDATE_CODE_WIDTH
+
+            if payload["public_meld_count"].shape != (len(obs.nonzero), 4, 37):
+                raise ValueError("v16 public meld counts do not match observation rows")
+            if payload.get("current_concealed_dora", np.empty(0)).shape != (
+                len(obs.nonzero),
+                3,
+            ):
+                raise ValueError("v16 current concealed dora labels are missing")
+            if payload.get("candidate_codes", np.empty(0)).shape != (
+                len(obs.nonzero),
+                CANDIDATE_CAPACITY,
+                CANDIDATE_CODE_WIDTH,
+            ):
+                raise ValueError("v16 complete action codes are missing")
+            if payload.get("candidate_mask", np.empty(0)).shape != (
+                len(obs.nonzero),
+                CANDIDATE_CAPACITY,
+            ) or payload.get("candidate_label", np.empty(0)).shape != (
+                len(obs.nonzero),
+            ):
+                raise ValueError("v16 complete action masks or labels are missing")
+        if "v15_facts" in payload:
+            from .v15_facts import V15_FACTS_WIDTH
+
+            if payload["v15_facts"].shape != (len(obs.nonzero), V15_FACTS_WIDTH):
+                raise ValueError("v15 public facts do not match observation rows")
     elif obs.channels == MODEL_INPUT_CHANNELS:
         input_schema = MODEL_INPUT_SCHEMA_ID
     elif obs.channels == OBS_CHANNELS:
@@ -304,7 +343,9 @@ def concatenate_packed(parts: list[dict[str, np.ndarray]]) -> dict[str, np.ndarr
     return result
 
 
-def permute_packed(packed: dict[str, np.ndarray], order: np.ndarray) -> dict[str, np.ndarray]:
+def permute_packed(
+    packed: dict[str, np.ndarray], order: np.ndarray
+) -> dict[str, np.ndarray]:
     """Reorder samples inside a packed shard without expanding the observations."""
 
     order = np.asarray(order, dtype=np.int64)
@@ -346,7 +387,9 @@ def permute_packed(packed: dict[str, np.ndarray], order: np.ndarray) -> dict[str
     return result
 
 
-def slice_packed(packed: dict[str, np.ndarray], start: int, stop: int) -> dict[str, np.ndarray]:
+def slice_packed(
+    packed: dict[str, np.ndarray], start: int, stop: int
+) -> dict[str, np.ndarray]:
     """Take a range of samples out of a packed shard without expanding it.
 
     The packed observations store one offset per sample, so a contiguous range
@@ -445,7 +488,11 @@ def save_chunk_archive(
                     if name in packed
                 }
                 for name, value in packed.items():
-                    if name not in {*PACKED_METADATA_FIELDS, "obs_offsets", "obs_values"}:
+                    if name not in {
+                        *PACKED_METADATA_FIELDS,
+                        "obs_offsets",
+                        "obs_values",
+                    }:
                         chunk[name] = value[start:stop]
                 # The sparse values are not one per sample, so they are cut by the
                 # offset window rather than by the sample range. A chunk keeps one
@@ -453,7 +500,9 @@ def save_chunk_archive(
                 # addressable after the rebase.
                 offsets = packed["obs_offsets"][start : stop + 1]
                 chunk["obs_offsets"] = offsets - offsets[0]
-                chunk["obs_values"] = packed["obs_values"][int(offsets[0]) : int(offsets[-1])]
+                chunk["obs_values"] = packed["obs_values"][
+                    int(offsets[0]) : int(offsets[-1])
+                ]
                 archive.writestr(
                     f"chunk_{member_index:05d}.npz",
                     _compressed_npz_bytes(chunk, compression_level),

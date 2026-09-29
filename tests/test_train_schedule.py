@@ -4,6 +4,7 @@ import torch
 from riichi_analysis_engine.train import (
     gradient_total_norm,
     learning_rate_at,
+    resolve_learning_rate_schedule,
     shared_gradient_geometry,
     tail_learning_rate_factor,
 )
@@ -75,3 +76,42 @@ def test_tail_decay_uses_the_authoritative_sample_cursor() -> None:
 
 def test_disabled_tail_decay_does_not_change_existing_runs() -> None:
     assert tail_learning_rate_factor(100, 100, 0, 0.1) == 1.0
+
+
+def test_learning_rate_transition_preserves_tail_and_records_exact_cursor() -> None:
+    saved = {
+        "type": "sample-tail-linear-v1",
+        "warmupSteps": 0,
+        "cooldownSteps": 0,
+        "peakLearningRate": 1e-5,
+        "learningRate": 1e-5,
+        "lossBalanceLearningRate": 1e-3,
+        "tailDecaySamples": 9_217_570,
+        "tailLearningRateFactor": 0.1,
+        "sampleLimit": 92_175_696,
+    }
+    requested = {**saved, "peakLearningRate": 2e-5, "learningRate": 2e-5}
+    with pytest.raises(RuntimeError, match="different learning-rate schedule"):
+        resolve_learning_rate_schedule(
+            requested, saved, next_sample=12_500_016,
+            allow_transition=False, validate_only=False,
+        )
+    transitioned = resolve_learning_rate_schedule(
+        requested, saved, next_sample=12_500_016,
+        allow_transition=True, validate_only=False,
+    )
+    assert transitioned["learningRatePhases"] == [
+        {"startSample": 0, "learningRate": 1e-5},
+        {"startSample": 12_500_016, "learningRate": 2e-5},
+    ]
+    assert transitioned["sampleLimit"] == saved["sampleLimit"]
+    assert transitioned["tailDecaySamples"] == saved["tailDecaySamples"]
+    assert resolve_learning_rate_schedule(
+        requested, transitioned, next_sample=13_000_016,
+        allow_transition=False, validate_only=False,
+    ) == transitioned
+    with pytest.raises(RuntimeError, match="another schedule field"):
+        resolve_learning_rate_schedule(
+            {**requested, "tailDecaySamples": 8_000_000}, saved,
+            next_sample=12_500_016, allow_transition=True, validate_only=False,
+        )
