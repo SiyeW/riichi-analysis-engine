@@ -448,6 +448,7 @@ def validate(
     shanten_labels = np.zeros(7, dtype=np.int64)
     balance_totals: dict[str, float] = {name: 0.0 for name in loss_terms}
     batches = 0
+    validation_samples = 0
     metric_sums: dict[str, float] = {}
     metric_counts: dict[str, int] = {}
     deal_in_positive_histogram = np.zeros(1_000, dtype=np.int64)
@@ -835,11 +836,13 @@ def validate(
             (predicted_match * 10_000.0 - batch["match_score"].float()).abs(),
         )
         batches += 1
+        validation_samples += len(batch["policy"])
         if progress_every > 0 and batches % progress_every == 0:
             print(json.dumps({"phase": "validation-progress", "batches": batches}))
     if should_stop is not None and should_stop():
         raise TrainingInterrupted
     result = {name: value / max(1, batches) for name, value in totals.items()}
+    result["metric/validationSamples"] = float(validation_samples)
     for name, count in conditional_loss_counts.items():
         if name in result and count:
             result[name] = conditional_loss_sums[name] / count
