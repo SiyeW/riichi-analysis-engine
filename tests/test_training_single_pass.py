@@ -45,13 +45,16 @@ def run_training(
     tail_learning_rate_factor: float = 0.1,
     batch_size: int = 8,
     allow_batch_size_transition: bool = False,
+    allow_corpus_extension: bool = False,
+    validation_packs: Path | None = None,
+    stop_file: Path | None = None,
 ) -> Path:
     arguments = [
         "riichi-analysis-train",
         "--train",
         str(packs),
         "--validation",
-        str(packs),
+        str(validation_packs or packs),
         "--run",
         str(run),
         "--batch-size",
@@ -107,6 +110,10 @@ def run_training(
         arguments.extend(["--resume", str(resume)])
     if allow_batch_size_transition:
         arguments.append("--allow-batch-size-transition")
+    if allow_corpus_extension:
+        arguments.append("--allow-corpus-extension")
+    if stop_file:
+        arguments.extend(["--stop-file", str(stop_file)])
     if validate_only:
         arguments.append("--validate-only")
     monkeypatch.setattr(sys, "argv", arguments)

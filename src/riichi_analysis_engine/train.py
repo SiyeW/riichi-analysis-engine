@@ -28,6 +28,11 @@ from .architecture import (
     V15Architecture,
 )
 from .constants import OBS_CHANNELS
+from .corpus_extension import (
+    extend_tail_schedule,
+    file_sha256,
+    validate_corpus_extension,
+)
 from .count_acceleration import CudaGraphJointCounts
 from .dataset import PackDataset
 from .hidden_transport import (
@@ -366,6 +371,7 @@ def resume_training_cursor(
     *,
     allow_complete: bool = False,
     allow_batch_size_transition: bool = False,
+    allow_corpus_extension: bool = False,
 ) -> tuple[int, int]:
     """Validate and return the next unread sample and completed update count."""
 
@@ -396,7 +402,19 @@ def resume_training_cursor(
             raise TypeError(f"resume checkpoint has no {split} dataset identity")
         saved_digest = saved.get("manifestSha256")
         if not saved_digest or saved_digest != current.get("manifestSha256"):
-            raise RuntimeError(f"resume checkpoint uses a different {split} manifest")
+            if split != "train" or not allow_corpus_extension:
+                raise RuntimeError(
+                    f"resume checkpoint uses a different {split} manifest"
+                )
+            extension = validate_corpus_extension(
+                saved, current, int(cursor.get("nextSample", -1))
+            )
+            current["corpusExtensions"] = [
+                *saved.get("corpusExtensions", []),
+                extension,
+            ]
+        elif "corpusExtensions" in saved:
+            current["corpusExtensions"] = saved["corpusExtensions"]
 
     next_sample = int(cursor.get("nextSample", -1))
     completed_steps = int(checkpoint.get("step", -1))
@@ -944,12 +962,15 @@ def resolve_learning_rate_schedule(
             # A phased checkpoint can be resumed without spelling out its
             # history again, provided the active rates and tail still match.
             phases = saved.get("learningRatePhases")
-            if not isinstance(phases, list) or not phases:
+            if not saved.get("corpusExtension") and (
+                not isinstance(phases, list) or not phases
+            ):
                 raise RuntimeError(
                     "resume checkpoint uses a different learning-rate schedule"
                 )
             comparison = dict(saved)
-            comparison.pop("learningRatePhases")
+            comparison.pop("learningRatePhases", None)
+            comparison.pop("corpusExtension", None)
             if comparison != requested:
                 raise RuntimeError(
                     "resume checkpoint uses a different learning-rate schedule"
@@ -1254,6 +1275,16 @@ def save_checkpoint(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the multi-task analysis model.")
     parser.add_argument("--train", type=Path, required=True)
+    parser.add_argument(
+        "--allow-corpus-extension",
+        action="store_true",
+        help="accept only an audited immutable pack-prefix extension on resume",
+    )
+    parser.add_argument(
+        "--stop-file",
+        type=Path,
+        help="save an exact interrupted checkpoint when this file appears",
+    )
     parser.add_argument("--validation", type=Path, required=True)
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -1623,7 +1654,19 @@ def main() -> None:
             args.batch_size,
             allow_complete=args.validate_only,
             allow_batch_size_transition=args.allow_batch_size_transition,
+            allow_corpus_extension=args.allow_corpus_extension
+            and not args.validate_only,
         )
+        if (
+            checkpoint["datasets"]["train"]["manifestSha256"]
+            != datasets["train"]["manifestSha256"]
+        ):
+            datasets["train"]["corpusExtensions"][-1].update(
+                parentCheckpointSha256=file_sha256(resume_path),
+                parentSourceRevision=checkpoint.get("environment", {}).get(
+                    "sourceRevision"
+                ),
+            )
         saved_cursor = checkpoint["trainingCursor"]
         saved_batch_size = int(saved_cursor["batchSize"])
         saved_phases = saved_cursor.get("batchSizePhases")
@@ -1713,13 +1756,26 @@ def main() -> None:
         learning_rate_schedule["sampleLimit"] = sample_limit
     if args.resume is not None:
         saved_schedule = checkpoint.get("learningRateSchedule")
-        learning_rate_schedule = resolve_learning_rate_schedule(
-            learning_rate_schedule,
-            saved_schedule,
-            next_sample=samples_seen,
-            allow_transition=args.allow_learning_rate_transition,
-            validate_only=args.validate_only,
+        corpus_changed = (
+            checkpoint["datasets"]["train"]["manifestSha256"]
+            != datasets["train"]["manifestSha256"]
         )
+        if corpus_changed:
+            if args.allow_learning_rate_transition or args.allow_batch_size_transition:
+                raise RuntimeError(
+                    "corpus extension cannot also change batch size or learning rate"
+                )
+            learning_rate_schedule = extend_tail_schedule(
+                learning_rate_schedule, saved_schedule, samples_seen
+            )
+        else:
+            learning_rate_schedule = resolve_learning_rate_schedule(
+                learning_rate_schedule,
+                saved_schedule,
+                next_sample=samples_seen,
+                allow_transition=args.allow_learning_rate_transition,
+                validate_only=args.validate_only,
+            )
         if (
             not args.validate_only
             and saved_schedule is None
@@ -1838,6 +1894,11 @@ def main() -> None:
 
     interrupt_requested = False
 
+    def should_stop() -> bool:
+        return interrupt_requested or (
+            args.stop_file is not None and args.stop_file.is_file()
+        )
+
     def request_interrupt(*_arguments: object) -> None:
         """Request a checkpoint at the next safe boundary between batches."""
 
@@ -1898,7 +1959,7 @@ def main() -> None:
     )
     trainable_parameters = [*model.parameters(), *balancer.parameters()]
     for batch in train_loader:
-        if interrupt_requested:
+        if should_stop():
             stop_reason = "interrupted"
             break
         batch = move_batch(batch, device)
@@ -2116,7 +2177,7 @@ def main() -> None:
         ):
             stop_reason = "max-analysis-samples"
             break
-        if interrupt_requested:
+        if should_stop():
             stop_reason = "interrupted"
             break
 
@@ -2168,7 +2229,7 @@ def main() -> None:
             balancer,
             validation_loader,
             device,
-            should_stop=lambda: interrupt_requested,
+            should_stop=should_stop,
         )
     except TrainingInterrupted:
         print(json.dumps({"phase": "validation-interrupted", "step": step}), flush=True)

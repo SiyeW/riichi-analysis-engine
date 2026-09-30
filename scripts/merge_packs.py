@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -30,11 +31,22 @@ from riichi_analysis_engine.packing import (
     write_manifest,
     write_plan,
 )
+from riichi_analysis_engine.pipeline_progress import AuditProgress
 
 
 def build_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, required=True, help="pack directory holding the segments")
+    parser.add_argument(
+        "--progress", type=Path, help="atomic merge audit progress JSON"
+    )
+    parser.add_argument(
+        "--root", type=Path, required=True, help="pack directory holding the segments"
+    )
+    parser.add_argument(
+        "--append-prefix",
+        action="store_true",
+        help="record an audited immutable first segment for guarded checkpoint extension",
+    )
     parser.add_argument(
         "--segments",
         nargs="*",
@@ -53,11 +65,18 @@ def build_arguments() -> argparse.Namespace:
 def segment_names(root: Path) -> list[str]:
     """Every subdirectory of the root that holds a packed segment, by name."""
 
-    return sorted(path.name for path in root.iterdir() if (path / "manifest.json").exists())
+    return sorted(
+        path.name for path in root.iterdir() if (path / "manifest.json").exists()
+    )
 
 
 def merge(
-    root: Path, names: list[str], expected_source_games: int = 0
+    root: Path,
+    names: list[str],
+    expected_source_games: int = 0,
+    *,
+    append_prefix: bool = False,
+    progress_path: Path | None = None,
 ) -> dict[str, object]:
     entries: list[dict[str, object]] = []
     plans: list[dict[str, np.ndarray]] = []
@@ -89,7 +108,9 @@ def merge(
             # Version 1 stored the exclusive upper bound rather than the count.
             declared_games -= offset
         if len(identifiers) != declared_games:
-            raise ValueError(f"segment {name} holds {len(identifiers)} games, its manifest says more")
+            raise ValueError(
+                f"segment {name} holds {len(identifiers)} games, its manifest says more"
+            )
         overlap = seen_games.intersection(int(value) for value in identifiers)
         if overlap:
             raise ValueError(f"segment {name} repeats source game {min(overlap)}")
@@ -99,7 +120,9 @@ def merge(
             source = segment / str(entry["pack"])
             if not source.is_file():
                 raise FileNotFoundError(source)
-            entries.append({**entry, "pack": source.relative_to(root).as_posix()})
+            entries.append(
+                {**entry, "pack": Path(os.path.relpath(source, root)).as_posix()}
+            )
         plans.append(plan)
 
     if not entries:
@@ -117,6 +140,13 @@ def merge(
             f"the merged corpus holds {len(ordered_games)} source games, "
             f"expected {expected_source_games}"
         )
+    extension = None
+    if append_prefix:
+        if len(names) < 2:
+            raise ValueError("extension requires an unchanged prefix and new segments")
+        from riichi_analysis_engine.corpus_extension import extension_proof
+
+        extension = extension_proof(root / names[0])
     merged = {
         name: np.concatenate([plan[name] for plan in plans])
         for name in ("source_game", "source_member", "length")
@@ -140,11 +170,15 @@ def merge(
         "observationChannels": shared.get("observationChannels"),
         "eventMemorySchema": shared.get("eventMemorySchema"),
         "trainingTargetSchema": shared.get("trainingTargetSchema"),
+        **({"appendPrefix": extension} if extension is not None else {}),
     }
     write_manifest(root / "manifest.json", manifest)
-    report = audit_packs(root, manifest, merged)
+    progress = AuditProgress(progress_path)
+    progress.begin("merged-pack-contract-and-order", len(entries))
+    report = audit_packs(root, manifest, merged, progress=progress.update)
     manifest["audit"] = report
     write_manifest(root / "manifest.json", manifest)
+    progress.write(force=True, status="complete")
     return report
 
 
@@ -153,7 +187,13 @@ def main() -> None:
     names = arguments.segments or segment_names(arguments.root)
     if not names:
         raise SystemExit(f"{arguments.root} holds no packed segments")
-    report = merge(arguments.root, names, arguments.expected_source_games)
+    report = merge(
+        arguments.root,
+        names,
+        arguments.expected_source_games,
+        append_prefix=arguments.append_prefix,
+        progress_path=arguments.progress,
+    )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

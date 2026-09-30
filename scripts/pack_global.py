@@ -36,10 +36,12 @@ from riichi_analysis_engine.packing import (
     plan_corpus,
     read_plan,
     seam_game,
+    staged_game_number,
     staged_games,
     write_manifest,
     write_plan,
 )
+from riichi_analysis_engine.pipeline_progress import AuditProgress
 from riichi_analysis_engine.storage import read_packed_shard
 
 # Worker processes receive the plan once, in their initializer, instead of
@@ -75,6 +77,15 @@ def build_arguments() -> argparse.Namespace:
         help="approximate sample count of one pack; a pack never splits a chunk",
     )
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "--progress", type=Path, help="atomic preparation progress JSON"
+    )
+    parser.add_argument(
+        "--start-game",
+        type=int,
+        default=0,
+        help="retain stable archive identities at or above this value (no renumbering)",
+    )
     parser.add_argument(
         "--limit-games",
         type=int,
@@ -198,6 +209,8 @@ def main() -> None:
         raise ValueError("--verify-resume-only requires --resume")
     plan_path = arguments.output / "plan.npz"
     started = time.perf_counter()
+    progress = AuditProgress(arguments.progress)
+    progress.begin("plan", 0)
 
     if arguments.audit_only:
         plan = read_plan(plan_path)
@@ -226,7 +239,15 @@ def main() -> None:
             )
         arguments.output.mkdir(parents=True, exist_ok=True)
 
-    games = staged_games(arguments.stage)
+    if arguments.start_game < 0:
+        raise ValueError("starting game must be non-negative")
+    games = [
+        path
+        for path in staged_games(arguments.stage)
+        if staged_game_number(path) >= arguments.start_game
+    ]
+    if not games:
+        raise ValueError("selected stage range contains no games")
     if arguments.limit_games:
         games = games[: arguments.limit_games]
     if arguments.resume or (arguments.reuse_plan and plan_path.exists()):
@@ -279,6 +300,7 @@ def main() -> None:
             )
             return
     pending = [slot for slot in slots if slot.index not in existing]
+    progress.begin("write-packs", len(slots))
     entries: list[dict[str, object]] = list(existing.values())
     if arguments.workers > 1:
         with concurrent.futures.ProcessPoolExecutor(
@@ -289,6 +311,7 @@ def main() -> None:
             for index, meta in pool.map(_build_slot, pending):
                 entries.append(meta)
                 report_progress(index, len(slots), started)
+                progress.update(len(entries), len(slots))
     else:
         _initialize_worker(
             games, plan, arguments.output, arguments.seed, first_forbidden
@@ -297,6 +320,7 @@ def main() -> None:
             index, meta = _build_slot(slot)
             entries.append(meta)
             report_progress(index, len(slots), started)
+            progress.update(len(entries), len(slots))
 
     entries.sort(key=lambda entry: str(entry["pack"]))
     manifest: dict[str, object] = {
@@ -317,10 +341,12 @@ def main() -> None:
         "trainingTargetSchema": entries[0].get("trainingTargetSchema"),
     }
     write_manifest(arguments.output / "manifest.json", manifest)
-    report = audit_packs(arguments.output, manifest, plan)
+    progress.begin("pack-contract-and-order", len(entries))
+    report = audit_packs(arguments.output, manifest, plan, progress=progress.update)
     manifest["audit"] = report
     write_manifest(arguments.output / "manifest.json", manifest)
     print(json.dumps(report, ensure_ascii=False, indent=2))
+    progress.write(force=True, status="complete")
 
 
 if __name__ == "__main__":
