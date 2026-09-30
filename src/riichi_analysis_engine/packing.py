@@ -24,6 +24,7 @@ import json
 import re
 import zipfile
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -476,8 +477,48 @@ def write_manifest(path: Path, payload: dict[str, object]) -> None:
     )
 
 
+def validate_catalog_ownership(
+    name: str,
+    games: np.ndarray,
+    catalog_games: np.ndarray,
+    catalog_offsets: np.ndarray,
+    starts: np.ndarray,
+    lengths: np.ndarray,
+) -> None:
+    """Look up each row's game bounds without rescanning rows for every game."""
+
+    if len(games) == 0:
+        return
+    order = np.argsort(catalog_games)
+    sorted_games = catalog_games[order]
+    positions = np.searchsorted(sorted_games, games)
+    if len(sorted_games) == 0:
+        raise ValueError(
+            f"{name} omits source game {int(games[0])} from its event catalog"
+        )
+    safe_positions = np.minimum(positions, len(sorted_games) - 1)
+    missing = (positions == len(sorted_games)) | (sorted_games[safe_positions] != games)
+    if missing.any():
+        game = int(games[np.flatnonzero(missing)[0]])
+        raise ValueError(f"{name} omits source game {game} from its event catalog")
+    owners = order[positions]
+    lower = catalog_offsets[owners]
+    upper = catalog_offsets[owners + 1]
+    ends = starts.astype(np.int64) + lengths.astype(np.int64)
+    invalid = (starts < lower) | (ends > upper)
+    if invalid.any():
+        game = int(games[np.flatnonzero(invalid)[0]])
+        raise ValueError(
+            f"{name} has an event-history reference outside source game {game}"
+        )
+
+
 def audit_packs(
-    output: Path, manifest: dict[str, object], plan: dict[str, np.ndarray]
+    output: Path,
+    manifest: dict[str, object],
+    plan: dict[str, np.ndarray],
+    *,
+    progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, object]:
     """Re-derive the training-order invariants from the written packs."""
 
@@ -488,9 +529,8 @@ def audit_packs(
     expected_samples = int(plan["length"].sum())
     game_count = int(plan["source_game"].max()) + 1
     unique_game_count = len(np.unique(plan["source_game"]))
-    plan_samples = np.bincount(
-        np.repeat(plan["source_game"], plan["length"]), minlength=game_count
-    )
+    plan_samples = np.zeros(game_count, dtype=np.int64)
+    np.add.at(plan_samples, plan["source_game"], plan["length"])
     seen_samples = np.zeros(game_count, dtype=np.int64)
 
     total = 0
@@ -502,7 +542,7 @@ def audit_packs(
     event_schema_initialized = False
     training_target_schema: str | None = None
     target_schema_initialized = False
-    for entry in entries:
+    for pack_index, entry in enumerate(entries, 1):
         assert isinstance(entry, dict)
         name = str(entry["pack"])
         with np.load(output / name, allow_pickle=False) as source:
@@ -595,23 +635,9 @@ def audit_packs(
                     )
                 if len(np.unique(catalog_games)) != len(catalog_games):
                     raise ValueError(f"{name} repeats a game in its event catalog")
-                game_bounds = {
-                    int(game): (int(catalog_offsets[i]), int(catalog_offsets[i + 1]))
-                    for i, game in enumerate(catalog_games.tolist())
-                }
-                for game in np.unique(games).tolist():
-                    if int(game) not in game_bounds:
-                        raise ValueError(
-                            f"{name} omits source game {game} from its event catalog"
-                        )
-                    lower, upper = game_bounds[int(game)]
-                    selected = games == game
-                    if (starts[selected] < lower).any() or (
-                        starts[selected] + lengths[selected] > upper
-                    ).any():
-                        raise ValueError(
-                            f"{name} has an event-history reference outside source game {game}"
-                        )
+                validate_catalog_ownership(
+                    name, games, catalog_games, catalog_offsets, starts, lengths
+                )
             elif {"history_start", "history_length"}.intersection(source.files):
                 raise ValueError(f"{name} has event references without a catalog")
         if input_schema is None:
@@ -654,6 +680,8 @@ def audit_packs(
         if len(games) > 1:
             adjacent_pairs += int(np.count_nonzero(np.diff(games) == 0))
         previous_game = int(games[-1])
+        if progress is not None:
+            progress(pack_index, len(entries))
 
     if total != expected_samples:
         raise ValueError(

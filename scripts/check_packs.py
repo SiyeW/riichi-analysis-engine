@@ -17,7 +17,13 @@ import argparse
 import concurrent.futures
 import io
 import json
+import os
 import statistics
+import sys
+import tempfile
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +37,71 @@ from riichi_analysis_engine.storage import (
     read_packed_shard,
 )
 from riichi_analysis_engine.training_schema import validate_v8_training_batch
+
+
+class AuditProgress:
+    """Keep progress outside stdout, which is reserved for the final report."""
+
+    def __init__(self, path: Path | None, interval: float = 10.0) -> None:
+        self.path = path
+        self.interval = interval
+        self.phase = "starting"
+        self.started = time.monotonic()
+        self.last_write = 0.0
+        self.completed = 0
+        self.total = 0
+
+    def begin(self, phase: str, total: int) -> None:
+        self.phase = phase
+        self.started = time.monotonic()
+        self.completed = 0
+        self.total = total
+        self.write(force=True)
+
+    def update(self, completed: int, total: int) -> None:
+        self.completed, self.total = completed, total
+        self.write(force=completed == total)
+
+    def write(
+        self, *, force: bool = False, status: str = "running", error: str = ""
+    ) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_write < self.interval:
+            return
+        elapsed = now - self.started
+        rate = self.completed / elapsed if elapsed > 0 else 0.0
+        payload = {
+            "status": status,
+            "phase": self.phase,
+            "completed": self.completed,
+            "total": self.total,
+            "elapsedSeconds": elapsed,
+            "itemsPerSecond": rate,
+            "phaseRemainingSeconds": (self.total - self.completed) / rate
+            if rate
+            else None,
+            "updatedAt": datetime.now(UTC).isoformat(),
+        }
+        if error:
+            payload["error"] = error
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=self.path.name + ".",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                json.dump(payload, handle, ensure_ascii=False)
+            try:
+                os.replace(temporary, self.path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
+        self.last_write = now
 
 
 def build_arguments() -> argparse.Namespace:
@@ -69,6 +140,9 @@ def build_arguments() -> argparse.Namespace:
         help="read every pack and check each one is internally consistent",
     )
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "--progress", type=Path, help="atomic JSON progress, separate from the report"
+    )
     return parser.parse_args()
 
 
@@ -100,14 +174,27 @@ def check_one_pack(path: Path) -> dict[str, object]:
     return {"pack": path.name, "samples": samples, "values": len(packed["obs_values"])}
 
 
-def check_analysis_rows(paths: list[Path]) -> dict[str, int]:
-    """Verify that a staged frame owns at most one selected analysis row."""
+def check_stage(
+    paths: list[Path],
+    *,
+    require_analysis_active: bool,
+    progress: Callable[[int, int], None] | None = None,
+) -> dict[str, object]:
+    """Read each game's metadata once and check its selected analysis rows."""
 
     frames = 0
     rows = 0
     supervised_frames = 0
-    for path in paths:
+    samples = 0
+    chunks = 0
+    for game_index, path in enumerate(paths, 1):
         meta = read_chunk_archive_meta(path)
+        samples += int(meta["samples"])
+        chunks += len(meta["chunkLengths"])
+        if not require_analysis_active:
+            if progress is not None:
+                progress(game_index, len(paths))
+            continue
         event_parts: list[np.ndarray] = []
         active_parts: list[np.ndarray] = []
         for member_index in range(len(meta["chunkLengths"])):
@@ -132,26 +219,55 @@ def check_analysis_rows(paths: list[Path]) -> dict[str, int]:
         frames += len(all_frames)
         supervised_frames += len(active_frames)
         rows += int(analysis_active.sum())
-    return {
+        if progress is not None:
+            progress(game_index, len(paths))
+    report: dict[str, object] = {
         "games": len(paths),
-        "frames": frames,
-        "supervisedFrames": supervised_frames,
-        "policyOnlyFrames": frames - supervised_frames,
-        "analysisRows": rows,
+        "chunks": chunks,
+        "samples": samples,
     }
+    if require_analysis_active:
+        report["analysisRows"] = {
+            "games": len(paths),
+            "frames": frames,
+            "supervisedFrames": supervised_frames,
+            "policyOnlyFrames": frames - supervised_frames,
+            "analysisRows": rows,
+        }
+    return report
 
 
 def verify_storage(
-    root: Path, manifest: dict[str, object], workers: int
+    root: Path,
+    manifest: dict[str, object],
+    workers: int,
+    progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, object]:
     """Read every pack and report what the whole corpus holds."""
 
     paths = [root / str(entry["pack"]) for entry in manifest["packs"]]
+
+    def collect(iterator):
+        results = []
+        for index, result in enumerate(iterator, 1):
+            results.append(result)
+            if progress is not None:
+                progress(index, len(paths))
+        return results
+
     if workers > 1:
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(check_one_pack, paths))
+            # Submit only a bounded window, rather than queueing the whole corpus.
+            results = []
+            for start in range(0, len(paths), workers * 2):
+                for result in pool.map(
+                    check_one_pack, paths[start : start + workers * 2]
+                ):
+                    results.append(result)
+                    if progress is not None:
+                        progress(len(results), len(paths))
     else:
-        results = [check_one_pack(path) for path in paths]
+        results = collect(map(check_one_pack, paths))
     return {
         "packs": len(results),
         "samples": sum(int(result["samples"]) for result in results),
@@ -159,15 +275,21 @@ def verify_storage(
     }
 
 
-def game_stream(root: Path, manifest: dict[str, object]) -> np.ndarray:
+def game_stream(
+    root: Path,
+    manifest: dict[str, object],
+    progress: Callable[[int, int], None] | None = None,
+) -> np.ndarray:
     """The source game of every sample, in the order training will read it."""
 
-    return np.concatenate(
-        [
-            np.load(root / str(entry["pack"]), allow_pickle=False)["source_game"]
-            for entry in manifest["packs"]
-        ]
-    )
+    parts = []
+    entries = manifest["packs"]
+    for index, entry in enumerate(entries, 1):
+        with np.load(root / str(entry["pack"]), allow_pickle=False) as source:
+            parts.append(source["source_game"])
+        if progress is not None:
+            progress(index, len(entries))
+    return np.concatenate(parts)
 
 
 def window_diversity(stream: np.ndarray, window: int, wanted: int) -> dict[str, object]:
@@ -203,6 +325,7 @@ def check_loader(
     samples: int,
     *,
     require_analysis_active: bool,
+    progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, object]:
     """Read a bounded prefix through the training loader and check the batches."""
 
@@ -222,6 +345,8 @@ def check_loader(
         length = len(batch["policy"])
         sizes.append(length)
         total += length
+        if progress is not None:
+            progress(total, samples)
     return {
         "batchSize": batch_size,
         "batches": len(sizes),
@@ -236,15 +361,19 @@ def check_loader(
     }
 
 
-def main() -> None:
-    arguments = build_arguments()
+def run_checks(
+    arguments: argparse.Namespace, progress: AuditProgress
+) -> dict[str, object]:
     if arguments.require_analysis_active and arguments.stage is None:
         raise SystemExit("--require-analysis-active also requires --stage")
     manifest = read_manifest(arguments.packs)
     plan = read_plan(arguments.plan or arguments.packs / "plan.npz")
-    audit = audit_packs(arguments.packs, manifest, plan)
+    progress.begin("pack-contract-and-order", len(manifest["packs"]))
+    audit = audit_packs(arguments.packs, manifest, plan, progress=progress.update)
 
-    stream = game_stream(arguments.packs, manifest)
+    progress.begin("sample-game-stream", len(manifest["packs"]))
+    stream = game_stream(arguments.packs, manifest, progress.update)
+    progress.begin("stream-statistics", len(stream))
     if len(stream) != int(manifest["samples"]):
         raise SystemExit(
             f"packs hold {len(stream)} samples, the manifest says {manifest['samples']}"
@@ -269,13 +398,18 @@ def main() -> None:
         raise SystemExit(
             f"a game owns {report['longestRunOfOneGame']} consecutive samples"
         )
+    progress.update(len(stream), len(stream))
 
     if arguments.stage is not None:
+        progress.begin("stage-enumeration", 0)
         games = staged_games(arguments.stage)
-        samples = sum(int(read_chunk_archive_meta(path)["samples"]) for path in games)
-        chunks = sum(
-            len(read_chunk_archive_meta(path)["chunkLengths"]) for path in games
+        progress.begin("stage-conservation-and-analysis", len(games))
+        stage_report = check_stage(
+            games,
+            require_analysis_active=arguments.require_analysis_active,
+            progress=progress.update,
         )
+        samples = stage_report["samples"]
         if len(games) != int(manifest["sourceGames"]):
             raise SystemExit(
                 f"the stage holds {len(games)} games, the packs say {manifest['sourceGames']}"
@@ -284,15 +418,18 @@ def main() -> None:
             raise SystemExit(
                 f"the stage holds {samples} samples, the packs hold {len(stream)}"
             )
-        report["stage"] = {"games": len(games), "chunks": chunks, "samples": samples}
+        analysis_report = stage_report.pop("analysisRows", None)
+        report["stage"] = stage_report
         if arguments.require_analysis_active:
-            report["analysisRows"] = check_analysis_rows(games)
+            report["analysisRows"] = analysis_report
 
+    progress.begin("loader", arguments.loader_samples)
     report["loader"] = check_loader(
         arguments.packs,
         arguments.batch_size,
         arguments.loader_samples,
         require_analysis_active=arguments.require_analysis_active,
+        progress=progress.update,
     )
     if report["loader"]["emptyBatches"]:
         raise SystemExit("the loader yielded an empty batch")
@@ -302,7 +439,10 @@ def main() -> None:
         )
 
     if arguments.verify_storage:
-        storage = verify_storage(arguments.packs, manifest, arguments.workers)
+        progress.begin("full-storage", len(manifest["packs"]))
+        storage = verify_storage(
+            arguments.packs, manifest, arguments.workers, progress.update
+        )
         if storage["samples"] != len(stream):
             raise SystemExit(
                 f"reading every pack found {storage['samples']} samples, the manifest says {len(stream)}"
@@ -310,6 +450,18 @@ def main() -> None:
         report["storage"] = storage
 
     report["verified"] = True
+    return report
+
+
+def main() -> None:
+    arguments = build_arguments()
+    progress = AuditProgress(arguments.progress)
+    try:
+        report = run_checks(arguments, progress)
+    except BaseException as error:
+        progress.write(force=True, status="failed", error=str(error))
+        raise
+    progress.write(force=True, status="complete")
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

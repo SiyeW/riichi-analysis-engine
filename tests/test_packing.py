@@ -2,6 +2,7 @@ import importlib.util
 import io
 import json
 import shutil
+import subprocess
 import sys
 import uuid
 import zipfile
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from test_dataset import pack_directory
 from test_storage import sample_arrays
 
 from riichi_analysis_engine.model_input import SHARED_MODEL_INPUT_CHANNELS
@@ -25,6 +27,7 @@ from riichi_analysis_engine.packing import (
     read_plan,
     seam_game,
     staged_games,
+    validate_catalog_ownership,
     write_manifest,
     write_plan,
 )
@@ -45,6 +48,157 @@ merge_packs = importlib.util.module_from_spec(MERGE_SPEC)
 sys.modules[MERGE_SPEC.name] = merge_packs
 MERGE_SPEC.loader.exec_module(merge_packs)
 
+CHECKER_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check_packs.py"
+CHECKER_SPEC = importlib.util.spec_from_file_location("check_packs", CHECKER_SCRIPT)
+assert CHECKER_SPEC is not None and CHECKER_SPEC.loader is not None
+checker = importlib.util.module_from_spec(CHECKER_SPEC)
+sys.modules[CHECKER_SPEC.name] = checker
+CHECKER_SPEC.loader.exec_module(checker)
+
+
+def test_stage_audit_conserves_samples_and_rejects_duplicate_analysis(
+    scratch: Path,
+) -> None:
+    path = scratch / "stage" / "game-000000.zip"
+    arrays = sample_arrays(4)
+    arrays["event_index"] = np.asarray([0, 0, 1, 1], dtype=np.int32)
+    arrays["analysis_active"] = np.asarray([True, False, True, False])
+    save_chunk_archive(path, arrays, 2)
+    updates = []
+    report = checker.check_stage(
+        [path],
+        require_analysis_active=True,
+        progress=lambda completed, total: updates.append((completed, total)),
+    )
+    assert report["samples"] == 4
+    assert report["chunks"] == 2
+    assert report["analysisRows"]["analysisRows"] == 2
+    assert report["analysisRows"]["frames"] == 2
+    assert updates == [(1, 1)]
+    arrays["analysis_active"][1] = True
+    save_chunk_archive(path, arrays, 2)
+    with pytest.raises(SystemExit, match="duplicate analysis rows"):
+        checker.check_stage([path], require_analysis_active=True)
+
+
+def test_checker_cli_progress_is_separate_from_verified_report(scratch: Path) -> None:
+    output = pack_directory(
+        scratch, games=4, chunks=2, samples=4, training_targets=True, model_format=10
+    )
+    stage = scratch / "stage"
+    plan = plan_corpus(staged_games(stage), 314159)
+    write_plan(output / "plan.npz", plan)
+    progress = scratch / "audit-progress.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CHECKER_SCRIPT),
+            "--packs",
+            str(output),
+            "--stage",
+            str(stage),
+            "--verify-storage",
+            "--require-analysis-active",
+            "--loader-samples",
+            "16",
+            "--batch-size",
+            "4",
+            "--workers",
+            "2",
+            "--progress",
+            str(progress),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["verified"] is True
+    assert report["samples"] == 32
+    assert report["stage"]["samples"] == 32
+    assert report["storage"]["samples"] == 32
+    state = json.loads(progress.read_text(encoding="utf-8"))
+    assert state["status"] == "complete"
+    assert state["completed"] == state["total"] == report["packs"]
+    assert not list(scratch.glob("audit-progress.json.*.tmp"))
+    records = [
+        json.loads(line) for line in result.stderr.splitlines() if line.startswith("{")
+    ]
+    assert records[0]["phase"] == "pack-contract-and-order"
+    assert records[-1]["status"] == "complete"
+    # A later failing attempt must replace the previous successful progress state.
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    manifest["packs"][0]["samples"] += 1
+    write_manifest(output / "manifest.json", manifest)
+    failed = subprocess.run(
+        [
+            sys.executable,
+            str(CHECKER_SCRIPT),
+            "--packs",
+            str(output),
+            "--progress",
+            str(progress),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert failed.returncode != 0
+    assert json.loads(progress.read_text(encoding="utf-8"))["status"] == "failed"
+
+
+def test_catalog_ownership_handles_shuffled_sparse_game_ids() -> None:
+    catalog_games = np.asarray([90, 5, 31], dtype=np.uint32)
+    offsets = np.asarray([0, 8, 14, 25], dtype=np.uint32)
+    games = np.asarray([31, 90, 5, 31, 5], dtype=np.uint32)
+    starts = np.asarray([14, 0, 8, 20, 13], dtype=np.uint32)
+    lengths = np.asarray([11, 8, 6, 5, 1], dtype=np.uint16)
+    validate_catalog_ownership("pack", games, catalog_games, offsets, starts, lengths)
+    lengths[-1] = 2
+    with pytest.raises(ValueError, match="outside source game 5"):
+        validate_catalog_ownership(
+            "pack", games, catalog_games, offsets, starts, lengths
+        )
+    games[-1] = 99
+    with pytest.raises(ValueError, match="omits source game 99"):
+        validate_catalog_ownership(
+            "pack", games, catalog_games, offsets, starts, lengths
+        )
+
+
+def test_catalog_ownership_matches_per_game_reference() -> None:
+    rng = np.random.default_rng(42)
+    catalog_games = rng.permutation(np.arange(100, dtype=np.uint32) * 7)
+    offsets = np.arange(101, dtype=np.uint32) * 10
+    owners = rng.integers(0, 100, size=2000)
+    games = catalog_games[owners]
+    starts = offsets[owners] + rng.integers(0, 10, size=len(games)).astype(np.uint32)
+    lengths = rng.integers(0, 10, size=len(games)).astype(np.uint16)
+    for trial in range(10):
+        trial_lengths = lengths.copy() if trial else np.zeros_like(lengths)
+        if trial:
+            trial_lengths[trial * 20] = 20
+        valid = all(
+            (starts[games == game] >= offsets[index]).all()
+            and (
+                starts[games == game].astype(np.int64) + trial_lengths[games == game]
+                <= offsets[index + 1]
+            ).all()
+            for index, game in enumerate(catalog_games)
+        )
+        if valid:
+            validate_catalog_ownership(
+                "pack", games, catalog_games, offsets, starts, trial_lengths
+            )
+        else:
+            with pytest.raises(ValueError, match="outside source game"):
+                validate_catalog_ownership(
+                    "pack", games, catalog_games, offsets, starts, trial_lengths
+                )
+
 
 @pytest.fixture()
 def scratch():
@@ -54,7 +208,9 @@ def scratch():
     write, and a packing test needs real files on disk.
     """
 
-    root = Path(__file__).resolve().parents[1] / "runs" / "test-packing" / uuid.uuid4().hex
+    root = (
+        Path(__file__).resolve().parents[1] / "runs" / "test-packing" / uuid.uuid4().hex
+    )
     root.mkdir(parents=True)
     try:
         yield root
@@ -62,7 +218,9 @@ def scratch():
         shutil.rmtree(root, ignore_errors=True)
 
 
-def stage_corpus(root: Path, *, games: int = 8, chunks: int = 6, samples: int = 16) -> Path:
+def stage_corpus(
+    root: Path, *, games: int = 8, chunks: int = 6, samples: int = 16
+) -> Path:
     """Write a staged corpus whose every sample is traceable to its game."""
 
     stage = root / "stage"
@@ -74,7 +232,9 @@ def stage_corpus(root: Path, *, games: int = 8, chunks: int = 6, samples: int = 
     return stage
 
 
-def pack_corpus(stage: Path, output: Path, plan: dict[str, np.ndarray]) -> dict[str, object]:
+def pack_corpus(
+    stage: Path, output: Path, plan: dict[str, np.ndarray]
+) -> dict[str, object]:
     """Build the packs and the manifest the way the packing command does."""
 
     games = staged_games(stage)
@@ -98,9 +258,9 @@ def test_plan_visits_every_chunk_exactly_once(scratch: Path) -> None:
 
     assert len(plan["length"]) == 48
     assert int(plan["length"].sum()) == 768
-    assert sorted(zip(plan["source_game"].tolist(), plan["source_member"].tolist())) == [
-        (game, member) for game in range(8) for member in range(6)
-    ]
+    assert sorted(
+        zip(plan["source_game"].tolist(), plan["source_member"].tolist())
+    ) == [(game, member) for game in range(8) for member in range(6)]
     assert set(plan["length"].tolist()) == {16}
     # The plan is a permutation, not a reshuffle of a prefix.
     assert sorted(plan["source_game"].tolist()) == sorted(
@@ -108,7 +268,9 @@ def test_plan_visits_every_chunk_exactly_once(scratch: Path) -> None:
     )
 
 
-def test_plan_keeps_archive_identity_when_an_earlier_game_is_missing(scratch: Path) -> None:
+def test_plan_keeps_archive_identity_when_an_earlier_game_is_missing(
+    scratch: Path,
+) -> None:
     stage = stage_corpus(scratch, games=4, chunks=2, samples=8)
     (stage / "game-000001.zip").unlink()
     games = staged_games(stage)
@@ -131,9 +293,10 @@ def test_load_slot_attaches_input_contract_to_legacy_staged_chunks(
     stage = stage_corpus(scratch, games=1, chunks=2, samples=4)
     path = next(stage.glob("game-*.zip"))
     rewritten = path.with_suffix(".legacy.zip")
-    with zipfile.ZipFile(path, "r") as source, zipfile.ZipFile(
-        rewritten, "w", compression=zipfile.ZIP_STORED
-    ) as destination:
+    with (
+        zipfile.ZipFile(path, "r") as source,
+        zipfile.ZipFile(rewritten, "w", compression=zipfile.ZIP_STORED) as destination,
+    ):
         for name in source.namelist():
             if name == "meta.json":
                 meta = json.loads(source.read(name))
@@ -148,9 +311,7 @@ def test_load_slot_attaches_input_contract_to_legacy_staged_chunks(
                     for field in chunk.files
                     if field not in PACKED_METADATA_FIELDS - {"storage_format"}
                 }
-            legacy["storage_format"] = np.asarray(
-                "dual-bitpack-sparse-float16-v4"
-            )
+            legacy["storage_format"] = np.asarray("dual-bitpack-sparse-float16-v4")
             buffer = io.BytesIO()
             np.savez_compressed(buffer, **legacy)
             destination.writestr(name, buffer.getvalue())
@@ -235,9 +396,7 @@ def test_pack_preserves_and_audits_v13_training_target_contract(scratch: Path) -
         paths, output, plan, PackSlot(0, 0, len(plan["length"])), 17, None
     )
     packed = read_packed_shard(output / str(meta["pack"]))
-    audit = audit_packs(
-        output, {"format": MANIFEST_FORMAT, "packs": [meta]}, plan
-    )
+    audit = audit_packs(output, {"format": MANIFEST_FORMAT, "packs": [meta]}, plan)
 
     assert meta["trainingTargetSchema"] == TRAINING_TARGET_SCHEMA_ID
     assert packed["training_target_schema"].item() == TRAINING_TARGET_SCHEMA_ID
@@ -311,7 +470,9 @@ def test_read_plan_rejects_a_foreign_format(scratch: Path) -> None:
 
 
 @pytest.mark.parametrize("pack_samples", [16, 100, 256, 10_000])
-def test_pack_slots_cover_the_chunk_order_exactly(scratch: Path, pack_samples: int) -> None:
+def test_pack_slots_cover_the_chunk_order_exactly(
+    scratch: Path, pack_samples: int
+) -> None:
     plan = plan_corpus(staged_games(stage_corpus(scratch)), 314159)
     slots = pack_slots(plan["length"], pack_samples)
 
