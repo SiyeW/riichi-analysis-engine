@@ -14,7 +14,41 @@ from riichi_analysis_engine.losses import (
     multitask_loss,
 )
 from riichi_analysis_engine.model import RiichiAnalysisModel
-from riichi_analysis_engine.train import forward_batch
+from riichi_analysis_engine.train import forward_batch, validate
+
+
+@pytest.mark.parametrize(
+    "active", [[False, False, False, False], [True, False, True, False]]
+)
+def test_validation_counts_policy_only_rows_before_analysis_filter(scratch, active):
+    packs = pack_directory(
+        scratch,
+        games=2,
+        chunks=1,
+        samples=2,
+        pack_samples=4,
+        training_targets=True,
+        model_format=11,
+        semantic_history=True,
+    )
+    batch = next(iter(PackDataset(packs, batch_size=4)))
+    batch["analysis_active"] = torch.tensor(active)
+    architecture = SemanticModelArchitecture(
+        backbone="cnn",
+        width=16,
+        stem_width=24,
+        event_width=12,
+        backbone_blocks=1,
+        event_blocks=1,
+        decoder_width=20,
+        attention_heads=4,
+    )
+    model = RiichiAnalysisModel(format_version=12, architecture=architecture)
+    balancer = LearnedUncertaintyBalancer(LOSS_TERMS_V8)
+    metrics = validate(model, balancer, [batch], torch.device("cpu"))
+    assert metrics["metric/validationSamples"] == 4
+
+
 from riichi_analysis_engine.training_schema import validate_semantic_training_batch
 
 
@@ -94,9 +128,7 @@ def test_v13_residual_count_losses_complete_one_cpu_optimizer_step(
     batch["concealed_count"][:, 1, 0] = 1
     batch["concealed_count"][:, 2, 1] = 1
     batch["wall_count"][:, 1] = 2
-    validate_semantic_training_batch(
-        batch, require_hidden_baseline_anchor=True
-    )
+    validate_semantic_training_batch(batch, require_hidden_baseline_anchor=True)
     architecture = SemanticModelArchitecture(
         backbone="cnn",
         width=16,

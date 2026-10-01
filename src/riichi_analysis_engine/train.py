@@ -472,6 +472,9 @@ def validate(
         if should_stop is not None and should_stop():
             raise TrainingInterrupted
         batch = move_batch(batch, device)
+        # Count every holdout row before analysis-only filtering; policy-only
+        # rows are still evaluated and must not disappear from the cursor.
+        validation_samples += len(batch["policy"])
         outputs = forward_batch(model, batch)
         total, losses, _active, weights = multitask_loss(outputs, batch, balancer)
         totals["total"] += float(total)
@@ -837,7 +840,6 @@ def validate(
             (predicted_match * 10_000.0 - batch["match_score"].float()).abs(),
         )
         batches += 1
-        validation_samples += len(batch["policy"])
         if progress_every > 0 and batches % progress_every == 0:
             print(json.dumps({"phase": "validation-progress", "batches": batches}))
     if should_stop is not None and should_stop():
