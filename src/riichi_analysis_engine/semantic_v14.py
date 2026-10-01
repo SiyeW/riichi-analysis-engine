@@ -243,6 +243,12 @@ class V14Decoder(nn.Module):
                 need_weights=False,
             )[0]
         )
+        return self.process_task_queries(query, seeds, flattened)
+
+    def process_task_queries(
+        self, query: Tensor, seeds: dict[str, Tensor], flattened: list[Tensor]
+    ) -> dict[str, Tensor]:
+        """Legacy formats share the post-read transformation across tasks."""
         parts = (query + self.task_ff(query)).split(
             [part.shape[1] for part in flattened], dim=1
         )

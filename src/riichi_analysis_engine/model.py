@@ -11,6 +11,7 @@ from .architecture import (
     SemanticModelArchitecture,
     StructuredModelArchitecture,
     V15Architecture,
+    V17Architecture,
 )
 from .constants import ACTION_SPACE, MORTAL_OBS_CHANNELS, OBS_CHANNELS, TILE_TYPES
 from .kyoku_outcome import OUTCOME_COUNT
@@ -357,6 +358,7 @@ class RiichiAnalysisModel(nn.Module):
             14,
             15,
             16,
+            17,
         }:
             raise ValueError(f"unsupported model format version: {format_version}")
         if architecture is not None and format_version not in {
@@ -371,6 +373,7 @@ class RiichiAnalysisModel(nn.Module):
             14,
             15,
             16,
+            17,
         }:
             raise ValueError(
                 "only model formats v6 and later accept architecture metadata"
@@ -383,9 +386,10 @@ class RiichiAnalysisModel(nn.Module):
             | V15Architecture
             | None
         ) = None
-        if format_version in {15, 16}:
+        if format_version in {15, 16, 17}:
             from .semantic_v15 import SemanticV15Model
             from .semantic_v16 import SemanticV16Model
+            from .semantic_v17 import SemanticV17Model
 
             if any(
                 value is not None
@@ -394,12 +398,22 @@ class RiichiAnalysisModel(nn.Module):
                 raise ValueError(
                     "v15 architecture must be configured through its metadata"
                 )
-            configured = architecture or V15Architecture()
+            configured = architecture or (
+                V17Architecture() if format_version == 17 else V15Architecture()
+            )
             if not isinstance(configured, V15Architecture):
                 raise TypeError("v15 requires V15Architecture")
+            if format_version == 17 and not isinstance(configured, V17Architecture):
+                raise TypeError("v17 requires V17Architecture")
+            if format_version != 17 and isinstance(configured, V17Architecture):
+                raise TypeError(
+                    "V17Architecture cannot configure an older model format"
+                )
             self.architecture = configured
             self.semantic_model = (
-                SemanticV16Model(configured)
+                SemanticV17Model(configured)
+                if format_version == 17
+                else SemanticV16Model(configured)
                 if format_version == 16
                 else SemanticV15Model(configured)
             )
@@ -655,7 +669,7 @@ class RiichiAnalysisModel(nn.Module):
         candidate_features: Tensor | None = None,
         candidate_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        if self.format_version == 16:
+        if self.format_version in {16, 17}:
             if any(
                 value is None
                 for value in (event_tokens, event_mask, v15_facts, public_meld_count)
@@ -1018,7 +1032,7 @@ class RiichiAnalysisModel(nn.Module):
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
-    if model.format_version in {15, 16}:
+    if model.format_version in {15, 16, 17}:
         modules = {
             "input": model.semantic_model.input,
             "backbone": model.semantic_model.blocks,

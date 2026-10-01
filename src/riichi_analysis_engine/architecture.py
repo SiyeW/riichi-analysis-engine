@@ -262,3 +262,12 @@ class V15Architecture:
         if not all(type(item) is int for item in value.values()):
             raise ValueError("v15 architecture values must be integers")
         return cls(**value)
+
+
+@dataclass(frozen=True)
+class V17Architecture(V15Architecture):
+    """Wider shared representation with equally sized private task processing."""
+
+    width: int = 512
+    feed_forward_width: int = 2048
+    decoder_width: int = 1024

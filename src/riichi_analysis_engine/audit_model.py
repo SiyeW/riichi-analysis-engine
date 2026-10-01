@@ -8,6 +8,7 @@ from .architecture import (
     SemanticModelArchitecture,
     StructuredModelArchitecture,
     V15Architecture,
+    V17Architecture,
 )
 from .model import RiichiAnalysisModel, count_parameters
 
@@ -17,7 +18,7 @@ def main() -> None:
     parser.add_argument(
         "--model-format",
         type=int,
-        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
+        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17),
         default=13,
     )
     parser.add_argument("--shared-channels", type=int, default=256)
@@ -45,15 +46,15 @@ def main() -> None:
     parser.add_argument(
         "--semantic-backbone", choices=("cnn", "transformer"), default="cnn"
     )
-    parser.add_argument("--semantic-width", type=int, default=256)
+    parser.add_argument("--semantic-width", type=int)
     parser.add_argument("--semantic-stem-width", type=int, default=384)
     parser.add_argument("--semantic-event-width", type=int, default=192)
     parser.add_argument("--semantic-backbone-blocks", type=int, default=8)
     parser.add_argument("--semantic-event-blocks", type=int, default=4)
-    parser.add_argument("--semantic-decoder-width", type=int, default=512)
+    parser.add_argument("--semantic-decoder-width", type=int)
     parser.add_argument("--semantic-attention-heads", type=int, default=8)
     parser.add_argument("--v15-blocks", type=int, default=4)
-    parser.add_argument("--v15-feed-forward-width", type=int, default=512)
+    parser.add_argument("--v15-feed-forward-width", type=int)
     parser.add_argument("--semantic-transformer-ff-multiplier", type=int, default=4)
     parser.add_argument("--semantic-transformer-tile-prior-blocks", type=int, default=0)
     parser.add_argument(
@@ -67,8 +68,19 @@ def main() -> None:
         help="semantic head revision; defaults to 2 for v13/v14 (v14 requires 2)",
     )
     args = parser.parse_args()
-    if args.model_format in {15, 16}:
-        architecture = V15Architecture(
+    defaults = V17Architecture() if args.model_format == 17 else V15Architecture()
+    for name, default in (
+        ("semantic_width", defaults.width),
+        ("semantic_decoder_width", defaults.decoder_width),
+        ("v15_feed_forward_width", defaults.feed_forward_width),
+    ):
+        if getattr(args, name) is None:
+            setattr(args, name, default)
+    if args.model_format in {15, 16, 17}:
+        architecture_type = (
+            V17Architecture if args.model_format == 17 else V15Architecture
+        )
+        architecture = architecture_type(
             width=args.semantic_width,
             blocks=args.v15_blocks,
             attention_heads=args.semantic_attention_heads,

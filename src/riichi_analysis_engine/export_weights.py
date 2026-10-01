@@ -14,6 +14,7 @@ from .architecture import (
     SemanticModelArchitecture,
     StructuredModelArchitecture,
     V15Architecture,
+    V17Architecture,
 )
 from .model import RiichiAnalysisModel, count_parameters
 from .model_input import (
@@ -81,6 +82,7 @@ def main() -> None:
         "riichi-analysis-model-v14": 14,
         "riichi-analysis-model-v15": 15,
         "riichi-analysis-model-v16": 16,
+        "riichi-analysis-model-v17": 17,
     }
     if model_format not in formats:
         raise RuntimeError("checkpoint has an unsupported format")
@@ -92,10 +94,12 @@ def main() -> None:
         | V15Architecture
         | None
     ) = None
-    if format_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}:
+    if format_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}:
         architecture_type = (
-            V15Architecture
-            if format_version in {15, 16}
+            V17Architecture
+            if format_version == 17
+            else V15Architecture
+            if format_version in {15, 16, 17}
             else SemanticModelArchitecture
             if format_version in {12, 13, 14}
             else StructuredModelArchitecture
@@ -150,10 +154,10 @@ def main() -> None:
         },
         "training": training,
     }
-    if format_version in {9, 10, 11, 12, 13, 14, 15, 16}:
+    if format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17}:
         expected_input = (
             v16_model_input_metadata()
-            if format_version == 16
+            if format_version in {16, 17}
             else v15_model_input_metadata()
             if format_version == 15
             else shared_model_input_metadata()
@@ -163,7 +167,7 @@ def main() -> None:
         if checkpoint.get("modelInput") != expected_input:
             raise RuntimeError("checkpoint uses a different model-input contract")
         payload["architecture"]["modelInput"] = expected_input
-    if format_version in {12, 13, 14, 15, 16}:
+    if format_version in {12, 13, 14, 15, 16, 17}:
         expected_semantic_input = semantic_input_metadata()
         if checkpoint.get("semanticInput") != expected_semantic_input:
             raise RuntimeError("checkpoint uses a different semantic-input contract")
