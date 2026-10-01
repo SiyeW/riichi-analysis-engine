@@ -29,7 +29,7 @@ from riichi_analysis_engine.v16_candidates import encode_candidate_set
 
 
 def small_architecture():
-    # Exact-fact event fields need at least their fixed 105 slots.
+    # Exact-fact event fields need at least their fixed 104 slots.
     return V17Architecture(
         width=128,
         blocks=1,
