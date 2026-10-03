@@ -20,7 +20,14 @@ def test_cpu_supervision_exact_loss_and_gradient_parity(analysis, conditional, d
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
     torch.manual_seed(42)
-    batch = training_batch()
+    # Match PackDataset's storage-dtype normalization. Raw converter arrays
+    # contain uint32 provenance; older CUDA/PyTorch cannot boolean-index it.
+    batch = {
+        name: value.long()
+        if value.dtype in {torch.uint16, torch.uint32, torch.uint64}
+        else value
+        for name, value in training_batch().items()
+    }
     if analysis == "mixed":
         batch["analysis_active"][1:] = False
     elif analysis == "none":
