@@ -271,3 +271,8 @@ class V17Architecture(V15Architecture):
     width: int = 512
     feed_forward_width: int = 2048
     decoder_width: int = 1024
+
+
+@dataclass(frozen=True)
+class V18Architecture(V17Architecture):
+    """Equal private pre/post-read processing, with one shared memory read."""

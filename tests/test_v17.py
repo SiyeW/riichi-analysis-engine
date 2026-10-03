@@ -256,7 +256,10 @@ def test_v17_reuses_v16_dataset_contract_and_rejects_old_schemas():
         )
 
 
-def test_cli_checkpoint_cooperative_stop_and_exact_resume(tmp_path, monkeypatch):
+@pytest.mark.parametrize("model_format", [17, 18])
+def test_cli_checkpoint_cooperative_stop_and_exact_resume(
+    tmp_path, monkeypatch, model_format
+):
     from riichi_analysis_engine import train
     from riichi_analysis_engine.packing import (
         MANIFEST_FORMAT,
@@ -321,7 +324,7 @@ def test_cli_checkpoint_cooperative_stop_and_exact_resume(tmp_path, monkeypatch)
             "--run",
             str(tmp_path / name),
             "--model-format",
-            "17",
+            str(model_format),
             "--device",
             "cpu",
             "--batch-size",
@@ -355,7 +358,7 @@ def test_cli_checkpoint_cooperative_stop_and_exact_resume(tmp_path, monkeypatch)
 
     first_path, first = run("first", 1)
     assert first["trainingCursor"]["nextSample"] == 1
-    assert first["format"] == "riichi-analysis-model-v17"
+    assert first["format"] == f"riichi-analysis-model-v{model_format}"
     stop.touch()
     stopped_path, stopped = run("stopped", 2, first_path)
     assert stopped["trainingCursor"]["nextSample"] == 1

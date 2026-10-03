@@ -9,6 +9,7 @@ from .architecture import (
     StructuredModelArchitecture,
     V15Architecture,
     V17Architecture,
+    V18Architecture,
 )
 from .model import RiichiAnalysisModel, count_parameters
 
@@ -18,7 +19,7 @@ def main() -> None:
     parser.add_argument(
         "--model-format",
         type=int,
-        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17),
+        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18),
         default=13,
     )
     parser.add_argument("--shared-channels", type=int, default=256)
@@ -68,7 +69,13 @@ def main() -> None:
         help="semantic head revision; defaults to 2 for v13/v14 (v14 requires 2)",
     )
     args = parser.parse_args()
-    defaults = V17Architecture() if args.model_format == 17 else V15Architecture()
+    defaults = (
+        V18Architecture()
+        if args.model_format == 18
+        else V17Architecture()
+        if args.model_format == 17
+        else V15Architecture()
+    )
     for name, default in (
         ("semantic_width", defaults.width),
         ("semantic_decoder_width", defaults.decoder_width),
@@ -76,9 +83,13 @@ def main() -> None:
     ):
         if getattr(args, name) is None:
             setattr(args, name, default)
-    if args.model_format in {15, 16, 17}:
+    if args.model_format in {15, 16, 17, 18}:
         architecture_type = (
-            V17Architecture if args.model_format == 17 else V15Architecture
+            V18Architecture
+            if args.model_format == 18
+            else V17Architecture
+            if args.model_format == 17
+            else V15Architecture
         )
         architecture = architecture_type(
             width=args.semantic_width,

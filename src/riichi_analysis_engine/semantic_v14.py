@@ -164,7 +164,13 @@ class V14Decoder(nn.Module):
         nn.init.zeros_(self.outputs["hidden_joint_residual"].bias)
 
     def question_seeds(self, state: V14State) -> dict[str, Tensor]:
-        """Semantic axes, not arbitrary learned slots: 300 questions in total."""
+        return {
+            name: seed + self.task_queries[name]
+            for name, seed in self.question_anchors(state).items()
+        }
+
+    def question_anchors(self, state: V14State) -> dict[str, Tensor]:
+        """Object addresses before adding the legacy task identity vector."""
         opponents = self.source_projection(state.players[:, 1:])
         global_state = self.source_projection(state.global_state)
         tiles = self.tile_projection(state.tiles)
@@ -189,7 +195,7 @@ class V14Decoder(nn.Module):
         for name in ("outcome", "kyoku_accounts", "placement", "match_score"):
             seeds[name] = global_state[:, None]
         seeds["policy"] = self.policy_seeds(state, tiles)
-        return {name: seed + self.task_queries[name] for name, seed in seeds.items()}
+        return seeds
 
     def policy_seeds(self, state: V14State, tiles: Tensor) -> Tensor:
         # 0..36 are discard identities; 37..45 are non-discard actions.
