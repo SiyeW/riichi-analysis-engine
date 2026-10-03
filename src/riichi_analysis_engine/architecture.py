@@ -276,3 +276,9 @@ class V17Architecture(V15Architecture):
 @dataclass(frozen=True)
 class V18Architecture(V17Architecture):
     """Equal private pre/post-read processing, with one shared memory read."""
+
+    # Shape is serialized explicitly; existing 512-wide artifacts retain their
+    # architecture when loaded. These defaults apply only to new models.
+    width: int = 256
+    feed_forward_width: int = 1024
+    decoder_width: int = 512

@@ -27,10 +27,10 @@ def small_architecture():
 def test_budget_and_no_redundant_identity_or_second_reader():
     model = RiichiAnalysisModel(format_version=18)
     assert count_parameters(model) == {
-        "input": 1_125_888,
-        "backbone": 16_807_936,
-        "decoder": 25_353_882,
-        "total": 43_287_706,
+        "input": 300_800,
+        "backbone": 4_209_664,
+        "decoder": 6_385_562,
+        "total": 10_896_026,
     }
     decoder = model.semantic_model.decoder
     assert not hasattr(decoder, "task_queries")
@@ -39,7 +39,7 @@ def test_budget_and_no_redundant_identity_or_second_reader():
         assert set(blocks) == set(decoder.OUTPUT_WIDTHS)
         assert {
             sum(p.numel() for p in block.parameters()) for block in blocks.values()
-        } == {1_051_136}
+        } == {263_424}
     assert (
         len(
             {
@@ -126,8 +126,8 @@ def test_private_read_selection_and_one_attention_call():
     assert len(calls) == 2  # One complete read per forward, not one per task.
 
 
-def test_real_losses_adam_and_policy_pre_branch():
-    model = RiichiAnalysisModel(format_version=18, architecture=small_architecture())
+def test_real_losses_adam_and_policy_pre_branch(tmp_path):
+    model = RiichiAnalysisModel(format_version=18)
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
     batch = training_batch()
     total, losses, _, _ = multitask_loss(forward_batch(model, batch), batch)
@@ -140,6 +140,36 @@ def test_real_losses_adam_and_policy_pre_branch():
     )
     optimizer.step()
     assert all(torch.isfinite(value).all() for value in model.state_dict().values())
+    checkpoint = tmp_path / "optimizer-roundtrip.pt"
+    torch.save(
+        {
+            "architecture": model.architecture.to_dict(),
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        },
+        checkpoint,
+    )
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    restored = RiichiAnalysisModel(
+        format_version=18,
+        architecture=V18Architecture.from_dict(saved["architecture"]),
+    )
+    restored.load_state_dict(saved["model"], strict=True)
+    resumed_optimizer = torch.optim.AdamW(restored.parameters(), lr=2e-5)
+    resumed_optimizer.load_state_dict(saved["optimizer"])
+    # The next update agrees with uninterrupted execution, including Adam moments.
+    for current, current_optimizer in (
+        (model, optimizer),
+        (restored, resumed_optimizer),
+    ):
+        current_optimizer.zero_grad(set_to_none=True)
+        next_loss, _, _, _ = multitask_loss(forward_batch(current, batch), batch)
+        next_loss.backward()
+        current_optimizer.step()
+    for name, expected in model.state_dict().items():
+        torch.testing.assert_close(
+            restored.state_dict()[name], expected, rtol=0, atol=0
+        )
 
 
 def test_actual_raw_fields_padding_and_candidate_order():
@@ -176,8 +206,13 @@ def test_actual_raw_fields_padding_and_candidate_order():
         assert torch.isfinite(masked[0, [0, 2]]).all()
 
 
-def test_export_load_strict_topology_and_unchanged_data(tmp_path, monkeypatch):
-    model = RiichiAnalysisModel(format_version=18, architecture=small_architecture())
+@pytest.mark.parametrize("width", [256, 512])
+def test_export_load_strict_topology_and_unchanged_data(tmp_path, monkeypatch, width):
+    architecture = V18Architecture(
+        width=width, feed_forward_width=width * 4, decoder_width=width * 2
+    )
+    assert V18Architecture.from_dict(architecture.to_dict()) == architecture
+    model = RiichiAnalysisModel(format_version=18, architecture=architecture)
     checkpoint, exported = tmp_path / "checkpoint.pt", tmp_path / "weights.pt"
     torch.save(
         {
@@ -202,6 +237,12 @@ def test_export_load_strict_topology_and_unchanged_data(tmp_path, monkeypatch):
     )
     runtime = AnalysisRuntime(exported, "cpu")
     assert runtime.format_version == 18
+    assert runtime.model.architecture == architecture
+    if width == 512:
+        assert count_parameters(runtime.model)["total"] == 43_287_706
+    else:
+        assert count_parameters(runtime.model)["total"] == 10_896_026
+        assert 43_584_104 < exported.stat().st_size < 45_000_000
     with torch.no_grad():
         for name, expected in model(*inputs()).items():
             torch.testing.assert_close(runtime.model(*inputs())[name], expected)
