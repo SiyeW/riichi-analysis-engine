@@ -100,6 +100,8 @@ def main():
             torch.cuda.reset_peak_memory_stats()
             started = None
             analysis_samples = 0
+            amp_backoffs = 0
+            measured_backoffs = 0
             for step in range(args.steps + args.warmup):
                 if step == args.warmup:
                     torch.cuda.synchronize()
@@ -121,28 +123,36 @@ def main():
                 events[0].record()
                 batch = move_batch(cpu, device)
                 events[1].record()
-                with torch.autocast(
-                    "cuda", dtype=torch.float16, enabled=precision == "amp"
-                ):
-                    output = forward_batch(model, batch)
-                    events[2].record()
-                    total, losses, active, _ = multitask_loss(
-                        output,
-                        batch,
-                        balancer,
-                        supervision=supervision,
-                        joint_count_projector=projector,
-                    )
-                    events[3].record()
-                scaler.scale(total).backward()
-                events[4].record()
-                scaler.unscale_(optimizer)
-                if not gradients_are_finite(parameters):
-                    raise FloatingPointError(
-                        f"non-finite gradients in {name}/{step}; no skipped batch"
-                    )
-                scaler.step(optimizer)
-                scaler.update()
+                for attempt in range(8):
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.autocast(
+                        "cuda", dtype=torch.float16, enabled=precision == "amp"
+                    ):
+                        output = forward_batch(model, batch)
+                        events[2].record()
+                        total, losses, active, _ = multitask_loss(
+                            output,
+                            batch,
+                            balancer,
+                            supervision=supervision,
+                            joint_count_projector=projector,
+                        )
+                        events[3].record()
+                    scaler.scale(total).backward()
+                    events[4].record()
+                    scaler.unscale_(optimizer)
+                    finite = gradients_are_finite(parameters)
+                    previous_scale = scaler.get_scale() if not finite else None
+                    scaler.step(optimizer)
+                    scaler.update()
+                    if finite:
+                        break
+                    amp_backoffs += 1
+                    measured_backoffs += int(step >= args.warmup)
+                    if attempt == 7 or scaler.get_scale() >= previous_scale:
+                        raise FloatingPointError(
+                            f"non-finite gradients in {name}/{step}; same-batch retries exhausted"
+                        )
                 analysis_samples += (
                     int(batch["analysis_active"].bool().sum().item())
                     if loss_mode == "legacy"
@@ -195,6 +205,8 @@ def main():
                 "parameters": count_parameters(model),
                 "finite": True,
                 "analysisSamples": analysis_samples,
+                "ampBackoffs": amp_backoffs,
+                "measuredAmpBackoffs": measured_backoffs,
             }
             report["arms"].append(result)
             temporary = args.output.with_suffix(".tmp")
