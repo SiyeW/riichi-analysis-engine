@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
@@ -22,6 +23,50 @@ from .prediction_values import DORA_TAIL_START, SCORE_VALUES, score_class_mask
 from .structured_outputs import fixed_total_values, zero_sum_accounts
 
 JointCountProjector = Callable[[Tensor, Tensor, Tensor], JointCountPrediction]
+
+
+@dataclass(frozen=True)
+class BatchSupervision:
+    """Label availability computed before a batch is transferred to CUDA.
+
+    This is ephemeral execution metadata, not a target or checkpoint format.
+    Construct it again for each batch; never reuse it for a different batch.
+    """
+
+    analysis_count: int
+    row_count: int
+    active: Mapping[str, bool]
+
+    @classmethod
+    def from_cpu(cls, batch: Mapping[str, Tensor]) -> BatchSupervision:
+        if any(value.device.type != "cpu" for value in batch.values()):
+            raise ValueError("supervision metadata requires a CPU batch")
+        rows = batch.get("analysis_active")
+        if rows is None:
+            rows = torch.ones(len(batch["policy"]), dtype=torch.bool)
+        rows = rows.bool()
+        shanten = batch["shanten"][rows]
+        furiten = batch["furiten_no_yaku"][rows].bool()
+        winner = batch["winner_mask"][rows].bool()
+        dora = batch.get("current_concealed_dora")
+        dora_labels = batch["dora"][rows] if dora is None else dora[rows]
+        dora_mask = winner if dora is None else torch.ones_like(winner)
+        return cls(
+            int(rows.sum()),
+            len(rows),
+            {
+                "policy": bool(
+                    (batch.get("candidate_label", batch["policy"]) >= 0).any()
+                ),
+                "analysis": bool(rows.any()),
+                "furiten_no_yaku": bool((shanten == 0).any()),
+                "deal_in_tile": bool(((shanten == 0) & ~furiten).any()),
+                "dora_distribution": bool(dora_mask.any()),
+                "score_distribution": bool(winner.any()),
+                "dora_tail": bool((dora_mask & (dora_labels >= DORA_TAIL_START)).any()),
+            },
+        )
+
 
 # A term represents one independently supervised prediction, not a manually
 # chosen product priority. Their relative influence is learned during training
@@ -124,14 +169,20 @@ def _structured_multitask_losses(
     joint_count_projector: JointCountProjector | None = None,
     *,
     include_hidden_allocation: bool = True,
+    supervision: BatchSupervision | None = None,
 ) -> tuple[dict[str, Tensor], dict[str, bool]]:
+    def has_labels(name: str, mask: Tensor) -> bool:
+        return bool(mask.any()) if supervision is None else supervision.active[name]
+
+    if supervision is not None and supervision.row_count != len(batch["policy"]):
+        raise ValueError("supervision metadata does not match batch size")
     losses: dict[str, Tensor] = {}
     active: dict[str, bool] = {}
     policy_labels = batch.get("candidate_label", batch["policy"])
     policy_mask = batch.get("candidate_mask", batch["action_mask"])
     policy_valid = policy_labels >= 0
     policy_logits = outputs["policy"].masked_fill(~policy_mask.bool(), -torch.inf)
-    if policy_valid.any():
+    if has_labels("policy", policy_valid):
         losses["policy"] = F.cross_entropy(
             policy_logits[policy_valid], policy_labels[policy_valid].long()
         )
@@ -149,7 +200,7 @@ def _structured_multitask_losses(
         )
     else:
         analysis_rows = analysis_rows.bool()
-    if not analysis_rows.any():
+    if not has_labels("analysis", analysis_rows):
         zero = (
             sum(value.sum() for name, value in outputs.items() if name != "policy") * 0
         )
@@ -159,15 +210,16 @@ def _structured_multitask_losses(
         return losses, active
 
     row_count = len(analysis_rows)
+    all_analysis = supervision is not None and supervision.analysis_count == row_count
     outputs = {
-        name: value[analysis_rows]
+        name: value if all_analysis else value[analysis_rows]
         for name, value in outputs.items()
         if name != "policy"
     }
     batch = {
         name: (
             value[analysis_rows]
-            if value.ndim > 0 and len(value) == row_count
+            if not all_analysis and value.ndim > 0 and len(value) == row_count
             else value
         )
         for name, value in batch.items()
@@ -184,7 +236,7 @@ def _structured_multitask_losses(
         reduction="none",
     )
     losses["furiten_no_yaku"] = _masked_mean(furiten_raw, tenpai)
-    active["furiten_no_yaku"] = bool(tenpai.any())
+    active["furiten_no_yaku"] = has_labels("furiten_no_yaku", tenpai)
 
     eligible_wait = tenpai & ~batch["furiten_no_yaku"].bool()
     wait_raw = F.binary_cross_entropy_with_logits(
@@ -193,7 +245,7 @@ def _structured_multitask_losses(
     losses["deal_in_tile"] = _masked_mean(
         wait_raw, eligible_wait.unsqueeze(-1).expand_as(wait_raw)
     )
-    active["deal_in_tile"] = bool(eligible_wait.any())
+    active["deal_in_tile"] = has_labels("deal_in_tile", eligible_wait)
 
     if not include_hidden_allocation:
         losses["hidden_allocation"] = outputs["shanten"].new_zeros(())
@@ -249,7 +301,7 @@ def _structured_multitask_losses(
     dora_mask = (
         torch.ones_like(winner_mask) if current_dora is not None else winner_mask
     )
-    if dora_mask.any():
+    if has_labels("dora_distribution", dora_mask):
         losses["dora_distribution"] = F.cross_entropy(
             outputs["dora_distribution"][dora_mask],
             dora_labels[dora_mask].clamp_max(DORA_TAIL_START),
@@ -258,7 +310,7 @@ def _structured_multitask_losses(
     else:
         losses["dora_distribution"] = outputs["dora_distribution"].sum() * 0
         active["dora_distribution"] = False
-    if winner_mask.any():
+    if has_labels("score_distribution", winner_mask):
         score_labels = batch["score"].long()[winner_mask]
         score_indices = score_class_indices(score_labels)
         score_logits = masked_score_logits(outputs, batch["obs"])
@@ -275,7 +327,7 @@ def _structured_multitask_losses(
         score_active = False
 
     tail_mask = dora_mask & (dora_labels >= DORA_TAIL_START)
-    if tail_mask.any():
+    if has_labels("dora_tail", tail_mask):
         tail_mean = DORA_TAIL_START + F.softplus(outputs["dora_tail"])
         losses["dora_tail"] = F.mse_loss(
             tail_mean[tail_mask], dora_labels.float()[tail_mask]
@@ -323,6 +375,7 @@ def multitask_losses(
     *,
     joint_count_projector: JointCountProjector | None = None,
     include_hidden_allocation: bool = True,
+    supervision: BatchSupervision | None = None,
 ) -> tuple[dict[str, Tensor], dict[str, bool]]:
     """Return raw proper losses and whether each has real supervision.
 
@@ -344,6 +397,7 @@ def multitask_losses(
             batch,
             joint_count_projector,
             include_hidden_allocation=include_hidden_allocation,
+            supervision=supervision,
         )
 
     losses: dict[str, Tensor] = {}
@@ -503,6 +557,7 @@ def multitask_loss(
     balancer: LearnedUncertaintyBalancer | None = None,
     *,
     joint_count_projector: JointCountProjector | None = None,
+    supervision: BatchSupervision | None = None,
 ) -> tuple[Tensor, dict[str, Tensor], dict[str, bool], dict[str, Tensor]]:
     """Compute raw losses, then combine them with the supplied balancer."""
 
@@ -510,6 +565,7 @@ def multitask_loss(
         outputs,
         batch,
         joint_count_projector=joint_count_projector,
+        supervision=supervision,
         include_hidden_allocation=(
             balancer is None or "hidden_allocation" in balancer.names
         ),

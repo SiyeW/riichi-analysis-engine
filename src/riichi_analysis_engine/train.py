@@ -50,6 +50,7 @@ from .kyoku_outcome import OUTCOME_DEAL_IN_INDICATORS, OUTCOME_WINNER_INDICATORS
 from .losses import (
     LOSS_TERMS,
     LOSS_TERMS_V8,
+    BatchSupervision,
     LearnedUncertaintyBalancer,
     masked_score_logits,
     multitask_loss,
@@ -69,6 +70,7 @@ from .model_input import (
     v15_model_input_metadata,
     v16_model_input_metadata,
 )
+from .optimizer_execution import make_adamw, set_adamw_execution
 from .prediction_values import DORA_TAIL_START, DORA_VALUES, SCORE_VALUES
 from .semantic_input import EVENT_MEMORY_SCHEMA_ID, semantic_input_metadata
 from .storage import TRAINING_TARGET_SCHEMA_ID, V16_TRAINING_TARGET_SCHEMA_ID
@@ -1302,7 +1304,7 @@ def main() -> None:
         "--loader-workers",
         type=int,
         choices=(0, 1),
-        default=0,
+        default=None,
         help="one worker overlaps pack decoding with GPU work; zero is synchronous",
     )
     parser.add_argument(
@@ -1312,6 +1314,13 @@ def main() -> None:
         help="batches prefetched when --loader-workers=1",
     )
     parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument(
+        "--optimizer-execution", choices=("auto", "foreach", "fused"), default="auto"
+    )
+    parser.add_argument("--precision", choices=("amp", "fp32"), default="amp")
+    parser.add_argument(
+        "--loss-execution", choices=("cpu-metadata", "legacy"), default="cpu-metadata"
+    )
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(
@@ -1497,7 +1506,11 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.benchmark = True
-    amp_dtype = torch.float16 if device.type == "cuda" else None
+    if args.loader_workers is None:
+        args.loader_workers = 1 if device.type == "cuda" else 0
+    amp_dtype = (
+        torch.float16 if device.type == "cuda" and args.precision == "amp" else None
+    )
     if args.count_projection_execution == "cuda-graph" and (
         args.model_format not in {14, 15, 16, 17, 18}
         or device.type != "cuda"
@@ -1597,7 +1610,7 @@ def main() -> None:
     ).to(device)
     balancer = LearnedUncertaintyBalancer(loss_terms).to(device)
     parameters = count_parameters(model)
-    optimizer = torch.optim.AdamW(
+    optimizer, optimizer_execution = make_adamw(
         [
             {
                 "params": model.parameters(),
@@ -1609,9 +1622,11 @@ def main() -> None:
                 "lr": args.loss_balance_learning_rate,
                 "weight_decay": 0.0,
             },
-        ]
+        ],
+        device,
+        args.optimizer_execution,
     )
-    scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype is not None)
     step = 0
     samples_seen = 0
     analysis_samples_seen = 0
@@ -1624,6 +1639,11 @@ def main() -> None:
     environment["dataLoader"] = {
         "workers": args.loader_workers,
         "prefetchBatches": args.loader_prefetch if args.loader_workers else 0,
+    }
+    environment["trainingExecution"] = {
+        "optimizer": optimizer_execution,
+        "precision": args.precision,
+        "loss": args.loss_execution,
     }
     batch_size_phases = [{"startSample": 0, "batchSize": args.batch_size}]
     if args.resume is not None:
@@ -1693,6 +1713,20 @@ def main() -> None:
             raise RuntimeError("resume checkpoint has incompatible loss-balance state")
         balancer.load_state_dict(balance["state"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
+        # Auto resume preserves the saved execution flags; explicit modes may
+        # switch implementation, but never discard moments or change AdamW math.
+        if args.optimizer_execution != "auto":
+            set_adamw_execution(optimizer, optimizer_execution)
+        else:
+            saved_group = optimizer.param_groups[0]
+            optimizer_execution = (
+                "fused"
+                if saved_group.get("fused")
+                else "foreach"
+                if saved_group.get("foreach")
+                else "default"
+            )
+        environment["trainingExecution"]["optimizer"] = optimizer_execution
         scaler.load_state_dict(checkpoint["scaler"])
         restore_random_state(checkpoint.get("randomState"))
         samples_seen, step = resume_training_cursor(
@@ -1914,6 +1948,7 @@ def main() -> None:
         "validation": str(args.validation.resolve()),
         "run": str(args.run.resolve()),
         "effectiveDevice": str(device),
+        "effectiveOptimizerExecution": optimizer_execution,
         "parameters": parameters,
         "modelArchitecture": architecture.to_dict(),
         "datasets": datasets,
@@ -2009,6 +2044,18 @@ def main() -> None:
         if should_stop():
             stop_reason = "interrupted"
             break
+        analysis_rows_cpu = batch.get("analysis_active")
+        analysis_batch_count = (
+            len(batch["policy"])
+            if analysis_rows_cpu is None
+            else int(analysis_rows_cpu.bool().sum())
+        )
+        supervision = (
+            BatchSupervision.from_cpu(batch)
+            if args.model_format in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+            and args.loss_execution == "cpu-metadata"
+            else None
+        )
         batch = move_batch(batch, device)
         samples_after_update = min(sample_limit, samples_seen + len(batch["policy"]))
         tail_factor = tail_learning_rate_factor(
@@ -2056,6 +2103,7 @@ def main() -> None:
                         batch,
                         balancer,
                         joint_count_projector=joint_count_projector,
+                        supervision=supervision,
                     )
                 if diagnose_gradients:
                     gradient_geometry = shared_gradient_geometry(losses, active, shared)
@@ -2110,12 +2158,7 @@ def main() -> None:
                 )
         step += 1
         samples_seen += len(batch["policy"])
-        analysis_rows = batch.get("analysis_active")
-        analysis_samples_seen += (
-            len(batch["policy"])
-            if analysis_rows is None
-            else int(analysis_rows.bool().sum().item())
-        )
+        analysis_samples_seen += analysis_batch_count
         if step == 1 or step % 100 == 0 or gradient_geometry:
             now = time.perf_counter()
             interval_seconds = max(now - last_log_time, 1e-9)
