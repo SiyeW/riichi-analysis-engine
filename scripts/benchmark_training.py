@@ -15,6 +15,10 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
+from riichi_analysis_engine.branch_execution import (
+    packed_gradients_are_finite,
+    supervised_branch_names,
+)
 from riichi_analysis_engine.count_acceleration import CudaGraphJointCounts
 from riichi_analysis_engine.dataset import PackDataset
 from riichi_analysis_engine.losses import (
@@ -25,6 +29,7 @@ from riichi_analysis_engine.losses import (
 )
 from riichi_analysis_engine.model import RiichiAnalysisModel, count_parameters
 from riichi_analysis_engine.optimizer_execution import make_adamw
+from riichi_analysis_engine.semantic_v17 import V17Decoder
 from riichi_analysis_engine.train import forward_batch, gradients_are_finite, move_batch
 from riichi_analysis_engine.training_schema import validate_v16_training_batch
 
@@ -40,7 +45,16 @@ def main():
     parser.add_argument(
         "--arms",
         nargs="+",
-        choices=("baseline", "cpu-labels", "fused", "prefetch", "fp32"),
+        choices=(
+            "baseline",
+            "cpu-labels",
+            "fused",
+            "prefetch",
+            "fp32",
+            "grouped",
+            "packed-finite",
+            "grouped-packed",
+        ),
     )
     args = parser.parse_args()
     if args.output.exists() or not 16 <= args.steps <= 200 or not 1 <= args.rounds <= 3:
@@ -65,6 +79,9 @@ def main():
         ("fused", "cpu-metadata", "fused", 0, "amp"),
         ("prefetch", "cpu-metadata", "fused", 1, "amp"),
         ("fp32", "cpu-metadata", "fused", 1, "fp32"),
+        ("grouped", "cpu-metadata", "fused", 1, "amp"),
+        ("packed-finite", "cpu-metadata", "fused", 1, "amp"),
+        ("grouped-packed", "cpu-metadata", "fused", 1, "amp"),
     ]
     if args.arms is not None:
         configurations = [
@@ -80,6 +97,17 @@ def main():
             torch.manual_seed(71)
             torch.cuda.manual_seed_all(71)
             model = RiichiAnalysisModel(format_version=18).to(device).train()
+            for module in model.modules():
+                if isinstance(module, V17Decoder):
+                    module.grouped_branch_execution = name in {
+                        "grouped",
+                        "grouped-packed",
+                    }
+            finite_check = (
+                packed_gradients_are_finite
+                if name in {"packed-finite", "grouped-packed"}
+                else gradients_are_finite
+            )
             balancer = LearnedUncertaintyBalancer(LOSS_TERMS_V8).to(device)
             optimizer, effective = make_adamw(
                 [
@@ -126,6 +154,12 @@ def main():
                     BatchSupervision.from_cpu(cpu) if loss_mode != "legacy" else None
                 )
                 prepared = time.perf_counter()
+                if supervision is not None:
+                    for module in model.modules():
+                        if isinstance(module, V17Decoder):
+                            module.grouped_branch_tasks = supervised_branch_names(
+                                dict(supervision.active)
+                            )
                 if step >= args.warmup:
                     host_seconds["loader"] += loaded - before
                     host_seconds["metadata"] += prepared - loaded
@@ -152,7 +186,7 @@ def main():
                     scaler.scale(total).backward()
                     events[4].record()
                     scaler.unscale_(optimizer)
-                    finite = gradients_are_finite(parameters)
+                    finite = finite_check(parameters)
                     previous_scale = scaler.get_scale() if not finite else None
                     scaler.step(optimizer)
                     scaler.update()

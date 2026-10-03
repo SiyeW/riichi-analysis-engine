@@ -4,6 +4,7 @@ import torch
 from torch import Tensor, nn
 
 from .architecture import V18Architecture
+from .branch_execution import execute_branches
 from .semantic_v16 import SemanticV16Model, V16Input, V16SharedBlock, V16State
 from .semantic_v17 import V17Decoder
 from .v16_raw_facts import OWNER_COUNT
@@ -44,11 +45,17 @@ class V18Decoder(V17Decoder):
         )
 
     def question_seeds(self, state: V16State) -> dict[str, Tensor]:
-        seeds = {}
-        for name, anchor in self.question_anchors(state).items():
-            normalized = self.query_norm(anchor)
-            seeds[name] = normalized + self.query_branches[name](normalized)
-        return seeds
+        normalized = {
+            name: self.query_norm(anchor)
+            for name, anchor in self.question_anchors(state).items()
+        }
+        processed = execute_branches(
+            self.query_branches,
+            normalized,
+            grouped=self.grouped_branch_execution,
+            eligible=self.grouped_branch_tasks,
+        )
+        return {name: value + processed[name] for name, value in normalized.items()}
 
     def task_states(self, state: V16State) -> dict[str, Tensor]:
         seeds = self.question_seeds(state)
