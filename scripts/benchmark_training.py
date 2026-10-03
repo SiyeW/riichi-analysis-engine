@@ -37,6 +37,11 @@ def main():
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--rounds", type=int, default=2)
+    parser.add_argument(
+        "--arms",
+        nargs="+",
+        choices=("baseline", "cpu-labels", "fused", "prefetch", "fp32"),
+    )
     args = parser.parse_args()
     if args.output.exists() or not 16 <= args.steps <= 200 or not 1 <= args.rounds <= 3:
         parser.error("new output, 16..200 steps and 1..3 rounds required")
@@ -61,6 +66,12 @@ def main():
         ("prefetch", "cpu-metadata", "fused", 1, "amp"),
         ("fp32", "cpu-metadata", "fused", 1, "fp32"),
     ]
+    if args.arms is not None:
+        configurations = [
+            configuration
+            for configuration in configurations
+            if configuration[0] in args.arms
+        ]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for repetition in range(args.rounds):
         for name, loss_mode, backend, workers, precision in configurations[
