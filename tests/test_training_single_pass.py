@@ -48,6 +48,7 @@ def run_training(
     allow_corpus_extension: bool = False,
     validation_packs: Path | None = None,
     stop_file: Path | None = None,
+    gradient_check: str = "per-tensor",
 ) -> Path:
     arguments = [
         "riichi-analysis-train",
@@ -73,6 +74,8 @@ def run_training(
         str(tail_learning_rate_factor),
         "--device",
         "cpu",
+        "--gradient-check",
+        gradient_check,
         "--model-format",
         str(model_format),
         "--shared-channels",
@@ -302,9 +305,10 @@ def test_explicit_batch_size_transition_keeps_exact_single_pass_cursor(
         batch_size=16,
     )
     assert load_cursor(complete)["nextSample"] == 128
-    assert load_cursor(complete)["batchSizePhases"] == load_cursor(second)[
-        "batchSizePhases"
-    ]
+    assert (
+        load_cursor(complete)["batchSizePhases"]
+        == load_cursor(second)["batchSizePhases"]
+    )
 
 
 def test_training_checkpoint_is_durable_before_validation(
@@ -376,8 +380,9 @@ def test_validation_can_resume_without_replaying_training_samples(
     assert records[0]["stopReason"] == "validation-only"
 
 
+@pytest.mark.parametrize("gradient_check", ["per-tensor", "packed"])
 def test_interrupt_saves_the_next_unread_sample_and_can_resume(
-    scratch: Path, monkeypatch: pytest.MonkeyPatch
+    scratch: Path, monkeypatch: pytest.MonkeyPatch, gradient_check: str
 ) -> None:
     packs = pack_directory(scratch, training_targets=True)
     run = scratch / "run"
@@ -402,7 +407,9 @@ def test_interrupt_saves_the_next_unread_sample_and_can_resume(
     monkeypatch.setattr(train.signal, "signal", capture_handler)
     monkeypatch.setattr(train, "multitask_loss", interrupt_after_first_loss)
     with pytest.raises(SystemExit) as stopped:
-        run_training(monkeypatch, packs, run, max_samples=32)
+        run_training(
+            monkeypatch, packs, run, max_samples=32, gradient_check=gradient_check
+        )
 
     assert stopped.value.code == 130
     interrupted_checkpoint = train.resolve_resume_path(run)
@@ -423,8 +430,11 @@ def test_interrupt_saves_the_next_unread_sample_and_can_resume(
         run,
         max_samples=32,
         resume=interrupted_checkpoint,
+        gradient_check=gradient_check,
     )
     assert load_cursor(resumed)["nextSample"] == 32
+    saved = torch.load(resumed, map_location="cpu", weights_only=True)
+    assert saved["environment"]["trainingExecution"]["gradientCheck"] == gradient_check
 
 
 def test_rolling_checkpoints_follow_sample_thresholds_not_step_numbers(

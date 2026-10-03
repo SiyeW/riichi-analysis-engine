@@ -29,6 +29,7 @@ from .architecture import (
     V17Architecture,
     V18Architecture,
 )
+from .branch_execution import packed_gradients_are_finite
 from .constants import OBS_CHANNELS
 from .corpus_extension import (
     extend_tail_schedule,
@@ -1319,6 +1320,12 @@ def main() -> None:
     )
     parser.add_argument("--precision", choices=("amp", "fp32"), default="amp")
     parser.add_argument(
+        "--gradient-check",
+        choices=("per-tensor", "packed"),
+        default="per-tensor",
+        help="every-step finite check implementation; neither clips nor skips checks",
+    )
+    parser.add_argument(
         "--loss-execution", choices=("cpu-metadata", "legacy"), default="cpu-metadata"
     )
     parser.add_argument("--loss-balance-learning-rate", type=float, default=1e-3)
@@ -1644,6 +1651,7 @@ def main() -> None:
         "optimizer": optimizer_execution,
         "precision": args.precision,
         "loss": args.loss_execution,
+        "gradientCheck": args.gradient_check,
     }
     batch_size_phases = [{"startSample": 0, "batchSize": args.batch_size}]
     if args.resume is not None:
@@ -2121,7 +2129,12 @@ def main() -> None:
                 print(json.dumps({"phase": "oom", "step": step}))
                 raise
             scaler.unscale_(optimizer)
-            if gradients_are_finite(trainable_parameters):
+            finite_check = (
+                packed_gradients_are_finite
+                if args.gradient_check == "packed"
+                else gradients_are_finite
+            )
+            if finite_check(trainable_parameters):
                 # Finiteness is a safety check on EVERY step. Norm/max are
                 # telemetry only; compute them precisely when they are logged,
                 # before the optimizer, without changing or clipping gradients.
