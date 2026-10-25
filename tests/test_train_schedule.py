@@ -66,6 +66,13 @@ def test_the_schedule_depends_only_on_the_step() -> None:
     )
 
 
+def test_rewarming_can_start_at_the_existing_nonzero_rate() -> None:
+    assert learning_rate_at(0, 100, 0, 1e-4, 1e-4, 0.1) == pytest.approx(1e-5)
+    assert learning_rate_at(50, 100, 0, 1e-4, 1e-4, 0.1) == pytest.approx(5.5e-5)
+    assert learning_rate_at(100, 100, 0, 1e-4, 1e-4, 0.1) == pytest.approx(1e-4)
+    assert learning_rate_at(101, 100, 0, 1e-4, 1e-4, 0.1) == pytest.approx(1e-4)
+
+
 def test_tail_decay_uses_the_authoritative_sample_cursor() -> None:
     assert tail_learning_rate_factor(79, 100, 20, 0.1) == 1.0
     assert tail_learning_rate_factor(80, 100, 20, 0.1) == 1.0
@@ -93,12 +100,18 @@ def test_learning_rate_transition_preserves_tail_and_records_exact_cursor() -> N
     requested = {**saved, "peakLearningRate": 2e-5, "learningRate": 2e-5}
     with pytest.raises(RuntimeError, match="different learning-rate schedule"):
         resolve_learning_rate_schedule(
-            requested, saved, next_sample=12_500_016,
-            allow_transition=False, validate_only=False,
+            requested,
+            saved,
+            next_sample=12_500_016,
+            allow_transition=False,
+            validate_only=False,
         )
     transitioned = resolve_learning_rate_schedule(
-        requested, saved, next_sample=12_500_016,
-        allow_transition=True, validate_only=False,
+        requested,
+        saved,
+        next_sample=12_500_016,
+        allow_transition=True,
+        validate_only=False,
     )
     assert transitioned["learningRatePhases"] == [
         {"startSample": 0, "learningRate": 1e-5},
@@ -106,12 +119,21 @@ def test_learning_rate_transition_preserves_tail_and_records_exact_cursor() -> N
     ]
     assert transitioned["sampleLimit"] == saved["sampleLimit"]
     assert transitioned["tailDecaySamples"] == saved["tailDecaySamples"]
-    assert resolve_learning_rate_schedule(
-        requested, transitioned, next_sample=13_000_016,
-        allow_transition=False, validate_only=False,
-    ) == transitioned
+    assert (
+        resolve_learning_rate_schedule(
+            requested,
+            transitioned,
+            next_sample=13_000_016,
+            allow_transition=False,
+            validate_only=False,
+        )
+        == transitioned
+    )
     with pytest.raises(RuntimeError, match="another schedule field"):
         resolve_learning_rate_schedule(
-            {**requested, "tailDecaySamples": 8_000_000}, saved,
-            next_sample=12_500_016, allow_transition=True, validate_only=False,
+            {**requested, "tailDecaySamples": 8_000_000},
+            saved,
+            next_sample=12_500_016,
+            allow_transition=True,
+            validate_only=False,
         )

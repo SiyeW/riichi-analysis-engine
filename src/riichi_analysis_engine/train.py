@@ -80,12 +80,20 @@ from .structured_outputs import (
     fixed_total_values,
     zero_sum_accounts,
 )
+from .training_phase import (
+    PHASE_CURSOR,
+    begin_training_phase,
+    phase_checkpoint_fields,
+    phase_totals,
+    restore_training_phase,
+)
 from .training_schema import (
     validate_semantic_training_batch,
     validate_v8_training_batch,
     validate_v16_training_batch,
 )
 from .v15_facts import V15_FACTS_WIDTH
+from .validation_groups import ValidationGroups
 
 
 class TrainingInterrupted(Exception):
@@ -384,11 +392,15 @@ def resume_training_cursor(
     """Validate and return the next unread sample and completed update count."""
 
     cursor = checkpoint.get("trainingCursor")
-    if not isinstance(cursor, dict) or cursor.get("type") != "single-pass-v1":
+    if not isinstance(cursor, dict) or cursor.get("type") not in {
+        "single-pass-v1",
+        PHASE_CURSOR,
+    }:
         raise RuntimeError(
             "resume checkpoint predates the single-pass cursor and cannot "
             "be resumed safely"
         )
+    restore_training_phase(checkpoint, datasets)
     complete = cursor.get("complete")
     if complete not in (False, True):
         raise RuntimeError("resume checkpoint has an invalid pass-complete marker")
@@ -444,6 +456,8 @@ def validate(
     *,
     progress_every: int = 100,
     should_stop: Callable[[], bool] | None = None,
+    group_report: Path | None = None,
+    validation_manifest_sha256: str | None = None,
 ) -> dict[str, float]:
     model.eval()
     loss_terms = balancer.names
@@ -465,11 +479,18 @@ def validate(
     eligible_negative_histogram = np.zeros(1_000, dtype=np.int64)
     conditional_loss_sums = {"furiten_no_yaku": 0.0, "deal_in_tile": 0.0}
     conditional_loss_counts = {"furiten_no_yaku": 0, "deal_in_tile": 0}
+    furiten_positive_targets = 0
+    grouped = ValidationGroups() if group_report is not None else None
+    current_games = None
 
     def add_metric(
         name: str, values: torch.Tensor, mask: torch.Tensor | None = None
     ) -> None:
         values = values.float()
+        if grouped is not None:
+            if current_games is None:
+                raise ValueError("grouped validation requires source-game metadata")
+            grouped.add(name, values, current_games, mask)
         if mask is not None:
             values = values[mask]
         metric_sums[name] = metric_sums.get(name, 0.0) + float(values.sum())
@@ -478,7 +499,13 @@ def validate(
     for batch in loader:
         if should_stop is not None and should_stop():
             raise TrainingInterrupted
-        batch = move_batch(batch, device)
+        current_games = batch.get("source_game")
+        model_batch = (
+            batch
+            if current_games is None
+            else {name: value for name, value in batch.items() if name != "source_game"}
+        )
+        batch = move_batch(model_batch, device)
         # Count every holdout row before analysis-only filtering; policy-only
         # rows are still evaluated and must not disappear from the cursor.
         validation_samples += len(batch["policy"])
@@ -500,6 +527,14 @@ def validate(
             complete_policy_null_sum += float(legal_counts.log().sum())
             complete_policy_null_count += int(policy_valid.sum())
         policy_logits = outputs["policy"].masked_fill(~policy_mask.bool(), -torch.inf)
+        policy_nll = policy_logits.new_zeros(len(policy_target))
+        if policy_valid.any():
+            policy_nll[policy_valid] = F.cross_entropy(
+                policy_logits[policy_valid],
+                policy_target[policy_valid].long(),
+                reduction="none",
+            )
+        add_metric("policyNll", policy_nll, policy_valid)
         add_metric(
             "policyAccuracy",
             policy_logits.argmax(-1) == policy_target,
@@ -523,6 +558,8 @@ def validate(
                 print(json.dumps({"phase": "validation-progress", "batches": batches}))
             continue
         row_count = len(analysis_rows)
+        if current_games is not None:
+            current_games = current_games[analysis_rows.detach().cpu()]
         outputs = {
             name: value[analysis_rows]
             for name, value in outputs.items()
@@ -580,6 +617,9 @@ def validate(
             torch.bincount(deal_in_bins[~deal_in_target], minlength=1_000).cpu().numpy()
         )
         tenpai = batch["shanten"] == 0
+        furiten_positive_targets += int(
+            (tenpai & batch["furiten_no_yaku"].bool()).sum()
+        )
         eligible_wait = tenpai & ~batch["furiten_no_yaku"].bool()
         eligible_cells = eligible_wait.unsqueeze(-1).expand_as(deal_in_target)
         positive_cells = eligible_cells & deal_in_target
@@ -780,6 +820,32 @@ def validate(
             (dora_point - dora_target.float()).abs(),
             dora_mask,
         )
+        dora_nll = dora_point.new_zeros(dora_target.shape)
+        if dora_mask.any():
+            dora_nll[dora_mask] = F.cross_entropy(
+                outputs["dora_distribution"][dora_mask],
+                dora_target[dora_mask].long().clamp_max(DORA_TAIL_START),
+                reduction="none",
+            )
+        add_metric("doraNll", dora_nll, dora_mask)
+        if "dora_tail" in outputs:
+            add_metric(
+                "doraTailMae",
+                (
+                    DORA_TAIL_START
+                    + F.softplus(outputs["dora_tail"])
+                    - dora_target.float()
+                ).abs(),
+                dora_mask & (dora_target >= DORA_TAIL_START),
+            )
+        score_nll = dora_point.new_zeros(batch["score"].shape)
+        if winner_mask.any():
+            score_nll[winner_mask] = F.cross_entropy(
+                masked_score_logits(outputs, batch["obs"])[winner_mask],
+                score_class_indices(batch["score"].long()[winner_mask]),
+                reduction="none",
+            )
+        add_metric("scoreNll", score_nll, winner_mask)
         if dora_mask.any():
             add_metric(
                 "doraDistributionAccuracy",
@@ -851,8 +917,20 @@ def validate(
             print(json.dumps({"phase": "validation-progress", "batches": batches}))
     if should_stop is not None and should_stop():
         raise TrainingInterrupted
+    if grouped is not None:
+        grouped.write(group_report, validation_samples, validation_manifest_sha256)
     result = {name: value / max(1, batches) for name, value in totals.items()}
     result["metric/validationSamples"] = float(validation_samples)
+    result["metric/policyTargets"] = float(metric_counts.get("policyNll", 0))
+    result["metric/scoreWinnerTargets"] = float(metric_counts.get("scoreNll", 0))
+    result["metric/doraTailTargets"] = float(metric_counts.get("doraTailMae", 0))
+    result["metric/furitenEligibleTargets"] = float(
+        conditional_loss_counts["furiten_no_yaku"]
+    )
+    result["metric/furitenPositiveTargets"] = float(furiten_positive_targets)
+    result["metric/furitenNegativeTargets"] = float(
+        conditional_loss_counts["furiten_no_yaku"] - furiten_positive_targets
+    )
     for name, count in conditional_loss_counts.items():
         if name in result and count:
             result[name] = conditional_loss_sums[name] / count
@@ -899,6 +977,9 @@ def validate(
         conditional_loss_counts["deal_in_tile"]
     )
     result["metric/dealInEligiblePositiveCells"] = float(eligible_positive_count)
+    result["metric/dealInEligibleNegativeCells"] = float(
+        eligible_negative_histogram.sum()
+    )
     result.update(
         {
             f"metric/{name}": metric_sums[name] / max(1, metric_counts[name])
@@ -914,6 +995,7 @@ def learning_rate_at(
     cooldown_steps: int,
     peak_rate: float,
     base_rate: float,
+    start_factor: float = 0.0,
 ) -> float:
     """Linear warmup to the peak rate, then a linear drop to the plateau rate.
 
@@ -924,7 +1006,7 @@ def learning_rate_at(
     """
 
     if warmup_steps > 0 and step <= warmup_steps:
-        return peak_rate * step / warmup_steps
+        return peak_rate * (start_factor + (1.0 - start_factor) * step / warmup_steps)
     if cooldown_steps > 0 and step <= warmup_steps + cooldown_steps:
         progress = (step - warmup_steps) / cooldown_steps
         return peak_rate + (base_rate - peak_rate) * progress
@@ -1219,6 +1301,7 @@ def save_checkpoint(
     learning_rate_schedule: dict[str, object] | None = None,
     resume_allowed: bool = True,
     batch_size_phases: list[dict[str, int]] | None = None,
+    training_phase: dict[str, object] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -1229,7 +1312,9 @@ def save_checkpoint(
             "samplesSeen": samples_seen,
             "analysisSamplesSeen": analysis_samples_seen,
             "trainingCursor": {
-                "type": "single-pass-v1",
+                "type": PHASE_CURSOR
+                if training_phase is not None
+                else "single-pass-v1",
                 "nextSample": samples_seen,
                 "batchesConsumed": step,
                 "batchSize": batch_size,
@@ -1279,6 +1364,9 @@ def save_checkpoint(
             "validation": validation,
             "learningRateSchedule": learning_rate_schedule,
             "resumeAllowed": resume_allowed,
+            **phase_checkpoint_fields(
+                training_phase, samples_seen, step, analysis_samples_seen
+            ),
         },
         temporary,
     )
@@ -1299,6 +1387,7 @@ def main() -> None:
         help="save an exact interrupted checkpoint when this file appears",
     )
     parser.add_argument("--validation", type=Path, required=True)
+    parser.add_argument("--validation-group-report", type=Path)
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument(
@@ -1434,6 +1523,12 @@ def main() -> None:
     parser.add_argument("--keep-checkpoints", type=int, default=3)
     parser.add_argument("--resume", type=Path)
     parser.add_argument(
+        "--start-new-phase",
+        type=Path,
+        help="hash-bound independent novelty proof for a completed parent pass",
+    )
+    parser.add_argument("--warmup-start-factor", type=float, default=0.0)
+    parser.add_argument(
         "--allow-batch-size-transition",
         action="store_true",
         help="explicitly continue a single pass with a new batch size",
@@ -1483,6 +1578,28 @@ def main() -> None:
         raise ValueError("batch-size transition requires --resume")
     if args.allow_learning_rate_transition and args.resume is None:
         raise ValueError("learning-rate transition requires --resume")
+    if args.start_new_phase is not None and (
+        args.resume is None
+        or args.validate_only
+        or args.allow_corpus_extension
+        or args.allow_batch_size_transition
+        or args.allow_learning_rate_transition
+    ):
+        raise ValueError(
+            "new phase requires --resume and cannot combine other transitions"
+        )
+    if (
+        args.start_new_phase is not None
+        and args.run.exists()
+        and any(args.run.iterdir())
+    ):
+        raise RuntimeError("new phase output directory must be empty")
+    if not 0.0 <= args.warmup_start_factor <= 1.0 or (
+        args.warmup_start_factor and args.warmup_steps <= 0
+    ):
+        raise ValueError(
+            "warmup start factor requires a positive warmup and lies in [0,1]"
+        )
     if args.loader_prefetch <= 0:
         raise ValueError("loader prefetch must be positive")
     if args.max_analysis_samples < 0:
@@ -1654,6 +1771,7 @@ def main() -> None:
         "gradientCheck": args.gradient_check,
     }
     batch_size_phases = [{"startSample": 0, "batchSize": args.batch_size}]
+    training_phase = None
     if args.resume is not None:
         resume_path = resolve_resume_path(args.resume)
         print(json.dumps({"resumedFrom": str(resume_path)}))
@@ -1735,10 +1853,40 @@ def main() -> None:
                 else "default"
             )
         environment["trainingExecution"]["optimizer"] = optimizer_execution
+        environment["resumeParent"] = {
+            "checkpointSha256": file_sha256(resume_path),
+            "sourceRevision": checkpoint.get("environment", {}).get("sourceRevision"),
+            "phaseSamplesSeen": checkpoint.get("samplesSeen"),
+            "phaseId": checkpoint.get("trainingPhase", {}).get("phaseId"),
+        }
         scaler.load_state_dict(checkpoint["scaler"])
         restore_random_state(checkpoint.get("randomState"))
+        if args.start_new_phase is not None:
+            training_phase = begin_training_phase(
+                args.start_new_phase, resume_path, checkpoint, datasets, args.batch_size
+            )
+            # The parent is immutable. Validate a new active cursor, not a
+            # rewritten parent checkpoint or a changed-manifest resume bypass.
+            active_checkpoint = {
+                **checkpoint,
+                "step": 0,
+                "samplesSeen": 0,
+                "analysisSamplesSeen": 0,
+                "datasets": datasets,
+                "trainingCursor": {
+                    "type": PHASE_CURSOR,
+                    "nextSample": 0,
+                    "batchesConsumed": 0,
+                    "batchSize": args.batch_size,
+                    "complete": False,
+                },
+                **phase_checkpoint_fields(training_phase, 0, 0, 0),
+            }
+        else:
+            active_checkpoint = checkpoint
+            training_phase = checkpoint.get("trainingPhase")
         samples_seen, step = resume_training_cursor(
-            checkpoint,
+            active_checkpoint,
             datasets,
             args.batch_size,
             allow_complete=args.validate_only,
@@ -1746,7 +1894,10 @@ def main() -> None:
             allow_corpus_extension=args.allow_corpus_extension
             and not args.validate_only,
         )
-        if (
+        if training_phase is not None:
+            datasets["train"]["verified"] = True
+            datasets["train"]["auditProofSha256"] = training_phase["proof"]["sha256"]
+        if args.start_new_phase is None and (
             checkpoint["datasets"]["train"]["manifestSha256"]
             != datasets["train"]["manifestSha256"]
         ):
@@ -1756,7 +1907,7 @@ def main() -> None:
                     "sourceRevision"
                 ),
             )
-        saved_cursor = checkpoint["trainingCursor"]
+        saved_cursor = active_checkpoint["trainingCursor"]
         saved_batch_size = int(saved_cursor["batchSize"])
         saved_phases = saved_cursor.get("batchSizePhases")
         if saved_phases is None:
@@ -1770,7 +1921,7 @@ def main() -> None:
                 or not isinstance(phase.get("batchSize"), int)
                 or phase["batchSize"] <= 0
                 or phase["startSample"] < 0
-                or phase["startSample"] >= samples_seen
+                or phase["startSample"] > samples_seen
                 for phase in saved_phases
             )
             or saved_phases[0]["startSample"] != 0
@@ -1788,7 +1939,7 @@ def main() -> None:
                 {"startSample": samples_seen, "batchSize": args.batch_size}
             )
         analysis_samples_seen = int(
-            checkpoint.get(
+            active_checkpoint.get(
                 "analysisSamplesSeen",
                 samples_seen if args.model_format < 10 else -1,
             )
@@ -1843,7 +1994,9 @@ def main() -> None:
         # rate.  Prefix-only development runs with no tail can therefore extend
         # the same single pass without manufacturing a scheduler mismatch.
         learning_rate_schedule["sampleLimit"] = sample_limit
-    if args.resume is not None:
+    if args.warmup_start_factor:
+        learning_rate_schedule["warmupStartFactor"] = args.warmup_start_factor
+    if args.resume is not None and args.start_new_phase is None:
         saved_schedule = checkpoint.get("learningRateSchedule")
         corpus_changed = (
             checkpoint["datasets"]["train"]["manifestSha256"]
@@ -1878,6 +2031,7 @@ def main() -> None:
         args.validation,
         max_samples=args.max_validation_samples,
         batch_size=args.batch_size,
+        include_source_game=args.validation_group_report is not None,
     )
     loader_options: dict[str, object] = {
         "batch_size": None,
@@ -1962,7 +2116,7 @@ def main() -> None:
         "datasets": datasets,
         "trainingOrder": {
             "type": "globally-mixed-packs-v1",
-            "pass": "single-pass-v1",
+            "pass": PHASE_CURSOR if training_phase is not None else "single-pass-v1",
             "trainSeed": datasets["train"].get("seed"),
             "verified": datasets["train"].get("verified"),
             "startSample": samples_seen,
@@ -1973,6 +2127,7 @@ def main() -> None:
         },
         "environment": environment,
         "trainingContract": training_contract,
+        "trainingPhase": training_phase,
     }
     (args.run / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2, default=str) + "\n",
@@ -2019,12 +2174,20 @@ def main() -> None:
             validation=validation,
             learning_rate_schedule=learning_rate_schedule,
             batch_size_phases=batch_size_phases,
+            training_phase=training_phase,
             resume_allowed=(
                 True
                 if args.resume is None
                 else checkpoint.get("resumeAllowed", True) is True
             ),
         )
+
+    def write_run_pointer(path: Path, **metadata: object) -> None:
+        if training_phase is not None:
+            metadata.update(
+                phase_totals(training_phase, samples_seen, step, analysis_samples_seen)
+            )
+        write_pointer(args.run, path, **metadata)
 
     signal.signal(signal.SIGINT, request_interrupt)
     started = time.perf_counter()
@@ -2042,6 +2205,16 @@ def main() -> None:
         else 0
     )
     model.train()
+    if args.start_new_phase is not None:
+        initial_checkpoint = args.run / "phase-initial.pt"
+        save_run_checkpoint(initial_checkpoint)
+        write_run_pointer(
+            initial_checkpoint,
+            step=0,
+            samplesSeen=0,
+            passComplete=False,
+            validationComplete=False,
+        )
     joint_count_projector = (
         CudaGraphJointCounts(args.batch_size, device)
         if args.count_projection_execution == "cuda-graph" and not args.validate_only
@@ -2078,6 +2251,7 @@ def main() -> None:
             args.cooldown_steps,
             peak_learning_rate,
             args.learning_rate,
+            args.warmup_start_factor,
         )
         optimizer.param_groups[1]["lr"] = tail_factor * learning_rate_at(
             step,
@@ -2085,6 +2259,7 @@ def main() -> None:
             args.cooldown_steps,
             args.loss_balance_learning_rate,
             args.loss_balance_learning_rate,
+            args.warmup_start_factor,
         )
         amp_backoffs = 0
         while True:
@@ -2120,8 +2295,7 @@ def main() -> None:
                 # The failed batch has not advanced the single-pass cursor, so a
                 # resumed run will read it again rather than silently dropping it.
                 save_run_checkpoint(args.run / "oom-interrupted.pt")
-                write_pointer(
-                    args.run,
+                write_run_pointer(
                     args.run / "oom-interrupted.pt",
                     step=step,
                     samplesSeen=samples_seen,
@@ -2189,6 +2363,13 @@ def main() -> None:
                 "learningRate": optimizer.param_groups[0]["lr"],
                 "lossBalanceLearningRate": optimizer.param_groups[1]["lr"],
                 "tailLearningRateFactor": tail_factor,
+                **(
+                    phase_totals(
+                        training_phase, samples_seen, step, analysis_samples_seen
+                    )
+                    if training_phase
+                    else {}
+                ),
                 **{name: float(value.detach()) for name, value in losses.items()},
                 **{
                     f"lossWeight/{name}": float(value.detach())
@@ -2207,45 +2388,65 @@ def main() -> None:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             print(json.dumps(record, ensure_ascii=False))
             if writer is not None:
-                writer.add_scalar("Loss/train_batch", float(total.detach()), step)
+                dashboard_step = phase_totals(
+                    training_phase, samples_seen, step, analysis_samples_seen
+                )["cumulativeStep"]
+                writer.add_scalar(
+                    "Loss/train_batch", float(total.detach()), dashboard_step
+                )
                 for name, value in losses.items():
                     writer.add_scalar(
-                        f"Loss/train_{name}_batch", float(value.detach()), step
+                        f"Loss/train_{name}_batch",
+                        float(value.detach()),
+                        dashboard_step,
                     )
                 for name, value in weights.items():
                     writer.add_scalar(
-                        f"LossBalance/{name}", float(value.detach()), step
+                        f"LossBalance/{name}", float(value.detach()), dashboard_step
                     )
                     if active[name]:
                         writer.add_scalar(
                             f"LossWeighted/{name}",
                             float((value * losses[name]).detach()),
-                            step,
+                            dashboard_step,
                         )
-                writer.add_scalar("Gradient/norm", gradient_norm, step)
-                writer.add_scalar("Gradient/max", gradient_max, step)
+                writer.add_scalar("Gradient/norm", gradient_norm, dashboard_step)
+                writer.add_scalar("Gradient/max", gradient_max, dashboard_step)
                 for name, value in gradient_geometry.items():
-                    writer.add_scalar(f"GradientShared/{name}", value, step)
-                writer.add_scalar("LR", optimizer.param_groups[0]["lr"], step)
+                    writer.add_scalar(f"GradientShared/{name}", value, dashboard_step)
+                writer.add_scalar("LR", optimizer.param_groups[0]["lr"], dashboard_step)
                 writer.add_scalar(
-                    "LR/loss_balance", optimizer.param_groups[1]["lr"], step
+                    "LR/loss_balance", optimizer.param_groups[1]["lr"], dashboard_step
                 )
-                writer.add_scalar("LR/tail_factor", tail_factor, step)
-                writer.add_scalar("Progress/samples", samples_seen, step)
+                writer.add_scalar("LR/tail_factor", tail_factor, dashboard_step)
+                writer.add_scalar("Progress/samples", samples_seen, dashboard_step)
+                if training_phase:
+                    writer.add_scalar(
+                        "Progress/cumulative_samples",
+                        record["cumulativeSamplesSeen"],
+                        dashboard_step,
+                    )
+                    writer.add_scalar(
+                        "Progress/cumulative_analysis_samples",
+                        record["cumulativeAnalysisSamplesSeen"],
+                        dashboard_step,
+                    )
                 writer.add_scalar(
-                    "Progress/analysis_samples", analysis_samples_seen, step
+                    "Progress/analysis_samples", analysis_samples_seen, dashboard_step
                 )
                 writer.add_scalar(
-                    "Progress/samples_per_second", record["samplesPerSecond"], step
+                    "Progress/samples_per_second",
+                    record["samplesPerSecond"],
+                    dashboard_step,
                 )
                 if device.type == "cuda":
                     writer.add_scalar(
-                        "CUDA/allocated_mib", record["peakAllocatedMiB"], step
+                        "CUDA/allocated_mib", record["peakAllocatedMiB"], dashboard_step
                     )
                     writer.add_scalar(
-                        "CUDA/reserved_mib", record["peakReservedMiB"], step
+                        "CUDA/reserved_mib", record["peakReservedMiB"], dashboard_step
                     )
-                    writer.add_scalar("AMP/scale", scaler.get_scale(), step)
+                    writer.add_scalar("AMP/scale", scaler.get_scale(), dashboard_step)
             last_log_time = now
             last_log_samples = samples_seen
         # A terminal boundary gets its named checkpoint immediately below.
@@ -2267,7 +2468,7 @@ def main() -> None:
         ):
             rolling = args.run / f"ckpt-{step:09d}.pt"
             save_run_checkpoint(rolling)
-            write_pointer(args.run, rolling, step=step, samplesSeen=samples_seen)
+            write_run_pointer(rolling, step=step, samplesSeen=samples_seen)
             prune_numbered_checkpoints(args.run, args.keep_checkpoints)
             while next_checkpoint_sample <= samples_seen:
                 next_checkpoint_sample += checkpoint_interval
@@ -2286,8 +2487,7 @@ def main() -> None:
 
     if stop_reason == "interrupted":
         save_run_checkpoint(args.run / "interrupted.pth")
-        write_pointer(
-            args.run,
+        write_run_pointer(
             args.run / "interrupted.pth",
             step=step,
             samplesSeen=samples_seen,
@@ -2317,8 +2517,7 @@ def main() -> None:
     # The training boundary is durable before validation starts. A validation
     # error or interruption must never discard the newest trained samples.
     save_run_checkpoint(final_checkpoint, pass_complete=pass_complete)
-    write_pointer(
-        args.run,
+    write_run_pointer(
         final_checkpoint,
         step=step,
         samplesSeen=samples_seen,
@@ -2333,6 +2532,16 @@ def main() -> None:
             validation_loader,
             device,
             should_stop=should_stop,
+            **(
+                {
+                    "group_report": args.validation_group_report,
+                    "validation_manifest_sha256": datasets["validation"][
+                        "manifestSha256"
+                    ],
+                }
+                if args.validation_group_report is not None
+                else {}
+            ),
         )
     except TrainingInterrupted:
         print(json.dumps({"phase": "validation-interrupted", "step": step}), flush=True)
@@ -2342,13 +2551,21 @@ def main() -> None:
     record = {
         "phase": "validation",
         "step": step,
+        **(
+            phase_totals(training_phase, samples_seen, step, analysis_samples_seen)
+            if training_phase
+            else {}
+        ),
         "stopReason": stop_reason,
         **metrics,
     }
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     print(json.dumps(record, ensure_ascii=False))
-    write_dashboard(writer, metrics, step)
+    dashboard_step = phase_totals(
+        training_phase, samples_seen, step, analysis_samples_seen
+    )["cumulativeStep"]
+    write_dashboard(writer, metrics, dashboard_step)
     if writer is not None and fixture is not None:
         # One fixed input, probed every validation: a metric can look steady
         # while the behaviour behind it drifts.
@@ -2359,22 +2576,27 @@ def main() -> None:
             for rank, (value, action) in enumerate(
                 zip(top.values.tolist(), top.indices.tolist(), strict=True), start=1
             ):
-                writer.add_scalar(f"Fixture/policy_top{rank}_probability", value, step)
-                writer.add_scalar(f"Fixture/policy_top{rank}_action", action, step)
+                writer.add_scalar(
+                    f"Fixture/policy_top{rank}_probability", value, dashboard_step
+                )
+                writer.add_scalar(
+                    f"Fixture/policy_top{rank}_action", action, dashboard_step
+                )
             # Sample zero, first opponent: the head predicts one shanten
             # per opponent, so the probe keeps to a fixed slice of it.
             for shanten, probability in enumerate(
                 probe["shanten"][0, 0].softmax(-1).tolist()
             ):
-                writer.add_scalar(f"Fixture/shanten_p{shanten}", probability, step)
-            writer.add_scalar("Fixture/max_policy", float(policy.max()), step)
+                writer.add_scalar(
+                    f"Fixture/shanten_p{shanten}", probability, dashboard_step
+                )
+            writer.add_scalar("Fixture/max_policy", float(policy.max()), dashboard_step)
     save_run_checkpoint(
         final_checkpoint,
         validation=metrics,
         pass_complete=pass_complete,
     )
-    write_pointer(
-        args.run,
+    write_run_pointer(
         final_checkpoint,
         step=step,
         samplesSeen=samples_seen,

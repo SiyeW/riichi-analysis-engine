@@ -32,7 +32,9 @@ from .storage import (
 )
 
 # Provenance the packer records alongside every sample. It stays out of the
-# batches: the model sees observations and targets, nothing else.
+# training batches: the model sees observations and targets, nothing else.
+# Evaluation can explicitly retain source_game for grouped statistics; validate
+# removes that field before moving model inputs to the device.
 METADATA_FIELDS = frozenset(
     {
         "perspective",
@@ -159,6 +161,7 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
         batch_size: int,
         max_samples: int = 0,
         start_sample: int = 0,
+        include_source_game: bool = False,
     ) -> None:
         super().__init__()
         if batch_size <= 0:
@@ -174,6 +177,7 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
         # not a batch count. It remains exact when a prior budget ended with a
         # short batch.
         self.start_sample = start_sample
+        self.include_source_game = include_source_game
         self.manifest = read_manifest(self.root)
         self.entries = [entry for entry in self.manifest["packs"]]
         self.packs = [self.root / str(entry["pack"]) for entry in self.entries]
@@ -205,7 +209,9 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
         if {"history_start", "history_length"}.issubset(arrays):
             missing = PACK_CATALOG_FIELDS.difference(arrays)
             if missing:
-                raise ValueError(f"semantic pack is missing catalog fields: {sorted(missing)}")
+                raise ValueError(
+                    f"semantic pack is missing catalog fields: {sorted(missing)}"
+                )
             event_tokens, event_mask = materialize_event_memory(
                 arrays["event_catalog"],
                 arrays["history_start"],
@@ -215,7 +221,10 @@ class PackDataset(IterableDataset[dict[str, torch.Tensor]]):
             arrays["event_tokens"] = event_tokens
             arrays["event_mask"] = event_mask
         return {
-            name: value for name, value in arrays.items() if name not in METADATA_FIELDS
+            name: value
+            for name, value in arrays.items()
+            if name not in METADATA_FIELDS
+            or (self.include_source_game and name == "source_game")
         }
 
     @staticmethod

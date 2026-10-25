@@ -49,6 +49,11 @@ def run_training(
     validation_packs: Path | None = None,
     stop_file: Path | None = None,
     gradient_check: str = "per-tensor",
+    start_new_phase: Path | None = None,
+    max_steps: int = 0,
+    warmup_steps: int = 0,
+    warmup_start_factor: float = 0.0,
+    validation_group_report: Path | None = None,
 ) -> Path:
     arguments = [
         "riichi-analysis-train",
@@ -111,6 +116,20 @@ def run_training(
     ]
     if resume is not None:
         arguments.extend(["--resume", str(resume)])
+    arguments.extend(
+        [
+            "--max-steps",
+            str(max_steps),
+            "--warmup-steps",
+            str(warmup_steps),
+            "--warmup-start-factor",
+            str(warmup_start_factor),
+        ]
+    )
+    if start_new_phase is not None:
+        arguments.extend(["--start-new-phase", str(start_new_phase)])
+    if validation_group_report is not None:
+        arguments.extend(["--validation-group-report", str(validation_group_report)])
     if allow_batch_size_transition:
         arguments.append("--allow-batch-size-transition")
     if allow_corpus_extension:

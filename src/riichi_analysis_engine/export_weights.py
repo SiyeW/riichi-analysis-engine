@@ -127,6 +127,19 @@ def main() -> None:
         "validation": checkpoint.get("validation"),
         "sourceRevision": training_source_revision(checkpoint),
     }
+    if checkpoint.get("trainingPhase") is not None:
+        from .training_phase import validate_phase_counters
+
+        totals = validate_phase_counters(checkpoint)
+        training.update(
+            phaseId=checkpoint["trainingPhase"]["phaseId"],
+            phaseStep=training["step"],
+            phaseSamplesSeen=training["samplesSeen"],
+            phaseAnalysisSamplesSeen=training["analysisSamplesSeen"],
+            step=totals["cumulativeStep"],
+            samplesSeen=totals["cumulativeSamplesSeen"],
+            analysisSamplesSeen=totals["cumulativeAnalysisSamplesSeen"],
+        )
     cursor = checkpoint.get("trainingCursor")
     if isinstance(cursor, dict):
         training["pass"] = {
