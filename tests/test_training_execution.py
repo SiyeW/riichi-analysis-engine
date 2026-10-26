@@ -7,16 +7,63 @@ import torch
 from test_v17 import training_batch
 
 from riichi_analysis_engine.architecture import V18Architecture
-from riichi_analysis_engine.losses import BatchSupervision, multitask_loss
+from riichi_analysis_engine.losses import (
+    LOSS_TERMS_V8,
+    BatchSupervision,
+    LearnedUncertaintyBalancer,
+    multitask_loss,
+)
 from riichi_analysis_engine.model import RiichiAnalysisModel
 from riichi_analysis_engine.optimizer_execution import make_adamw, set_adamw_execution
-from riichi_analysis_engine.train import forward_batch
+from riichi_analysis_engine.train import forward_batch, validate
+
+
+def test_distance_validation_keeps_probability_metrics_and_core_selection():
+    batch = {
+        name: value.long()
+        if value.dtype in {torch.uint16, torch.uint32, torch.uint64}
+        else value
+        for name, value in training_batch().items()
+    }
+    model = RiichiAnalysisModel(
+        format_version=18,
+        architecture=V18Architecture(
+            width=128, blocks=1, feed_forward_width=256, decoder_width=256
+        ),
+    )
+    balancer = LearnedUncertaintyBalancer(LOSS_TERMS_V8)
+    baseline = validate(model, balancer, [batch], torch.device("cpu"), progress_every=0)
+    ordered = validate(
+        model,
+        balancer,
+        [batch],
+        torch.device("cpu"),
+        progress_every=0,
+        ordered_distance=True,
+    )
+    for name, value in baseline.items():
+        if name.startswith(("metric/", "Selection/", "null/")):
+            assert ordered[name] == value
+    for name in (
+        "shanten",
+        "hidden_allocation",
+        "dora_distribution",
+        "score_distribution",
+        "placement",
+    ):
+        assert ordered["lossComponent/base/" + name] == baseline[name]
+        assert ordered[name] == pytest.approx(
+            baseline[name] + ordered["lossComponent/distance/" + name]
+        )
 
 
 @pytest.mark.parametrize("analysis", ["all", "mixed", "none"])
 @pytest.mark.parametrize("conditional", [True, False])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_cpu_supervision_exact_loss_and_gradient_parity(analysis, conditional, device):
+@pytest.mark.parametrize("ordered_distance", [False, True])
+def test_cpu_supervision_exact_loss_and_gradient_parity(
+    analysis, conditional, device, ordered_distance
+):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
     torch.manual_seed(42)
@@ -49,9 +96,14 @@ def test_cpu_supervision_exact_loss_and_gradient_parity(analysis, conditional, d
         ),
     ).to(device)
     other = copy.deepcopy(model)
-    first, losses, active, _ = multitask_loss(forward_batch(model, batch), batch)
+    first, losses, active, _ = multitask_loss(
+        forward_batch(model, batch), batch, ordered_distance=ordered_distance
+    )
     second, accelerated, availability, _ = multitask_loss(
-        forward_batch(other, batch), batch, supervision=supervision
+        forward_batch(other, batch),
+        batch,
+        supervision=supervision,
+        ordered_distance=ordered_distance,
     )
     assert active == availability
     for name in losses:

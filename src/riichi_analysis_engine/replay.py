@@ -3,7 +3,6 @@ from __future__ import annotations
 import atexit
 import gzip
 import hashlib
-import itertools
 import json
 import zipfile
 from collections import Counter
@@ -23,6 +22,7 @@ from .constants import (
     tile34_index,
 )
 from .kyoku_outcome import outcome_class_index
+from .prediction_values import PLACEMENT_PERMUTATIONS as PERMUTATIONS
 from .prediction_values import SCORE_VALUE_SET
 from .yaku import has_ron_yaku, is_complete_hand
 
@@ -755,9 +755,6 @@ def passive_perspective(source_id: str, event_index: int) -> int:
 def rotate_absolute(values: np.ndarray, perspective: int) -> np.ndarray:
     order = [(perspective + offset) % PLAYERS for offset in range(PLAYERS)]
     return np.asarray(values)[order]
-
-
-PERMUTATIONS = tuple(itertools.permutations(range(PLAYERS)))
 
 
 def placement_label(scores: np.ndarray, perspective: int) -> int:

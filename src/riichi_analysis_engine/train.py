@@ -80,6 +80,16 @@ from .structured_outputs import (
     fixed_total_values,
     zero_sum_accounts,
 )
+from .training_objective import (
+    ORDERED_CURSOR,
+    ORDERED_PHASE_CURSOR,
+    ORDERED_PROFILE,
+    PROBABILITY_PROFILE,
+    objective_cursor,
+    objective_definition,
+    resolve_objective,
+    saved_objective,
+)
 from .training_phase import (
     PHASE_CURSOR,
     begin_training_phase,
@@ -392,9 +402,12 @@ def resume_training_cursor(
     """Validate and return the next unread sample and completed update count."""
 
     cursor = checkpoint.get("trainingCursor")
+    saved_objective(checkpoint)
     if not isinstance(cursor, dict) or cursor.get("type") not in {
         "single-pass-v1",
         PHASE_CURSOR,
+        ORDERED_CURSOR,
+        ORDERED_PHASE_CURSOR,
     }:
         raise RuntimeError(
             "resume checkpoint predates the single-pass cursor and cannot "
@@ -458,6 +471,7 @@ def validate(
     should_stop: Callable[[], bool] | None = None,
     group_report: Path | None = None,
     validation_manifest_sha256: str | None = None,
+    ordered_distance: bool = False,
 ) -> dict[str, float]:
     model.eval()
     loss_terms = balancer.names
@@ -469,6 +483,7 @@ def validate(
     complete_policy_null_count = 0
     shanten_labels = np.zeros(7, dtype=np.int64)
     balance_totals: dict[str, float] = {name: 0.0 for name in loss_terms}
+    component_totals: dict[str, float] = {}
     batches = 0
     validation_samples = 0
     metric_sums: dict[str, float] = {}
@@ -510,7 +525,17 @@ def validate(
         # rows are still evaluated and must not disappear from the cursor.
         validation_samples += len(batch["policy"])
         outputs = forward_batch(model, batch)
-        total, losses, _active, weights = multitask_loss(outputs, batch, balancer)
+        components = {} if ordered_distance else None
+        total, losses, _active, weights = multitask_loss(
+            outputs,
+            batch,
+            balancer,
+            ordered_distance=ordered_distance,
+            loss_components=components,
+        )
+        if components is not None:
+            for name, value in components.items():
+                component_totals[name] = component_totals.get(name, 0.0) + float(value)
         totals["total"] += float(total)
         for name, value in losses.items():
             totals[name] += float(value)
@@ -920,6 +945,14 @@ def validate(
     if grouped is not None:
         grouped.write(group_report, validation_samples, validation_manifest_sha256)
     result = {name: value / max(1, batches) for name, value in totals.items()}
+    # Like the existing raw validation loss fields, these are batch means,
+    # NOT pooled per-label metrics. The metric/* NLL/MAE definitions stay intact.
+    result.update(
+        {
+            f"lossComponent/{name}": value / max(1, batches)
+            for name, value in component_totals.items()
+        }
+    )
     result["metric/validationSamples"] = float(validation_samples)
     result["metric/policyTargets"] = float(metric_counts.get("policyNll", 0))
     result["metric/scoreWinnerTargets"] = float(metric_counts.get("scoreNll", 0))
@@ -944,7 +977,15 @@ def validate(
     }
     for name, value in nulls.items():
         result[f"null/{name}"] = value
-    add_core_selection_metrics(result, nulls)
+    if ordered_distance:
+        # Preserve probability-vs-null semantics; a composite is not the old CE.
+        selection = {**result, "shanten": result["lossComponent/base/shanten"]}
+        add_core_selection_metrics(selection, nulls)
+        result.update(
+            {k: v for k, v in selection.items() if k.startswith("Selection/")}
+        )
+    else:
+        add_core_selection_metrics(result, nulls)
     result.update(
         {
             f"lossWeight/{name}": balance_totals[name] / max(1, batches)
@@ -1302,6 +1343,8 @@ def save_checkpoint(
     resume_allowed: bool = True,
     batch_size_phases: list[dict[str, int]] | None = None,
     training_phase: dict[str, object] | None = None,
+    loss_objective: dict[str, object] | None = None,
+    objective_transition: dict[str, object] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -1312,9 +1355,12 @@ def save_checkpoint(
             "samplesSeen": samples_seen,
             "analysisSamplesSeen": analysis_samples_seen,
             "trainingCursor": {
-                "type": PHASE_CURSOR
-                if training_phase is not None
-                else "single-pass-v1",
+                "type": objective_cursor(
+                    (loss_objective or objective_definition(PROBABILITY_PROFILE))[
+                        "profile"
+                    ],
+                    phase=training_phase is not None,
+                ),
                 "nextSample": samples_seen,
                 "batchesConsumed": step,
                 "batchSize": batch_size,
@@ -1364,6 +1410,13 @@ def save_checkpoint(
             "validation": validation,
             "learningRateSchedule": learning_rate_schedule,
             "resumeAllowed": resume_allowed,
+            "lossObjective": loss_objective
+            or objective_definition(PROBABILITY_PROFILE),
+            **(
+                {"objectiveTransition": objective_transition}
+                if objective_transition is not None
+                else {}
+            ),
             **phase_checkpoint_fields(
                 training_phase, samples_seen, step, analysis_samples_seen
             ),
@@ -1529,6 +1582,16 @@ def main() -> None:
     )
     parser.add_argument("--warmup-start-factor", type=float, default=0.0)
     parser.add_argument(
+        "--loss-profile",
+        choices=(PROBABILITY_PROFILE, ORDERED_PROFILE),
+        help="versioned loss definition; defaults to the saved objective on resume",
+    )
+    parser.add_argument(
+        "--loss-transition-proof",
+        type=Path,
+        help="hash-bound authorization of an objective change at the unread cursor",
+    )
+    parser.add_argument(
         "--allow-batch-size-transition",
         action="store_true",
         help="explicitly continue a single pass with a new batch size",
@@ -1574,6 +1637,17 @@ def main() -> None:
             setattr(args, name, default)
     if args.max_steps < 0:
         raise ValueError("max steps must be non-negative")
+    if args.loss_transition_proof is not None and (
+        args.resume is None
+        or args.validate_only
+        or args.start_new_phase is not None
+        or args.allow_batch_size_transition
+        or args.allow_learning_rate_transition
+        or args.allow_corpus_extension
+    ):
+        raise ValueError(
+            "objective transition requires resume without other transitions"
+        )
     if args.allow_batch_size_transition and args.resume is None:
         raise ValueError("batch-size transition requires --resume")
     if args.allow_learning_rate_transition and args.resume is None:
@@ -1772,6 +1846,14 @@ def main() -> None:
     }
     batch_size_phases = [{"startSample": 0, "batchSize": args.batch_size}]
     training_phase = None
+    loss_objective, objective_transition, objective_changed = resolve_objective(
+        args.loss_profile,
+        None,
+        None,
+        datasets,
+        None,
+        source_revision=environment.get("sourceRevision"),
+    )
     if args.resume is not None:
         resume_path = resolve_resume_path(args.resume)
         print(json.dumps({"resumedFrom": str(resume_path)}))
@@ -1780,6 +1862,15 @@ def main() -> None:
             raise RuntimeError("this checkpoint is a validation-only model candidate")
         if checkpoint.get("format") != f"riichi-analysis-model-v{args.model_format}":
             raise RuntimeError("resume checkpoint has an unsupported format")
+        loss_objective, objective_transition, objective_changed = resolve_objective(
+            args.loss_profile,
+            checkpoint,
+            resume_path,
+            datasets,
+            args.loss_transition_proof,
+            source_revision=environment.get("sourceRevision"),
+            validate_only=args.validate_only,
+        )
         checkpoint_architecture = checkpoint.get("modelArchitecture")
         if args.model_format in {15, 16, 17, 18}:
             architecture_type = (
@@ -1960,6 +2051,13 @@ def main() -> None:
             raise RuntimeError(
                 "resume budget is already exhausted; increase --max-analysis-samples"
             )
+    ordered_distance = loss_objective["profile"] == ORDERED_PROFILE
+    if ordered_distance and (
+        args.model_format not in {14, 15, 16, 17, 18} or args.loss_term
+    ):
+        raise ValueError(
+            "ordered-distance profile requires all structured joint-count tasks"
+        )
     # The order comes from the training manifest: one pass over globally mixed
     # packs, with no shuffling left for the loader to do.
     train_manifest = PackDataset(args.train, batch_size=args.batch_size)
@@ -2116,7 +2214,9 @@ def main() -> None:
         "datasets": datasets,
         "trainingOrder": {
             "type": "globally-mixed-packs-v1",
-            "pass": PHASE_CURSOR if training_phase is not None else "single-pass-v1",
+            "pass": objective_cursor(
+                loss_objective["profile"], phase=training_phase is not None
+            ),
             "trainSeed": datasets["train"].get("seed"),
             "verified": datasets["train"].get("verified"),
             "startSample": samples_seen,
@@ -2128,6 +2228,8 @@ def main() -> None:
         "environment": environment,
         "trainingContract": training_contract,
         "trainingPhase": training_phase,
+        "lossObjective": loss_objective,
+        "objectiveTransition": objective_transition,
     }
     (args.run / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2, default=str) + "\n",
@@ -2175,6 +2277,8 @@ def main() -> None:
             learning_rate_schedule=learning_rate_schedule,
             batch_size_phases=batch_size_phases,
             training_phase=training_phase,
+            loss_objective=loss_objective,
+            objective_transition=objective_transition,
             resume_allowed=(
                 True
                 if args.resume is None
@@ -2205,13 +2309,15 @@ def main() -> None:
         else 0
     )
     model.train()
-    if args.start_new_phase is not None:
-        initial_checkpoint = args.run / "phase-initial.pt"
+    if args.start_new_phase is not None or objective_changed:
+        initial_checkpoint = args.run / (
+            "objective-initial.pt" if objective_changed else "phase-initial.pt"
+        )
         save_run_checkpoint(initial_checkpoint)
         write_run_pointer(
             initial_checkpoint,
-            step=0,
-            samplesSeen=0,
+            step=step,
+            samplesSeen=samples_seen,
             passComplete=False,
             validationComplete=False,
         )
@@ -2281,12 +2387,15 @@ def main() -> None:
                         )
                     else:
                         outputs = forward_batch(model, batch)
+                    components = {} if ordered_distance else None
                     total, losses, active, weights = multitask_loss(
                         outputs,
                         batch,
                         balancer,
                         joint_count_projector=joint_count_projector,
                         supervision=supervision,
+                        ordered_distance=ordered_distance,
+                        loss_components=components,
                     )
                 if diagnose_gradients:
                     gradient_geometry = shared_gradient_geometry(losses, active, shared)
@@ -2371,6 +2480,14 @@ def main() -> None:
                     else {}
                 ),
                 **{name: float(value.detach()) for name, value in losses.items()},
+                **(
+                    {
+                        f"lossComponent/{name}": float(value.detach())
+                        for name, value in components.items()
+                    }
+                    if components is not None
+                    else {}
+                ),
                 **{
                     f"lossWeight/{name}": float(value.detach())
                     for name, value in weights.items()
@@ -2411,6 +2528,13 @@ def main() -> None:
                             dashboard_step,
                         )
                 writer.add_scalar("Gradient/norm", gradient_norm, dashboard_step)
+                if components is not None:
+                    for name, value in components.items():
+                        writer.add_scalar(
+                            f"LossComponent/{name}",
+                            float(value.detach()),
+                            dashboard_step,
+                        )
                 writer.add_scalar("Gradient/max", gradient_max, dashboard_step)
                 for name, value in gradient_geometry.items():
                     writer.add_scalar(f"GradientShared/{name}", value, dashboard_step)
@@ -2532,6 +2656,7 @@ def main() -> None:
             validation_loader,
             device,
             should_stop=should_stop,
+            ordered_distance=ordered_distance,
             **(
                 {
                     "group_report": args.validation_group_report,

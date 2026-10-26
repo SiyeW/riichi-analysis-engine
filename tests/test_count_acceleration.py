@@ -3,6 +3,7 @@ import torch
 
 from riichi_analysis_engine.count_acceleration import CudaGraphJointCounts
 from riichi_analysis_engine.joint_counts import project_joint_counts
+from riichi_analysis_engine.ordered_losses import cdf_distance
 
 
 def test_replay_rejects_cpu():
@@ -11,7 +12,8 @@ def test_replay_rejects_cpu():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-def test_replay_dynamic_rows_values_gradients_and_optimizer():
+@pytest.mark.parametrize("ordered_distance", [False, True])
+def test_replay_dynamic_rows_values_gradients_and_optimizer(ordered_distance):
     torch.manual_seed(9)
     replay = CudaGraphJointCounts(4, torch.device("cuda"))
     saved = []
@@ -41,6 +43,12 @@ def test_replay_dynamic_rows_values_gradients_and_optimizer():
         saved.append((actual.probability, actual.probability.detach().clone()))
         ex_loss = (expected.probability * weights).square().sum()
         ac_loss = (actual.probability * weights).square().sum()
+        if ordered_distance:
+            labels = torch.zeros(rows, 4, 34, dtype=torch.long, device="cuda")
+            ex_total = expected.probability.reshape(rows, 4, 34, 5, 2).sum(-1)
+            ac_total = actual.probability.reshape(rows, 4, 34, 5, 2).sum(-1)
+            ex_loss = ex_loss + cdf_distance(ex_total, labels).mean()
+            ac_loss = ac_loss + cdf_distance(ac_total, labels).mean()
         with pytest.raises(RuntimeError, match="before another forward"):
             replay(y, inventory, capacities)
         ex_loss.backward()

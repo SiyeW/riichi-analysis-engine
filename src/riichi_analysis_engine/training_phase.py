@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from .corpus_extension import file_sha256
+from .training_objective import ORDERED_PHASE_CURSOR, PHASE_CURSOR
 
-PHASE_CURSOR = "single-pass-phase-v1"
 PHASE_FORMAT = "audited-training-phase-v1"
 
 
@@ -166,7 +166,10 @@ def restore_training_phase(
 ) -> dict[str, Any] | None:
     phase = checkpoint.get("trainingPhase")
     if phase is None:
-        if checkpoint.get("trainingCursor", {}).get("type") == PHASE_CURSOR or any(
+        if checkpoint.get("trainingCursor", {}).get("type") in {
+            PHASE_CURSOR,
+            ORDERED_PHASE_CURSOR,
+        } or any(
             name in checkpoint
             for name in (
                 "cumulativeSamplesSeen",
@@ -179,7 +182,8 @@ def restore_training_phase(
     if (
         not isinstance(phase, dict)
         or phase.get("type") != PHASE_FORMAT
-        or checkpoint.get("trainingCursor", {}).get("type") != PHASE_CURSOR
+        or checkpoint.get("trainingCursor", {}).get("type")
+        not in {PHASE_CURSOR, ORDERED_PHASE_CURSOR}
     ):
         raise RuntimeError("invalid training phase history/cursor")
     validate_phase_counters(checkpoint)

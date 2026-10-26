@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from itertools import permutations
+
+PLACEMENT_PERMUTATIONS = tuple(permutations(range(4)))
+
 
 def _ceil_100(value: int) -> int:
     return ((value + 99) // 100) * 100

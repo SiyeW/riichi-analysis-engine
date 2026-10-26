@@ -16,9 +16,10 @@ from .hidden_transport import (
     physical_hidden_counts,
     projected_count_distributions,
 )
-from .joint_counts import JointCountPrediction, project_joint_counts
+from .joint_counts import JointCountPrediction, family_inventory, project_joint_counts
 from .model_input import MODEL_INPUT_CHANNELS, SHARED_MODEL_INPUT_CHANNELS
 from .observation_layout import JIKAZE_CHANNEL, WIND_TILE_START
+from .ordered_losses import cdf_distance, hidden_count_distance, placement_distance
 from .prediction_values import DORA_TAIL_START, SCORE_VALUES, score_class_mask
 from .structured_outputs import fixed_total_values, zero_sum_accounts
 
@@ -170,7 +171,15 @@ def _structured_multitask_losses(
     *,
     include_hidden_allocation: bool = True,
     supervision: BatchSupervision | None = None,
+    ordered_distance: bool = False,
+    loss_components: dict[str, Tensor] | None = None,
 ) -> tuple[dict[str, Tensor], dict[str, bool]]:
+    def with_distance(name: str, original: Tensor, distance: Tensor) -> Tensor:
+        if loss_components is not None:
+            loss_components[f"base/{name}"] = original
+            loss_components[f"distance/{name}"] = distance
+        return original + distance
+
     def has_labels(name: str, mask: Tensor) -> bool:
         return bool(mask.any()) if supervision is None else supervision.active[name]
 
@@ -207,6 +216,16 @@ def _structured_multitask_losses(
         for name in LOSS_TERMS_V8[1:]:
             losses[name] = zero
             active[name] = False
+        if ordered_distance and loss_components is not None:
+            for name in (
+                "shanten",
+                "hidden_allocation",
+                "dora_distribution",
+                "score_distribution",
+                "placement",
+            ):
+                loss_components[f"base/{name}"] = zero
+                loss_components[f"distance/{name}"] = zero
         return losses, active
 
     row_count = len(analysis_rows)
@@ -228,6 +247,14 @@ def _structured_multitask_losses(
     losses["shanten"] = F.cross_entropy(
         outputs["shanten"].reshape(-1, 7), batch["shanten"].reshape(-1).long()
     )
+    if ordered_distance:
+        losses["shanten"] = with_distance(
+            "shanten",
+            losses["shanten"],
+            cdf_distance(
+                outputs["shanten"].float().softmax(-1), batch["shanten"]
+            ).mean(),
+        )
     active["shanten"] = True
     tenpai = batch["shanten"] == 0
     furiten_raw = F.binary_cross_entropy_with_logits(
@@ -268,6 +295,20 @@ def _structured_multitask_losses(
             losses["hidden_allocation"] = prediction.loss(
                 physical_counts, inventory, anchor.bool()
             )
+            if ordered_distance:
+                total_labels, _ = family_inventory(physical_counts.flatten(0, 1))
+                total_inventory, _ = family_inventory(inventory)
+                losses["hidden_allocation"] = with_distance(
+                    "hidden_allocation",
+                    losses["hidden_allocation"],
+                    hidden_count_distance(
+                        prediction.probability,
+                        prediction.baseline,
+                        total_labels.reshape(len(physical_counts), 4, 34),
+                        total_inventory,
+                        anchor,
+                    ),
+                )
         elif "hidden_count_residual" in outputs:
             probability, baseline = projected_count_distributions(
                 outputs["hidden_count_residual"], inventory, capacities
@@ -310,6 +351,18 @@ def _structured_multitask_losses(
     else:
         losses["dora_distribution"] = outputs["dora_distribution"].sum() * 0
         active["dora_distribution"] = False
+    if ordered_distance:
+        dora_distance = (
+            cdf_distance(
+                outputs["dora_distribution"][dora_mask].float().softmax(-1),
+                dora_labels[dora_mask],
+            ).mean()
+            if active["dora_distribution"]
+            else losses["dora_distribution"]
+        )
+        losses["dora_distribution"] = with_distance(
+            "dora_distribution", losses["dora_distribution"], dora_distance
+        )
     if has_labels("score_distribution", winner_mask):
         score_labels = batch["score"].long()[winner_mask]
         score_indices = score_class_indices(score_labels)
@@ -321,9 +374,22 @@ def _structured_multitask_losses(
         ):
             raise ValueError("score label is impossible for the winner's dealer status")
         score_loss = F.cross_entropy(score_logits[winner_mask], score_indices)
+        if ordered_distance:
+            score_loss = with_distance(
+                "score_distribution",
+                score_loss,
+                cdf_distance(
+                    score_logits[winner_mask].float().softmax(-1),
+                    score_labels,
+                    values=SCORE_VALUES,
+                    unit=1000.0,
+                ).mean(),
+            )
         score_active = True
     else:
         score_loss = outputs["score_distribution"].sum() * 0
+        if ordered_distance:
+            score_loss = with_distance("score_distribution", score_loss, score_loss)
         score_active = False
 
     tail_mask = dora_mask & (dora_labels >= DORA_TAIL_START)
@@ -359,6 +425,14 @@ def _structured_multitask_losses(
     losses["placement"] = F.cross_entropy(
         outputs["placement"], batch["placement"].long()
     )
+    if ordered_distance:
+        losses["placement"] = with_distance(
+            "placement",
+            losses["placement"],
+            placement_distance(
+                outputs["placement"].float().softmax(-1), batch["placement"]
+            ).mean(),
+        )
     active["placement"] = True
     match_target = batch["match_score"].float() / 10_000.0
     projected_match = fixed_total_values(outputs["match_score"], match_target.sum(-1))
@@ -376,6 +450,8 @@ def multitask_losses(
     joint_count_projector: JointCountProjector | None = None,
     include_hidden_allocation: bool = True,
     supervision: BatchSupervision | None = None,
+    ordered_distance: bool = False,
+    loss_components: dict[str, Tensor] | None = None,
 ) -> tuple[dict[str, Tensor], dict[str, bool]]:
     """Return raw proper losses and whether each has real supervision.
 
@@ -384,6 +460,10 @@ def multitask_losses(
     essential for dora/score heads, which have no label in a no-win batch.
     """
 
+    if ordered_distance and "hidden_joint_residual" not in outputs:
+        raise ValueError(
+            "ordered-distance profile requires structured joint-count outputs"
+        )
     if any(
         key in outputs
         for key in (
@@ -398,6 +478,8 @@ def multitask_losses(
             joint_count_projector,
             include_hidden_allocation=include_hidden_allocation,
             supervision=supervision,
+            ordered_distance=ordered_distance,
+            loss_components=loss_components,
         )
 
     losses: dict[str, Tensor] = {}
@@ -558,6 +640,8 @@ def multitask_loss(
     *,
     joint_count_projector: JointCountProjector | None = None,
     supervision: BatchSupervision | None = None,
+    ordered_distance: bool = False,
+    loss_components: dict[str, Tensor] | None = None,
 ) -> tuple[Tensor, dict[str, Tensor], dict[str, bool], dict[str, Tensor]]:
     """Compute raw losses, then combine them with the supplied balancer."""
 
@@ -566,6 +650,8 @@ def multitask_loss(
         batch,
         joint_count_projector=joint_count_projector,
         supervision=supervision,
+        ordered_distance=ordered_distance,
+        loss_components=loss_components,
         include_hidden_allocation=(
             balancer is None or "hidden_allocation" in balancer.names
         ),

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 import json
 import math
 import os
@@ -59,6 +58,7 @@ from .model_input import (
 )
 from .observations import add_all_player_ranks
 from .prediction_values import DORA_VALUES, SCORE_VALUES, score_class_mask
+from .prediction_values import PLACEMENT_PERMUTATIONS as PERMUTATIONS
 from .rule_certainties import (
     PublicRuleState,
     apply_opponent_rule_certainties,
@@ -79,8 +79,6 @@ from .structured_outputs import (
 )
 from .v15_facts import V15_FACTS_WIDTH, encode_v15_facts
 from .v16_candidates import encode_candidate_set
-
-PERMUTATIONS = tuple(itertools.permutations(range(4)))
 
 
 def _load_player_state() -> Any:

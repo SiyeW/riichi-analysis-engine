@@ -127,6 +127,12 @@ def main() -> None:
         "validation": checkpoint.get("validation"),
         "sourceRevision": training_source_revision(checkpoint),
     }
+    if "lossObjective" in checkpoint:
+        training["lossObjective"] = checkpoint["lossObjective"]
+    if checkpoint.get("objectiveTransition") is not None:
+        training["objectiveTransitionParent"] = checkpoint["objectiveTransition"][
+            "parent"
+        ]["sha256"]
     if checkpoint.get("trainingPhase") is not None:
         from .training_phase import validate_phase_counters
 
