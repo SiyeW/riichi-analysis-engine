@@ -1663,11 +1663,13 @@ def main() -> None:
             "new phase requires --resume and cannot combine other transitions"
         )
     if (
-        args.start_new_phase is not None
+        (args.start_new_phase is not None or args.loss_transition_proof is not None)
         and args.run.exists()
         and any(args.run.iterdir())
     ):
-        raise RuntimeError("new phase output directory must be empty")
+        raise RuntimeError(
+            "new phase/objective transition output directory must be empty"
+        )
     if not 0.0 <= args.warmup_start_factor <= 1.0 or (
         args.warmup_start_factor and args.warmup_steps <= 0
     ):

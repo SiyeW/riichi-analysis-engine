@@ -242,6 +242,20 @@ def test_real_entry_transition_keeps_state_unread_suffix_and_inference_export(
     }
     proof_path = tmp_path / "real-objective-proof.json"
     proof_path.write_text(json.dumps(proof), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="output directory must be empty"):
+        run(
+            "parent",
+            [
+                "--resume",
+                str(parent_path),
+                "--max-steps",
+                "2",
+                "--loss-profile",
+                ORDERED_PROFILE,
+                "--loss-transition-proof",
+                str(proof_path),
+            ],
+        )
     middle = run(
         "changed",
         [
