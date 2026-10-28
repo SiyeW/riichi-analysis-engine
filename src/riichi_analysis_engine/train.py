@@ -29,6 +29,7 @@ from .architecture import (
     V17Architecture,
     V18Architecture,
 )
+from .atomic_io import publish_json, replace_file, temporary_sibling
 from .branch_execution import packed_gradients_are_finite
 from .constants import OBS_CHANNELS
 from .corpus_extension import (
@@ -1197,11 +1198,7 @@ def write_pointer(run: Path, checkpoint: Path, **fields: object) -> None:
         "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         **fields,
     }
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    os.replace(temporary, path)
+    publish_json(path, payload)
 
 
 def prune_numbered_checkpoints(run: Path, keep: int) -> None:
@@ -1347,7 +1344,7 @@ def save_checkpoint(
     objective_transition: dict[str, object] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = temporary_sibling(path)
     torch.save(
         {
             "format": f"riichi-analysis-model-v{model.format_version}",
@@ -1423,7 +1420,7 @@ def save_checkpoint(
         },
         temporary,
     )
-    os.replace(temporary, path)
+    replace_file(temporary, path, attempts=20, retry_delay=0.025)
 
 
 def main() -> None:

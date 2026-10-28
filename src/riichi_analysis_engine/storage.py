@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import io
 import json
-import os
-import time
-import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+from .atomic_io import replace_file as _replace_atomically
+from .atomic_io import temporary_sibling as _temporary_sibling
 from .constants import ACTION_SPACE, OBS_CHANNELS, TILE_TYPES
 from .model_input import (
     LEGACY_MODEL_INPUT_SCHEMA_ID,
@@ -231,14 +230,6 @@ def write_packed_shard(path: str | Path, packed: dict[str, np.ndarray]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _temporary_sibling(destination: Path) -> Path:
-    """Return a collision-free temporary name beside an atomic destination."""
-
-    return destination.with_name(
-        f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    )
-
-
 def _compressed_npz_bytes(
     arrays: dict[str, np.ndarray], compression_level: int
 ) -> bytes:
@@ -258,19 +249,6 @@ def _compressed_npz_bytes(
             np.save(member, np.asarray(value), allow_pickle=False)
             archive.writestr(f"{name}.npy", member.getvalue())
     return payload.getvalue()
-
-
-def _replace_atomically(source: Path, destination: Path, attempts: int = 8) -> None:
-    """Replace a file despite brief Windows sharing violations at the destination."""
-
-    for attempt in range(attempts):
-        try:
-            os.replace(source, destination)
-            return
-        except PermissionError:
-            if attempt + 1 == attempts:
-                raise
-            time.sleep(0.01 * (attempt + 1))
 
 
 def read_packed_shard(path: str | Path) -> dict[str, np.ndarray]:
