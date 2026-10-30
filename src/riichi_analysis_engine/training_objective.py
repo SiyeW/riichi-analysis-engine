@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .architecture_transition import base_cursor
 from .corpus_extension import file_sha256
 
 PROBABILITY_PROFILE = "probability-v1"
@@ -72,8 +73,10 @@ def saved_objective(checkpoint: dict[str, Any]) -> dict[str, Any]:
         objective.get("profile")
     ):
         raise RuntimeError("checkpoint objective definition is incompatible")
-    cursor = checkpoint.get("trainingCursor")
-    if isinstance(cursor, dict) and cursor.get("type") != objective_cursor(
+    cursor = base_cursor(checkpoint)
+    if isinstance(checkpoint.get("trainingCursor"), dict) and cursor.get(
+        "type"
+    ) != objective_cursor(
         objective["profile"], phase=checkpoint.get("trainingPhase") is not None
     ):
         raise RuntimeError("checkpoint cursor and objective version disagree")

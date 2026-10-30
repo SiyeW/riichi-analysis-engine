@@ -29,6 +29,14 @@ from .architecture import (
     V17Architecture,
     V18Architecture,
 )
+from .architecture_transition import (
+    ARCHITECTURE_CURSOR,
+    base_cursor,
+    generation_progress,
+    restore_architecture_transition,
+    transition_cursor,
+    transition_fields,
+)
 from .atomic_io import publish_json, replace_file, temporary_sibling
 from .branch_execution import packed_gradients_are_finite
 from .constants import OBS_CHANNELS
@@ -402,8 +410,9 @@ def resume_training_cursor(
 ) -> tuple[int, int]:
     """Validate and return the next unread sample and completed update count."""
 
-    cursor = checkpoint.get("trainingCursor")
+    cursor = base_cursor(checkpoint)
     saved_objective(checkpoint)
+    restore_architecture_transition(checkpoint)
     if not isinstance(cursor, dict) or cursor.get("type") not in {
         "single-pass-v1",
         PHASE_CURSOR,
@@ -1342,6 +1351,7 @@ def save_checkpoint(
     training_phase: dict[str, object] | None = None,
     loss_objective: dict[str, object] | None = None,
     objective_transition: dict[str, object] | None = None,
+    architecture_transition: dict[str, object] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = temporary_sibling(path)
@@ -1351,23 +1361,26 @@ def save_checkpoint(
             "step": step,
             "samplesSeen": samples_seen,
             "analysisSamplesSeen": analysis_samples_seen,
-            "trainingCursor": {
-                "type": objective_cursor(
-                    (loss_objective or objective_definition(PROBABILITY_PROFILE))[
-                        "profile"
-                    ],
-                    phase=training_phase is not None,
-                ),
-                "nextSample": samples_seen,
-                "batchesConsumed": step,
-                "batchSize": batch_size,
-                "complete": pass_complete,
-                **(
-                    {"batchSizePhases": batch_size_phases}
-                    if batch_size_phases is not None
-                    else {}
-                ),
-            },
+            "trainingCursor": transition_cursor(
+                {
+                    "type": objective_cursor(
+                        (loss_objective or objective_definition(PROBABILITY_PROFILE))[
+                            "profile"
+                        ],
+                        phase=training_phase is not None,
+                    ),
+                    "nextSample": samples_seen,
+                    "batchesConsumed": step,
+                    "batchSize": batch_size,
+                    "complete": pass_complete,
+                    **(
+                        {"batchSizePhases": batch_size_phases}
+                        if batch_size_phases is not None
+                        else {}
+                    ),
+                },
+                architecture_transition,
+            ),
             "model": model.state_dict(),
             "modelArchitecture": architecture.to_dict(),
             **(
@@ -1416,6 +1429,9 @@ def save_checkpoint(
             ),
             **phase_checkpoint_fields(
                 training_phase, samples_seen, step, analysis_samples_seen
+            ),
+            **transition_fields(
+                architecture_transition, samples_seen, step, analysis_samples_seen
             ),
         },
         temporary,
@@ -1845,6 +1861,7 @@ def main() -> None:
     }
     batch_size_phases = [{"startSample": 0, "batchSize": args.batch_size}]
     training_phase = None
+    architecture_transition = None
     loss_objective, objective_transition, objective_changed = resolve_objective(
         args.loss_profile,
         None,
@@ -1857,6 +1874,15 @@ def main() -> None:
         resume_path = resolve_resume_path(args.resume)
         print(json.dumps({"resumedFrom": str(resume_path)}))
         checkpoint = torch.load(resume_path, map_location="cpu", weights_only=True)
+        if checkpoint.get("architectureTransition") is not None and (
+            args.start_new_phase is not None
+            or args.allow_batch_size_transition
+            or args.allow_corpus_extension
+            or args.allow_learning_rate_transition
+        ):
+            raise RuntimeError(
+                "architecture continuation cannot bundle another transition"
+            )
         if not args.validate_only and checkpoint.get("resumeAllowed", True) is not True:
             raise RuntimeError("this checkpoint is a validation-only model candidate")
         if checkpoint.get("format") != f"riichi-analysis-model-v{args.model_format}":
@@ -1984,6 +2010,7 @@ def main() -> None:
             allow_corpus_extension=args.allow_corpus_extension
             and not args.validate_only,
         )
+        architecture_transition = active_checkpoint.get("architectureTransition")
         if training_phase is not None:
             datasets["train"]["verified"] = True
             datasets["train"]["auditProofSha256"] = training_phase["proof"]["sha256"]
@@ -2213,7 +2240,9 @@ def main() -> None:
         "datasets": datasets,
         "trainingOrder": {
             "type": "globally-mixed-packs-v1",
-            "pass": objective_cursor(
+            "pass": ARCHITECTURE_CURSOR
+            if architecture_transition
+            else objective_cursor(
                 loss_objective["profile"], phase=training_phase is not None
             ),
             "trainSeed": datasets["train"].get("seed"),
@@ -2229,6 +2258,9 @@ def main() -> None:
         "trainingPhase": training_phase,
         "lossObjective": loss_objective,
         "objectiveTransition": objective_transition,
+        **transition_fields(
+            architecture_transition, samples_seen, step, analysis_samples_seen
+        ),
     }
     (args.run / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2, default=str) + "\n",
@@ -2278,6 +2310,7 @@ def main() -> None:
             training_phase=training_phase,
             loss_objective=loss_objective,
             objective_transition=objective_transition,
+            architecture_transition=architecture_transition,
             resume_allowed=(
                 True
                 if args.resume is None
@@ -2290,6 +2323,11 @@ def main() -> None:
             metadata.update(
                 phase_totals(training_phase, samples_seen, step, analysis_samples_seen)
             )
+        metadata.update(
+            generation_progress(
+                architecture_transition, samples_seen, step, analysis_samples_seen
+            )
+        )
         write_pointer(args.run, path, **metadata)
 
     signal.signal(signal.SIGINT, request_interrupt)
@@ -2463,6 +2501,9 @@ def main() -> None:
                 "step": step,
                 "samples": samples_seen,
                 "analysisSamples": analysis_samples_seen,
+                **generation_progress(
+                    architecture_transition, samples_seen, step, analysis_samples_seen
+                ),
                 "elapsedSeconds": now - started,
                 "samplesPerSecond": interval_samples / interval_seconds,
                 "total": float(total.detach()),

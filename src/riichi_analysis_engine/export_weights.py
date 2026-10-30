@@ -17,6 +17,7 @@ from .architecture import (
     V17Architecture,
     V18Architecture,
 )
+from .architecture_transition import restore_architecture_transition
 from .model import RiichiAnalysisModel, count_parameters
 from .model_input import (
     model_input_metadata,
@@ -147,6 +148,16 @@ def main() -> None:
             analysisSamplesSeen=totals["cumulativeAnalysisSamplesSeen"],
         )
     cursor = checkpoint.get("trainingCursor")
+    transition = restore_architecture_transition(checkpoint)
+    if transition is not None:
+        training["modelGeneration"] = checkpoint["modelGeneration"]
+        training["architectureTransfer"] = {
+            "type": transition["type"],
+            "parentCheckpointSha256": transition["parent"]["sha256"],
+            "initializerSha256": transition["initializer"]["sha256"],
+            "proofSha256": transition["proof"]["sha256"],
+            "optimizerPolicy": transition["optimizerPolicy"],
+        }
     if isinstance(cursor, dict):
         training["pass"] = {
             "type": cursor.get("type"),
