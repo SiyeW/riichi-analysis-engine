@@ -35,6 +35,7 @@ riichi-analysis-train = "riichi_analysis_engine.train:main"
 riichi-analysis-average-checkpoints = "riichi_analysis_engine.average_checkpoints:main"
 riichi-analysis-audit-model = "riichi_analysis_engine.audit_model:main"
 riichi-analysis-export-weights = "riichi_analysis_engine.export_weights:main"
+riichi-analysis-grow-weights = "riichi_analysis_engine.grow_weights:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

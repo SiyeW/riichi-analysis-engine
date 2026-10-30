@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-
 from riichi_analysis_engine.constants import (
     ACTION_SPACE,
     MORTAL_OBS_CHANNELS,
@@ -14,6 +13,7 @@ from riichi_analysis_engine.convert import (
     convert_game,
     preflight_conversion,
 )
+from riichi_analysis_engine.dataset import METADATA_FIELDS, PackDataset
 from riichi_analysis_engine.frame_sampling import FrameSamplingPlan
 from riichi_analysis_engine.semantic_input import (
     EVENT_TILE,
@@ -289,7 +289,6 @@ def test_v16_conversion_labels_the_complete_hand_discard_not_tsumogiri() -> None
 
 def test_v16_converted_rows_have_finite_forward_and_loss() -> None:
     import torch
-
     from riichi_analysis_engine.losses import multitask_loss
     from riichi_analysis_engine.model import RiichiAnalysisModel
     from riichi_analysis_engine.semantic_input import materialize_event_memory
@@ -337,9 +336,13 @@ def test_v16_converted_rows_have_finite_forward_and_loss() -> None:
         arrays["history_length"],
         arrays["perspective"],
     )
-    batch = {
-        name: torch.from_numpy(np.asarray(value)) for name, value in arrays.items()
-    }
+    batch = PackDataset._torch(
+        {
+            name: np.asarray(value)
+            for name, value in arrays.items()
+            if name not in METADATA_FIELDS
+        }
+    )
     batch["event_tokens"] = torch.from_numpy(tokens)
     batch["event_mask"] = torch.from_numpy(mask)
     assert validate_v16_training_batch(batch)["completePolicyRows"] == 1

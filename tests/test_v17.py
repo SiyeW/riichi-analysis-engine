@@ -5,10 +5,9 @@ import sys
 import numpy as np
 import pytest
 import torch
-from test_convert import _OneDiscardPlayerState
-
 from riichi_analysis_engine.architecture import V15Architecture, V17Architecture
 from riichi_analysis_engine.convert import convert_game
+from riichi_analysis_engine.dataset import METADATA_FIELDS, PackDataset
 from riichi_analysis_engine.export_weights import main as export_weights
 from riichi_analysis_engine.losses import multitask_loss
 from riichi_analysis_engine.model import RiichiAnalysisModel, count_parameters
@@ -26,6 +25,7 @@ from riichi_analysis_engine.train import forward_batch, validate_dataset_input_c
 from riichi_analysis_engine.training_schema import validate_v16_training_batch
 from riichi_analysis_engine.v15_facts import V15_FACTS_WIDTH
 from riichi_analysis_engine.v16_candidates import encode_candidate_set
+from test_convert import _OneDiscardPlayerState
 
 
 def small_architecture():
@@ -173,7 +173,13 @@ def training_batch():
         arrays["perspective"],
     )
     return {
-        **{name: torch.from_numpy(np.asarray(value)) for name, value in arrays.items()},
+        **PackDataset._torch(
+            {
+                name: np.asarray(value)
+                for name, value in arrays.items()
+                if name not in METADATA_FIELDS
+            }
+        ),
         "event_tokens": torch.from_numpy(tokens),
         "event_mask": torch.from_numpy(mask),
     }
