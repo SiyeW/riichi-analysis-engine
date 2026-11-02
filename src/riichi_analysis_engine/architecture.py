@@ -282,3 +282,35 @@ class V18Architecture(V17Architecture):
     width: int = 256
     feed_forward_width: int = 1024
     decoder_width: int = 512
+
+
+@dataclass(frozen=True)
+class V19Architecture(V18Architecture):
+    """Two common task reads; the original private pre/post blocks are retained."""
+
+    width: int = 384
+    blocks: int = 6
+    attention_heads: int = 12
+    feed_forward_width: int = 1536
+    decoder_width: int = 768
+    readout_stages: int = 2
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.readout_stages != 2:
+            raise ValueError("v19 requires exactly two common task reads")
+
+
+def mixed_architecture_type(format_version: int) -> type[V15Architecture]:
+    """One authority for strict mixed-entity architecture deserialization."""
+    architectures = {
+        15: V15Architecture,
+        16: V15Architecture,
+        17: V17Architecture,
+        18: V18Architecture,
+        19: V19Architecture,
+    }
+    try:
+        return architectures[format_version]
+    except KeyError as error:
+        raise ValueError("not a mixed-entity model format") from error

@@ -57,7 +57,10 @@ class V18Decoder(V17Decoder):
         )
         return {name: value + processed[name] for name, value in normalized.items()}
 
-    def task_states(self, state: V16State) -> dict[str, Tensor]:
+    def _first_task_read(
+        self, state: V16State
+    ) -> tuple[Tensor, dict[str, Tensor], list[Tensor], Tensor, Tensor]:
+        """Return the unchanged first read and its read-only memory boundary."""
         seeds = self.question_seeds(state)
         flattened = [seed.flatten(1, -2) for seed in seeds.values()]
         query = torch.cat(flattened, dim=1)
@@ -95,6 +98,10 @@ class V18Decoder(V17Decoder):
                 need_weights=False,
             )[0]
         )
+        return query, seeds, flattened, memory, mask
+
+    def task_states(self, state: V16State) -> dict[str, Tensor]:
+        query, seeds, flattened, _memory, _mask = self._first_task_read(state)
         return self.process_task_queries(query, seeds, flattened)
 
 

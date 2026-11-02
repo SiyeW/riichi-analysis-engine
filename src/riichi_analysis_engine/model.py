@@ -11,8 +11,7 @@ from .architecture import (
     SemanticModelArchitecture,
     StructuredModelArchitecture,
     V15Architecture,
-    V17Architecture,
-    V18Architecture,
+    mixed_architecture_type,
 )
 from .constants import ACTION_SPACE, MORTAL_OBS_CHANNELS, OBS_CHANNELS, TILE_TYPES
 from .kyoku_outcome import OUTCOME_COUNT
@@ -361,6 +360,7 @@ class RiichiAnalysisModel(nn.Module):
             16,
             17,
             18,
+            19,
         }:
             raise ValueError(f"unsupported model format version: {format_version}")
         if architecture is not None and format_version not in {
@@ -377,6 +377,7 @@ class RiichiAnalysisModel(nn.Module):
             16,
             17,
             18,
+            19,
         }:
             raise ValueError(
                 "only model formats v6 and later accept architecture metadata"
@@ -389,11 +390,12 @@ class RiichiAnalysisModel(nn.Module):
             | V15Architecture
             | None
         ) = None
-        if format_version in {15, 16, 17, 18}:
+        if format_version in {15, 16, 17, 18, 19}:
             from .semantic_v15 import SemanticV15Model
             from .semantic_v16 import SemanticV16Model
             from .semantic_v17 import SemanticV17Model
             from .semantic_v18 import SemanticV18Model
+            from .semantic_v19 import SemanticV19Model
 
             if any(
                 value is not None
@@ -402,37 +404,21 @@ class RiichiAnalysisModel(nn.Module):
                 raise ValueError(
                     "v15 architecture must be configured through its metadata"
                 )
-            configured = architecture or (
-                V18Architecture()
-                if format_version == 18
-                else V17Architecture()
-                if format_version == 17
-                else V15Architecture()
-            )
-            if not isinstance(configured, V15Architecture):
-                raise TypeError("v15 requires V15Architecture")
-            if format_version == 17 and not isinstance(configured, V17Architecture):
-                raise TypeError("v17 requires V17Architecture")
-            if format_version not in {17, 18} and isinstance(
-                configured, V17Architecture
-            ):
+            architecture_type = mixed_architecture_type(format_version)
+            configured = architecture or architecture_type()
+            if type(configured) is not architecture_type:
                 raise TypeError(
-                    "V17Architecture cannot configure an older model format"
+                    f"v{format_version} requires {architecture_type.__name__}"
                 )
-            if format_version == 18 and type(configured) is not V18Architecture:
-                raise TypeError("v18 requires V18Architecture")
-            if format_version != 18 and isinstance(configured, V18Architecture):
-                raise TypeError("V18Architecture requires model format 18")
             self.architecture = configured
-            self.semantic_model = (
-                SemanticV18Model(configured)
-                if format_version == 18
-                else SemanticV17Model(configured)
-                if format_version == 17
-                else SemanticV16Model(configured)
-                if format_version == 16
-                else SemanticV15Model(configured)
-            )
+            semantic_type = {
+                15: SemanticV15Model,
+                16: SemanticV16Model,
+                17: SemanticV17Model,
+                18: SemanticV18Model,
+                19: SemanticV19Model,
+            }[format_version]
+            self.semantic_model = semantic_type(configured)
             return
         if format_version in {12, 13, 14}:
             if any(
@@ -685,7 +671,7 @@ class RiichiAnalysisModel(nn.Module):
         candidate_features: Tensor | None = None,
         candidate_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        if self.format_version in {16, 17, 18}:
+        if self.format_version in {16, 17, 18, 19}:
             if any(
                 value is None
                 for value in (event_tokens, event_mask, v15_facts, public_meld_count)
@@ -1048,7 +1034,7 @@ class RiichiAnalysisModel(nn.Module):
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
-    if model.format_version in {15, 16, 17, 18}:
+    if model.format_version in {15, 16, 17, 18, 19}:
         modules = {
             "input": model.semantic_model.input,
             "backbone": model.semantic_model.blocks,

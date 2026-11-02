@@ -14,8 +14,7 @@ from .architecture import (
     SemanticModelArchitecture,
     StructuredModelArchitecture,
     V15Architecture,
-    V17Architecture,
-    V18Architecture,
+    mixed_architecture_type,
 )
 from .architecture_transition import restore_architecture_transition
 from .model import RiichiAnalysisModel, count_parameters
@@ -86,6 +85,7 @@ def main() -> None:
         "riichi-analysis-model-v16": 16,
         "riichi-analysis-model-v17": 17,
         "riichi-analysis-model-v18": 18,
+        "riichi-analysis-model-v19": 19,
     }
     if model_format not in formats:
         raise RuntimeError("checkpoint has an unsupported format")
@@ -97,14 +97,10 @@ def main() -> None:
         | V15Architecture
         | None
     ) = None
-    if format_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}:
+    if format_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}:
         architecture_type = (
-            V18Architecture
-            if format_version == 18
-            else V17Architecture
-            if format_version == 17
-            else V15Architecture
-            if format_version in {15, 16, 17, 18}
+            mixed_architecture_type(format_version)
+            if format_version in {15, 16, 17, 18, 19}
             else SemanticModelArchitecture
             if format_version in {12, 13, 14}
             else StructuredModelArchitecture
@@ -130,6 +126,9 @@ def main() -> None:
     }
     if "lossObjective" in checkpoint:
         training["lossObjective"] = checkpoint["lossObjective"]
+    if checkpoint.get("readerTransfer") is not None:
+        training["readerTransfer"] = checkpoint["readerTransfer"]
+        training["initializationOnly"] = checkpoint.get("resumeAllowed") is False
     if checkpoint.get("objectiveTransition") is not None:
         training["objectiveTransitionParent"] = checkpoint["objectiveTransition"][
             "parent"
@@ -188,10 +187,10 @@ def main() -> None:
         },
         "training": training,
     }
-    if format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18}:
+    if format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}:
         expected_input = (
             v16_model_input_metadata()
-            if format_version in {16, 17, 18}
+            if format_version in {16, 17, 18, 19}
             else v15_model_input_metadata()
             if format_version == 15
             else shared_model_input_metadata()
@@ -201,7 +200,7 @@ def main() -> None:
         if checkpoint.get("modelInput") != expected_input:
             raise RuntimeError("checkpoint uses a different model-input contract")
         payload["architecture"]["modelInput"] = expected_input
-    if format_version in {12, 13, 14, 15, 16, 17, 18}:
+    if format_version in {12, 13, 14, 15, 16, 17, 18, 19}:
         expected_semantic_input = semantic_input_metadata()
         if checkpoint.get("semanticInput") != expected_semantic_input:
             raise RuntimeError("checkpoint uses a different semantic-input contract")

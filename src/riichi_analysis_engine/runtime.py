@@ -20,9 +20,7 @@ from .architecture import (
     ModelArchitecture,
     SemanticModelArchitecture,
     StructuredModelArchitecture,
-    V15Architecture,
-    V17Architecture,
-    V18Architecture,
+    mixed_architecture_type,
 )
 from .constants import (
     MORTAL_OBS_CHANNELS,
@@ -313,15 +311,16 @@ class AnalysisRuntime:
             "riichi-analysis-model-v16": 16,
             "riichi-analysis-model-v17": 17,
             "riichi-analysis-model-v18": 18,
+            "riichi-analysis-model-v19": 19,
         }
         if model_format not in formats:
             raise RuntimeError("weight file has an unsupported format")
         self.format_version = formats[model_format]
-        if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18}:
+        if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict) or architecture.get("modelInput") != (
                 v16_model_input_metadata()
-                if self.format_version in {16, 17, 18}
+                if self.format_version in {16, 17, 18, 19}
                 else v15_model_input_metadata()
                 if self.format_version == 15
                 else shared_model_input_metadata()
@@ -329,7 +328,7 @@ class AnalysisRuntime:
                 else model_input_metadata()
             ):
                 raise RuntimeError("weight file uses a different model-input contract")
-        if self.format_version in {12, 13, 14, 15, 16, 17, 18}:
+        if self.format_version in {12, 13, 14, 15, 16, 17, 18, 19}:
             architecture = payload.get("architecture")
             if (
                 not isinstance(architecture, dict)
@@ -349,18 +348,14 @@ class AnalysisRuntime:
                 or architecture.get("predictionValues") != expected_values
             ):
                 raise RuntimeError("weight file uses different prediction values")
-        if self.format_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}:
+        if self.format_version in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}:
             architecture = payload.get("architecture")
             if not isinstance(architecture, dict):
                 raise RuntimeError("weight file has no architecture metadata")
             try:
                 architecture_type = (
-                    V18Architecture
-                    if self.format_version == 18
-                    else V17Architecture
-                    if self.format_version == 17
-                    else V15Architecture
-                    if self.format_version in {15, 16, 17, 18}
+                    mixed_architecture_type(self.format_version)
+                    if self.format_version in {15, 16, 17, 18, 19}
                     else SemanticModelArchitecture
                     if self.format_version in {12, 13, 14}
                     else StructuredModelArchitecture
@@ -385,16 +380,16 @@ class AnalysisRuntime:
         self._sessions: dict[str, RuntimeSession] = {}
         observation_channels = (
             SHARED_MODEL_INPUT_CHANNELS
-            if self.format_version in {13, 14, 15, 16, 17, 18}
+            if self.format_version in {13, 14, 15, 16, 17, 18, 19}
             else MODEL_INPUT_CHANNELS
-            if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+            if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
             else OBS_CHANNELS
             if self.format_version in {6, 7, 8}
             else MORTAL_OBS_CHANNELS
         )
         with torch.inference_mode():
             observation = torch.zeros(1, observation_channels, 34, device=self.device)
-            if self.format_version in {15, 16, 17, 18}:
+            if self.format_version in {15, 16, 17, 18, 19}:
                 facts = torch.zeros(1, V15_FACTS_WIDTH, device=self.device)
                 facts[:, 24] = 1
                 self.model(
@@ -406,7 +401,7 @@ class AnalysisRuntime:
                     facts,
                     *(
                         (torch.zeros(1, 4, 37, device=self.device),)
-                        if self.format_version in {16, 17, 18}
+                        if self.format_version in {16, 17, 18, 19}
                         else ()
                     ),
                 )
@@ -482,7 +477,7 @@ class AnalysisRuntime:
         rule_state: PublicRuleState | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         observation, mask = state.encode_obs(4, at_kan_select)
-        if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18}:
+        if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}:
             if analysis_observation is None:
                 raise ValueError(
                     "semantic model formats require the public-history observation"
@@ -501,7 +496,7 @@ class AnalysisRuntime:
                         rule_state=rule_state,
                     ),
                 )
-                if self.format_version in {13, 14, 15, 16, 17, 18}
+                if self.format_version in {13, 14, 15, 16, 17, 18, 19}
                 else compose_model_input(
                     analysis_observation, extract_policy_context(observation)
                 )
@@ -539,7 +534,7 @@ class AnalysisRuntime:
             rule_state.process(event)
         analysis_observation = (
             self._analysis_observation(events, controlled_seat)
-            if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+            if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
             else None
         )
         observation, _mask = self._encode_observation(
@@ -596,7 +591,7 @@ class AnalysisRuntime:
         score_state = session.score_state
         analysis_observation = (
             session.analysis_observation()
-            if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+            if self.format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
             else None
         )
         observation, _primary_mask = self._encode_observation(
@@ -608,7 +603,7 @@ class AnalysisRuntime:
         )
         tensor = torch.from_numpy(observation).unsqueeze(0).to(self.device)
         semantic_memory: tuple[torch.Tensor, torch.Tensor] | None = None
-        if self.format_version in {12, 13, 14, 15, 16, 17, 18}:
+        if self.format_version in {12, 13, 14, 15, 16, 17, 18, 19}:
             event_tokens, event_mask = session.semantic_event_memory()
             semantic_memory = (
                 event_tokens.to(self.device),
@@ -627,7 +622,7 @@ class AnalysisRuntime:
                     )
                     .unsqueeze(0)
                     .to(self.device)
-                    if self.format_version in {15, 16, 17, 18}
+                    if self.format_version in {15, 16, 17, 18, 19}
                     else None
                 )
                 semantic_state = self.model.semantic_model.encode(
@@ -644,7 +639,7 @@ class AnalysisRuntime:
                             .unsqueeze(0)
                             .to(self.device),
                         )
-                        if self.format_version in {16, 17, 18}
+                        if self.format_version in {16, 17, 18, 19}
                         else ()
                     ),
                 )
@@ -837,7 +832,7 @@ class AnalysisRuntime:
                 )
             else:
                 dora_point = F.softplus(outputs["dora_point"]).numpy()
-            if self.format_version in {16, 17, 18}:
+            if self.format_version in {16, 17, 18, 19}:
                 known = known_meld_dora(
                     session.public_state.physical_meld_counts(controlled_seat),
                     session.public_state.visible_dora_markers(),
@@ -1067,7 +1062,7 @@ class AnalysisRuntime:
             candidates = policy_request.get("parameters", {}).get("candidates")
             if not isinstance(candidates, list) or not candidates:
                 raise ValueError("action-recommendation requires non-empty candidates")
-            if self.format_version in {16, 17, 18}:
+            if self.format_version in {16, 17, 18, 19}:
                 if semantic_state is None:
                     raise RuntimeError("v16 requires a shared semantic state")
                 identifiers = [candidate.get("candidateId") for candidate in candidates]

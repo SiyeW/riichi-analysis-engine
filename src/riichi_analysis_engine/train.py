@@ -25,9 +25,7 @@ from .architecture import (
     ModelArchitecture,
     SemanticModelArchitecture,
     StructuredModelArchitecture,
-    V15Architecture,
-    V17Architecture,
-    V18Architecture,
+    mixed_architecture_type,
 )
 from .architecture_transition import (
     ARCHITECTURE_CURSOR,
@@ -288,7 +286,7 @@ def validate_dataset_input_contract(
 
     expected_schema = (
         V16_MODEL_INPUT_SCHEMA_ID
-        if model_format in {16, 17, 18}
+        if model_format in {16, 17, 18, 19}
         else V15_MODEL_INPUT_SCHEMA_ID
         if model_format == 15
         else SHARED_MODEL_INPUT_SCHEMA_ID
@@ -299,7 +297,7 @@ def validate_dataset_input_contract(
     )
     expected_channels = (
         SHARED_MODEL_INPUT_CHANNELS
-        if model_format in {13, 14, 15, 16, 17, 18}
+        if model_format in {13, 14, 15, 16, 17, 18, 19}
         else MODEL_INPUT_CHANNELS
         if model_format in {9, 10, 11, 12}
         else OBS_CHANNELS
@@ -312,25 +310,25 @@ def validate_dataset_input_contract(
         if (
             schema is None
             and channels is None
-            and model_format not in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+            and model_format not in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
         ):
             continue
         if schema != expected_schema or channels != expected_channels:
             raise RuntimeError(f"{split} dataset uses a different model-input contract")
         event_schema = metadata.get("eventMemorySchema")
         if (
-            model_format in {12, 13, 14, 15, 16, 17, 18}
+            model_format in {12, 13, 14, 15, 16, 17, 18, 19}
             and event_schema != EVENT_MEMORY_SCHEMA_ID
         ):
             raise RuntimeError(f"{split} dataset has no compatible event memory")
         target_schema = metadata.get("trainingTargetSchema")
         expected_target = (
             V16_TRAINING_TARGET_SCHEMA_ID
-            if model_format in {16, 17, 18}
+            if model_format in {16, 17, 18, 19}
             else TRAINING_TARGET_SCHEMA_ID
         )
         if (
-            model_format in {13, 14, 15, 16, 17, 18}
+            model_format in {13, 14, 15, 16, 17, 18, 19}
             and target_schema != expected_target
         ):
             raise RuntimeError(f"{split} dataset has no compatible training targets")
@@ -340,7 +338,7 @@ def forward_batch(
     model: RiichiAnalysisModel, batch: Mapping[str, torch.Tensor]
 ) -> dict[str, torch.Tensor]:
     observation = batch["obs"].float()
-    if model.format_version in {16, 17, 18}:
+    if model.format_version in {16, 17, 18, 19}:
         from .v16_candidates import candidate_features_from_codes
 
         return model(
@@ -1387,7 +1385,7 @@ def save_checkpoint(
                 {
                     "modelInput": (
                         v16_model_input_metadata()
-                        if model.format_version in {16, 17, 18}
+                        if model.format_version in {16, 17, 18, 19}
                         else v15_model_input_metadata()
                         if model.format_version == 15
                         else shared_model_input_metadata()
@@ -1395,12 +1393,12 @@ def save_checkpoint(
                         else model_input_metadata()
                     )
                 }
-                if model.format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+                if model.format_version in {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
                 else {}
             ),
             **(
                 {"semanticInput": semantic_input_metadata()}
-                if model.format_version in {12, 13, 14, 15, 16, 17, 18}
+                if model.format_version in {12, 13, 14, 15, 16, 17, 18, 19}
                 else {}
             ),
             "optimizer": optimizer.state_dict(),
@@ -1488,7 +1486,7 @@ def main() -> None:
     parser.add_argument(
         "--model-format",
         type=int,
-        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18),
+        choices=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19),
         default=13,
     )
     parser.add_argument("--shared-channels", type=int, default=256)
@@ -1517,8 +1515,8 @@ def main() -> None:
     parser.add_argument("--semantic-backbone-blocks", type=int, default=8)
     parser.add_argument("--semantic-event-blocks", type=int, default=4)
     parser.add_argument("--semantic-decoder-width", type=int)
-    parser.add_argument("--semantic-attention-heads", type=int, default=8)
-    parser.add_argument("--v15-blocks", type=int, default=4)
+    parser.add_argument("--semantic-attention-heads", type=int)
+    parser.add_argument("--v15-blocks", type=int)
     parser.add_argument("--v15-feed-forward-width", type=int)
     parser.add_argument("--semantic-transformer-ff-multiplier", type=int, default=4)
     parser.add_argument("--semantic-transformer-tile-prior-blocks", type=int, default=0)
@@ -1634,17 +1632,13 @@ def main() -> None:
         help="train only this loss term; repeat for a controlled ablation",
     )
     args = parser.parse_args()
-    defaults = (
-        V18Architecture()
-        if args.model_format == 18
-        else V17Architecture()
-        if args.model_format == 17
-        else V15Architecture()
-    )
+    defaults = mixed_architecture_type(max(args.model_format, 15))()
     for name, default in (
         ("semantic_width", defaults.width),
         ("semantic_decoder_width", defaults.decoder_width),
         ("v15_feed_forward_width", defaults.feed_forward_width),
+        ("v15_blocks", defaults.blocks),
+        ("semantic_attention_heads", defaults.attention_heads),
     ):
         if getattr(args, name) is None:
             setattr(args, name, default)
@@ -1725,7 +1719,7 @@ def main() -> None:
         torch.float16 if device.type == "cuda" and args.precision == "amp" else None
     )
     if args.count_projection_execution == "cuda-graph" and (
-        args.model_format not in {14, 15, 16, 17, 18}
+        args.model_format not in {14, 15, 16, 17, 18, 19}
         or device.type != "cuda"
         or (args.loss_term and "hidden_allocation" not in args.loss_term)
     ):
@@ -1733,14 +1727,8 @@ def main() -> None:
             "CUDA count replay requires model format 14/15, CUDA, and the hidden_allocation loss"
         )
 
-    if args.model_format in {15, 16, 17, 18}:
-        architecture_type = (
-            V18Architecture
-            if args.model_format == 18
-            else V17Architecture
-            if args.model_format == 17
-            else V15Architecture
-        )
+    if args.model_format in {15, 16, 17, 18, 19}:
+        architecture_type = mixed_architecture_type(args.model_format)
         architecture = architecture_type(
             width=args.semantic_width,
             blocks=args.v15_blocks,
@@ -1897,14 +1885,8 @@ def main() -> None:
             validate_only=args.validate_only,
         )
         checkpoint_architecture = checkpoint.get("modelArchitecture")
-        if args.model_format in {15, 16, 17, 18}:
-            architecture_type = (
-                V18Architecture
-                if args.model_format == 18
-                else V17Architecture
-                if args.model_format == 17
-                else V15Architecture
-            )
+        if args.model_format in {15, 16, 17, 18, 19}:
+            architecture_type = mixed_architecture_type(args.model_format)
             checkpoint_architecture = architecture_type.from_dict(
                 checkpoint_architecture
             ).to_dict()
@@ -1925,9 +1907,10 @@ def main() -> None:
             16,
             17,
             18,
+            19,
         } and checkpoint.get("modelInput") != (
             v16_model_input_metadata()
-            if args.model_format in {16, 17, 18}
+            if args.model_format in {16, 17, 18, 19}
             else v15_model_input_metadata()
             if args.model_format == 15
             else shared_model_input_metadata()
@@ -1938,7 +1921,7 @@ def main() -> None:
                 "resume checkpoint uses a different model-input contract"
             )
         if (
-            args.model_format in {12, 13, 14, 15, 16, 17, 18}
+            args.model_format in {12, 13, 14, 15, 16, 17, 18, 19}
             and checkpoint.get("semanticInput") != semantic_input_metadata()
         ):
             raise RuntimeError(
@@ -2079,7 +2062,7 @@ def main() -> None:
             )
     ordered_distance = loss_objective["profile"] == ORDERED_PROFILE
     if ordered_distance and (
-        args.model_format not in {14, 15, 16, 17, 18} or args.loss_term
+        args.model_format not in {14, 15, 16, 17, 18, 19} or args.loss_term
     ):
         raise ValueError(
             "ordered-distance profile requires all structured joint-count tasks"
@@ -2175,17 +2158,17 @@ def main() -> None:
         fixture = next(iter(validation_loader))
     except StopIteration:
         fixture = None
-    if args.model_format in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}:
+    if args.model_format in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}:
 
         def validate_fixture(value: Mapping[str, torch.Tensor]) -> dict[str, int]:
-            if args.model_format in {12, 13, 14, 15, 16, 17, 18}:
-                if args.model_format in {16, 17, 18}:
+            if args.model_format in {12, 13, 14, 15, 16, 17, 18, 19}:
+                if args.model_format in {16, 17, 18, 19}:
                     return validate_v16_training_batch(value)
                 result = validate_semantic_training_batch(
                     value,
                     require_analysis_active=args.model_format >= 10,
                     require_hidden_baseline_anchor=args.model_format
-                    in {13, 14, 15, 16, 17, 18},
+                    in {13, 14, 15, 16, 17, 18, 19},
                 )
                 if args.model_format == 15:
                     facts = value.get("v15_facts")
@@ -2376,7 +2359,7 @@ def main() -> None:
         )
         supervision = (
             BatchSupervision.from_cpu(batch)
-            if args.model_format in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+            if args.model_format in {8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
             and args.loss_execution == "cpu-metadata"
             else None
         )
